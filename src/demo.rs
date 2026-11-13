@@ -75,6 +75,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             can_forward: true,
             forwarded: false,
             pinned: false,
+            reactions: Vec::new(),
             edited: false,
         })
         .collect()
