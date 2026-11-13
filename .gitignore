@@ -1,0 +1,6 @@
+/target/
+.env
+.env.*
+*.session*
+*.sqlite*
+/core

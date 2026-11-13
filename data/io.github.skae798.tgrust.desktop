@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=tgrust
+GenericName=Клиент Telegram
+Comment=Неофициальный клиент Telegram для GNOME
+Exec=tgrust
+Icon=mail-message-new
+Terminal=false
+Categories=Network;InstantMessaging;

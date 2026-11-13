@@ -1,0 +1,33 @@
+name: Rust checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    container: fedora:45
+    steps:
+      - name: Install system dependencies
+        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc git gtk4-devel libadwaita-devel make pkgconf-pkg-config
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/tgrust-rustup.sh
+          sh /tmp/tgrust-rustup.sh -y --profile minimal --default-toolchain 1.100.0 --component rustfmt --component clippy
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Validate desktop entry
+        run: desktop-file-validate data/io.github.skae798.tgrust.desktop

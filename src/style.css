@@ -1,0 +1,46 @@
+.chat-row {
+  padding: 8px 10px;
+}
+
+.chat-preview {
+  font-size: 0.9em;
+}
+
+.unread-count {
+  background: var(--accent-bg-color);
+  color: var(--accent-fg-color);
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 0.85em;
+  font-weight: 700;
+}
+
+.conversation {
+  padding: 10px 18px 18px;
+}
+
+.message-bubble {
+  padding: 9px 13px;
+  border-radius: 15px;
+  background: var(--card-bg-color);
+  color: var(--card-fg-color);
+}
+
+.message-bubble.outgoing {
+  background: alpha(var(--accent-bg-color), 0.16);
+  color: var(--view-fg-color);
+}
+
+.message-name {
+  color: var(--accent-color);
+  font-weight: 700;
+  font-size: 0.85em;
+}
+
+.message-time {
+  font-size: 0.8em;
+}
+
+.composer {
+  padding: 8px 14px 10px;
+}

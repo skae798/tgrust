@@ -1,0 +1,20 @@
+[package]
+name = "tgrust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+description = "Неофициальный клиент Telegram для GNOME"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
+anyhow = "1"
+grammers-client = { version = "0.12", default-features = false }
+grammers-session = "0.12"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_16"] }
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }
+
+[profile.dev]
+debug = 0
