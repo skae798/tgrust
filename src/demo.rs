@@ -68,6 +68,8 @@ pub fn history(chat: i64) -> Vec<Message> {
             text: text.to_owned(),
             outgoing,
             attachment: attachment.map(str::to_owned),
+            reply_to: None,
+            can_reply: true,
         })
         .collect()
 }

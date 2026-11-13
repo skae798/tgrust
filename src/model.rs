@@ -18,6 +18,24 @@ pub struct Message {
     pub text: String,
     pub outgoing: bool,
     pub attachment: Option<String>,
+    pub reply_to: Option<i32>,
+    pub can_reply: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Reply {
+    pub id: i32,
+    pub summary: String,
+}
+
+impl Message {
+    pub fn reply_summary(&self) -> String {
+        let text = self.text.lines().find(|line| !line.trim().is_empty());
+        match text.or(self.attachment.as_deref()) {
+            Some(text) => format!("{} · {text}", self.sender),
+            None => self.sender.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -80,6 +98,8 @@ mod tests {
                 text: String::new(),
                 outgoing: false,
                 attachment: None,
+                reply_to: None,
+                can_reply: true,
             })
             .collect()
     }
