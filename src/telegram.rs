@@ -17,11 +17,11 @@ use grammers_session::{
     storages::SqliteSession,
     types::{PeerId, PeerRef},
 };
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatImage, Message, Reaction, SearchHit, UpdateStatus,
-    Upload, UploadKind,
+    AttachmentThumbnail, Avatar, Chat, ChatImage, Message, Reaction, ReplyPreview, SearchHit,
+    UpdateStatus, Upload, UploadKind,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -53,6 +53,7 @@ pub struct Telegram {
     peers: RwLock<HashMap<i64, PeerRef>>,
     changes: watch::Sender<UpdateStatus>,
     image_downloads: Semaphore,
+    profile: OnceCell<Peer>,
 }
 
 impl Telegram {
@@ -108,6 +109,7 @@ impl Telegram {
                 peers: RwLock::new(HashMap::new()),
                 changes,
                 image_downloads: Semaphore::new(4),
+                profile: OnceCell::new(),
             }),
             step,
         ))
@@ -141,7 +143,8 @@ impl Telegram {
                 Ok(LoginStep::Code)
             }
             LoginState::Code(token) => match self.client.sign_in(token, value).await {
-                Ok(_) => {
+                Ok(user) => {
+                    let _ = self.profile.set(Peer::User(user));
                     *state = LoginState::Authorized;
                     Ok(LoginStep::Authorized)
                 }
@@ -160,7 +163,8 @@ impl Telegram {
                     unreachable!();
                 };
                 match self.client.check_password(token, value).await {
-                    Ok(_) => {
+                    Ok(user) => {
+                        let _ = self.profile.set(Peer::User(user));
                         *state = LoginState::Authorized;
                         Ok(LoginStep::Authorized)
                     }
@@ -283,6 +287,7 @@ impl Telegram {
     }
 
     pub async fn chats(&self) -> Result<Vec<Chat>> {
+        let profile = self.profile().await;
         let mut chats = Vec::new();
         let mut peers = HashMap::new();
         let mut dialogs = self.client.iter_dialogs().limit(150);
@@ -309,6 +314,15 @@ impl Telegram {
                     .as_ref()
                     .map(preview)
                     .unwrap_or_default(),
+                preview_sender: matches!(peer, Peer::Group(_) | Peer::Community(_))
+                    .then(|| {
+                        dialog
+                            .last_message
+                            .as_ref()
+                            .and_then(|message| preview_sender(message, profile))
+                    })
+                    .flatten(),
+                group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
                 unread: raw.unread_count,
                 broadcast: matches!(peer, Peer::Channel(_)),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
@@ -354,8 +368,20 @@ impl Telegram {
             .map(|peer| peer.id()))
     }
 
+    async fn profile(&self) -> Option<&Peer> {
+        self.profile
+            .get_or_try_init(|| async {
+                let user =
+                    tokio::time::timeout(Duration::from_secs(5), self.client.get_me()).await??;
+                Ok::<_, anyhow::Error>(Peer::User(user))
+            })
+            .await
+            .ok()
+    }
+
     pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
         let self_id = self.self_id().await?;
+        let profile = self.profile().await;
         let mut messages = self.client.search_all_messages().query(query).limit(50);
         let mut hits = Vec::new();
         let mut peers = HashMap::new();
@@ -384,6 +410,8 @@ impl Telegram {
                     }
                     .to_owned(),
                     preview: String::new(),
+                    preview_sender: None,
+                    group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
                     unread: 0,
                     broadcast: matches!(peer, Peer::Channel(_)),
                     saved_messages: Some(peer_ref.id) == self_id
@@ -391,7 +419,7 @@ impl Telegram {
                     avatar: peer_avatar(peer),
                     archived: false,
                 },
-                message: message_view(&message, self_id),
+                message: message_view(&message, self_id, profile),
             });
         }
         self.peers.write().await.extend(peers);
@@ -406,6 +434,7 @@ impl Telegram {
     ) -> Result<(Vec<Message>, bool, bool)> {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
+        let profile = self.profile().await;
         let mut iter = self.client.iter_messages(peer).limit(PAGE_SIZE + 1);
         if let Some(before) = before {
             iter = iter.offset_id(before);
@@ -413,13 +442,13 @@ impl Telegram {
         let mut result = Vec::new();
         let newest = iter.next().await?;
         if let Some(message) = &newest {
-            result.push(message_view(message, self_id));
+            result.push(message_view(message, self_id, profile));
         }
         while result.len() < PAGE_SIZE {
             let Some(message) = iter.next().await? else {
                 break;
             };
-            result.push(message_view(&message, self_id));
+            result.push(message_view(&message, self_id, profile));
         }
         let has_older = iter.next().await?.is_some();
         let marked = if mark_read && let Some(message) = newest {
@@ -428,18 +457,21 @@ impl Telegram {
             false
         };
         result.reverse();
+        self.load_reply_previews(peer, &mut result, self_id, profile)
+            .await;
         Ok((result, has_older, marked))
     }
 
     pub async fn history_around(&self, chat: i64, anchor: i32) -> Result<(Vec<Message>, bool)> {
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
+        let profile = self.profile().await;
         let original = self
             .message_by_id(peer, anchor)
             .await?
             .context("Сообщение больше недоступно")?;
         let (mut messages, older, _) = self.history(chat, Some(anchor), false).await?;
-        messages.push(message_view(&original, self_id));
+        messages.push(message_view(&original, self_id, profile));
         let mut newer = self
             .client
             .iter_messages(peer)
@@ -448,10 +480,53 @@ impl Telegram {
             .limit(PAGE_SIZE / 2);
         while let Some(message) = newer.next().await? {
             if message.id() > anchor {
-                messages.push(message_view(&message, self_id));
+                messages.push(message_view(&message, self_id, profile));
             }
         }
+        self.load_reply_previews(peer, &mut messages, self_id, profile)
+            .await;
         Ok((messages, older))
+    }
+
+    async fn load_reply_previews(
+        &self,
+        peer: PeerRef,
+        messages: &mut [Message],
+        self_id: Option<PeerId>,
+        profile: Option<&Peer>,
+    ) {
+        let mut ids = messages
+            .iter()
+            .filter_map(|message| message.reply_to)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.retain(|id| !messages.iter().any(|message| message.id == *id));
+        if ids.is_empty() {
+            return;
+        }
+        let Ok(Ok(originals)) = tokio::time::timeout(
+            Duration::from_secs(3),
+            self.client.get_messages_by_id(peer, &ids),
+        )
+        .await
+        else {
+            return;
+        };
+        let previews: HashMap<_, _> = originals.into_iter().flatten()
+            .filter(|message| matches!(&message.raw, enums::Message::Message(raw) if raw.ttl_period.is_none()))
+            .map(|message| {
+                let original = message_view(&message, self_id, profile);
+                (original.id, original.reply_preview())
+            }).collect();
+        for message in messages {
+            if let Some(original) = message.reply_to.and_then(|id| previews.get(&id)) {
+                let preview = message
+                    .reply_preview
+                    .get_or_insert_with(|| original.clone());
+                preview.sender.clone_from(&original.sender);
+            }
+        }
     }
 
     pub async fn send(
@@ -463,6 +538,7 @@ impl Telegram {
     ) -> Result<Message> {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
+        let profile = self.profile().await;
         let mut message = InputMessage::new().text(text).reply_to(reply_to);
         if let Some(upload) = upload {
             let metadata = tokio::fs::metadata(&upload.path)
@@ -492,7 +568,7 @@ impl Telegram {
             };
         }
         let message = self.client.send_message(peer, message).await?;
-        Ok(message_view(&message, self_id))
+        Ok(message_view(&message, self_id, profile))
     }
 
     pub async fn save(&self, chat: i64, id: i32, destination: PathBuf) -> Result<()> {
@@ -595,7 +671,12 @@ impl Telegram {
             ChatImage::Avatar(avatar) => {
                 let id = PeerId::from_bot_api_dialog_id(avatar.peer).context("Чат не найден")?;
                 let cached = self.peers.read().await.get(&avatar.peer).copied();
-                let peer = if let Some(peer) = cached {
+                let peer = if Some(id) == self.self_id().await? {
+                    PeerRef {
+                        id: PeerId::self_user(),
+                        auth: Default::default(),
+                    }
+                } else if let Some(peer) = cached {
                     peer
                 } else {
                     let peer = self.session.peer(id).await?.context("Чат не найден")?;
@@ -749,6 +830,7 @@ impl Telegram {
 
     pub async fn forward_message(&self, source: i64, id: i32, destination: i64) -> Result<Message> {
         let self_id = self.self_id().await?;
+        let profile = self.profile().await;
         let source = self.peer(source).await?;
         let destination = self.peer(destination).await?;
         let original = self
@@ -764,7 +846,7 @@ impl Telegram {
             .next()
             .flatten()
             .context("Telegram не вернул пересланное сообщение")?;
-        Ok(message_view(&message, self_id))
+        Ok(message_view(&message, self_id, profile))
     }
 
     async fn message_by_id(&self, peer: PeerRef, id: i32) -> Result<Option<TelegramMessage>> {
@@ -901,7 +983,11 @@ fn update_retry_delay(error: &InvocationError, backoff: Duration) -> Duration {
     backoff
 }
 
-fn message_view(message: &TelegramMessage, self_id: Option<PeerId>) -> Message {
+fn message_view(
+    message: &TelegramMessage,
+    self_id: Option<PeerId>,
+    profile: Option<&Peer>,
+) -> Message {
     let outgoing = message.outgoing();
     let attachment = attachment(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
@@ -918,40 +1004,47 @@ fn message_view(message: &TelegramMessage, self_id: Option<PeerId>) -> Message {
         }
         _ => None,
     };
+    let (reply_to, reply_preview) = match &message.raw {
+        enums::Message::Message(raw) => match &raw.reply_to {
+            Some(enums::MessageReplyHeader::Header(header)) if !header.reply_to_ephemeral => {
+                let same_chat = header
+                    .reply_to_peer_id
+                    .as_ref()
+                    .is_none_or(|peer| PeerId::from(peer.clone()) == message.peer_id());
+                let id = header.reply_to_msg_id.filter(|_| same_chat);
+                let quote = header
+                    .quote_text
+                    .as_ref()
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| ReplyPreview {
+                        sender: None,
+                        text: text.clone(),
+                    });
+                (id, quote)
+            }
+            _ => (None, None),
+        },
+        _ => (None, None),
+    };
     Message {
         id: message.id(),
-        sender: if outgoing {
-            "Вы".to_owned()
-        } else {
-            message
-                .sender()
-                .and_then(Peer::name)
-                .unwrap_or("Сообщение")
-                .to_owned()
-        },
-        sender_avatar: message.sender().and_then(peer_avatar).or_else(|| {
-            match (message.sender_id(), message.peer()) {
-                (None, Some(peer @ Peer::Channel(_))) => peer_avatar(peer),
-                _ => None,
+        sender: author_name(message, profile).unwrap_or_else(|| {
+            if outgoing {
+                "Вы"
+            } else {
+                "Сообщение"
             }
+            .to_owned()
         }),
+        sender_avatar: author_peer(message, profile).and_then(peer_avatar),
         timestamp: message.date().as_second(),
         text: preview(message),
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
         thumbnail,
-        reply_to: match &message.raw {
-            enums::Message::Message(raw)
-                if matches!(
-                    &raw.reply_to,
-                    Some(enums::MessageReplyHeader::Header(header)) if header.reply_to_peer_id.is_none()
-                ) =>
-            {
-                message.reply_to_message_id()
-            }
-            _ => None,
-        },
+        reply_to,
+        reply_preview,
         can_reply: matches!(message.raw, enums::Message::Message(_)),
         can_edit: can_edit_text(message),
         can_delete: can_delete(message, self_id),
@@ -961,6 +1054,44 @@ fn message_view(message: &TelegramMessage, self_id: Option<PeerId>) -> Message {
         reactions: message_reactions(message),
         edited: message.edit_date().is_some() && !message.edit_hide(),
     }
+}
+
+fn author_peer<'a>(message: &'a TelegramMessage, profile: Option<&'a Peer>) -> Option<&'a Peer> {
+    message.sender().or_else(|| {
+        if message.outgoing() {
+            profile
+        } else {
+            message
+                .peer()
+                .filter(|peer| matches!(peer, Peer::Channel(_)))
+        }
+    })
+}
+
+fn author_name(message: &TelegramMessage, profile: Option<&Peer>) -> Option<String> {
+    if let Some(name) = message.post_author().filter(|name| !name.is_empty()) {
+        return Some(name.to_owned());
+    }
+    match author_peer(message, profile)? {
+        Peer::User(user) => Some(user.full_name()).filter(|name| !name.is_empty()),
+        peer => peer
+            .name()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned),
+    }
+}
+
+fn preview_sender(message: &TelegramMessage, profile: Option<&Peer>) -> Option<String> {
+    if message.action().is_some() {
+        return None;
+    }
+    author_peer(message, profile)
+        .and_then(|peer| {
+            peer.username()
+                .or_else(|| peer.usernames().into_iter().next())
+        })
+        .map(|name| format!("@{name}"))
+        .or_else(|| author_name(message, profile))
 }
 
 fn can_delete(message: &TelegramMessage, self_id: Option<PeerId>) -> bool {
