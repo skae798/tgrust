@@ -5,6 +5,10 @@ use crate::model::{Chat, Message};
 pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
 
+pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
+    chat == 1 && message == 3
+}
+
 pub fn chats() -> Vec<Chat> {
     [
         (
