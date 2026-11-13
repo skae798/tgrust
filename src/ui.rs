@@ -889,6 +889,9 @@ impl Ui {
             if !message.outgoing {
                 bubble.append(&label(&message.sender, "message-name"));
             }
+            if message.forwarded {
+                bubble.append(&label("Пересланное сообщение", "dim-label"));
+            }
             if let Some(id) = message.reply_to {
                 let summary = messages
                     .get(&id)
@@ -943,6 +946,19 @@ impl Ui {
             time.add_css_class("dim-label");
             let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             footer.set_halign(gtk::Align::End);
+            if message.can_forward
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("mail-forward-symbolic", "Переслать");
+                button.add_css_class("flat");
+                let message = message.clone();
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.forward_message(chat, message.clone())
+                ));
+                footer.append(&button);
+            }
             if message.can_delete
                 && let Some(chat) = self.selection.get()
             {
@@ -1096,10 +1112,8 @@ impl Ui {
         let reply = self.replies.borrow().get(&chat).cloned();
         let reply_to = reply.as_ref().map(|reply| reply.id);
         if self.is_demo.get() {
-            let id = self.demo_next_message.get();
-            self.demo_next_message.set(id + 1);
             let message = Message {
-                id,
+                id: self.next_demo_message(),
                 text: if text.is_empty() {
                     "Вложение".into()
                 } else {
@@ -1113,28 +1127,15 @@ impl Ui {
                 can_reply: true,
                 can_edit: upload.is_none(),
                 can_delete: true,
+                can_forward: true,
+                forwarded: false,
                 edited: false,
             };
-            self.demo_messages
-                .borrow_mut()
-                .entry(chat)
-                .or_default()
-                .push(message.clone());
-            if let Some(chat) = self
-                .chats
-                .borrow_mut()
-                .iter_mut()
-                .find(|candidate| candidate.id == chat)
-            {
-                chat.preview.clone_from(&message.text);
-            }
             self.input.set_text("");
             self.uploads.borrow_mut().remove(&chat);
             self.replies.borrow_mut().remove(&chat);
             self.update_send_button();
-            self.messages.borrow_mut().insert(id, message);
-            self.render_chats();
-            self.render_history(true);
+            self.add_demo_message(chat, message);
             return;
         }
         let Some(client) = self.client.borrow().clone() else {
@@ -1257,6 +1258,125 @@ impl Ui {
                             ui.edit_message(chat, id, &text, true);
                         }
                         ui.toast(&format!("Не удалось сохранить правку. {error}"));
+                    }
+                },
+            );
+        });
+    }
+
+    fn next_demo_message(&self) -> i32 {
+        let id = self.demo_next_message.get();
+        self.demo_next_message.set(id + 1);
+        id
+    }
+
+    fn add_demo_message(self: &Rc<Self>, chat: i64, message: Message) {
+        self.demo_messages
+            .borrow_mut()
+            .entry(chat)
+            .or_insert_with(|| demo::history(chat))
+            .push(message.clone());
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|item| item.id == chat)
+        {
+            chat.preview.clone_from(&message.text);
+        }
+        if self.selection.get() == Some(chat) {
+            self.messages.borrow_mut().insert(message.id, message);
+            self.render_history(true);
+        }
+        self.render_chats();
+    }
+
+    fn forward_message(self: &Rc<Self>, source: i64, message: Message) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        if self.sending.get() {
+            self.toast("Дождитесь текущей отправки");
+            return;
+        }
+        let dialog = adw::AlertDialog::builder()
+            .heading("Переслать сообщение")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Отмена");
+        let chats = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let destination = Rc::new(Cell::new(None));
+        for chat in self.chats.borrow().iter().filter(|chat| !chat.broadcast) {
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            let title = label(&chat.title, "");
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            button.set_child(Some(&title));
+            let chat = chat.id;
+            button.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                #[strong]
+                destination,
+                move |_| {
+                    destination.set(Some(chat));
+                    dialog.close();
+                }
+            ));
+            chats.append(&button);
+        }
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&chats)
+            .max_content_height(280)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        dialog.set_extra_child(Some(&scroll));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            dialog.choose_future(Some(&window)).await;
+            let (Some(ui), Some(chat)) = (weak.upgrade(), destination.get()) else {
+                return;
+            };
+            if ui.is_demo.get() {
+                ui.add_demo_message(
+                    chat,
+                    Message {
+                        id: ui.next_demo_message(),
+                        timestamp: demo::now(),
+                        sender: "Вы".into(),
+                        outgoing: true,
+                        reply_to: None,
+                        can_edit: false,
+                        can_delete: true,
+                        forwarded: true,
+                        edited: false,
+                        ..message
+                    },
+                );
+                ui.toast("Сообщение переслано");
+                return;
+            }
+            let Some(client) = ui.client.borrow().clone() else {
+                return;
+            };
+            ui.sending.set(true);
+            ui.update_send_button();
+            ui.job(
+                async move { client.forward_message(source, message.id, chat).await },
+                move |ui, result| {
+                    ui.sending.set(false);
+                    ui.update_send_button();
+                    match result {
+                        Ok(message) => {
+                            if ui.selection.get() == Some(chat) {
+                                ui.messages.borrow_mut().insert(message.id, message);
+                                ui.render_history(true);
+                            }
+                            ui.refresh_chats();
+                            ui.toast("Сообщение переслано");
+                        }
+                        Err(error) => ui.toast(&format!("Не удалось переслать сообщение. {error}")),
                     }
                 },
             );

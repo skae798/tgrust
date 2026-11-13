@@ -438,6 +438,25 @@ impl Telegram {
         Ok(())
     }
 
+    pub async fn forward_message(&self, source: i64, id: i32, destination: i64) -> Result<Message> {
+        let source = self.peer(source).await?;
+        let destination = self.peer(destination).await?;
+        let original = self
+            .message_by_id(source, id)
+            .await?
+            .context("Сообщение больше недоступно")?;
+        ensure!(can_forward(&original), "Это сообщение нельзя переслать");
+        let message = self
+            .client
+            .forward_messages(destination, &[id], source)
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .context("Telegram не вернул пересланное сообщение")?;
+        Ok(message_view(&message))
+    }
+
     async fn message_by_id(&self, peer: PeerRef, id: i32) -> Result<Option<TelegramMessage>> {
         Ok(self
             .client
@@ -528,8 +547,23 @@ fn message_view(message: &TelegramMessage) -> Message {
         can_reply: matches!(message.raw, enums::Message::Message(_)),
         can_edit: can_edit_text(message),
         can_delete: outgoing && matches!(message.raw, enums::Message::Message(_)),
+        can_forward: can_forward(message),
+        forwarded: matches!(&message.raw, enums::Message::Message(raw) if raw.fwd_from.is_some()),
         edited: message.edit_date().is_some() && !message.edit_hide(),
     }
+}
+
+fn can_forward(message: &TelegramMessage) -> bool {
+    let enums::Message::Message(raw) = &message.raw else {
+        return false;
+    };
+    !raw.noforwards
+        && raw.ttl_period.is_none()
+        && match message.media() {
+            Some(Media::Photo(photo)) => photo.raw.ttl_seconds.is_none(),
+            Some(Media::Document(document)) => document.raw.ttl_seconds.is_none(),
+            _ => true,
+        }
 }
 
 fn can_edit_text(message: &TelegramMessage) -> bool {
