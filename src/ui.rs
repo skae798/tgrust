@@ -52,7 +52,8 @@ struct Ui {
     scroll: gtk::ScrolledWindow,
     older: gtk::Button,
     latest: gtk::Button,
-    input: gtk::Entry,
+    input: gtk::TextView,
+    input_placeholder: gtk::Label,
     send: gtk::Button,
     attach: gtk::MenuButton,
     upload_bar: gtk::Box,
@@ -256,15 +257,40 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let remove_reply = icon_button("edit-clear-symbolic", "Отменить ответ");
     reply_bar.append(&reply_quote);
     reply_bar.append(&remove_reply);
-    let input = gtk::Entry::builder()
-        .hexpand(true)
-        .placeholder_text("Сообщение")
-        .max_length(4096)
+    let input = gtk::TextView::builder()
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .accepts_tab(false)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(10)
+        .right_margin(10)
         .build();
+    input.update_property(&[gtk::accessible::Property::Label("Сообщение")]);
+    let input_scroll = gtk::ScrolledWindow::builder()
+        .child(&input)
+        .min_content_height(36)
+        .max_content_height(132)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let input_box = gtk::Overlay::new();
+    input_box.add_css_class("composer-field");
+    input_box.set_hexpand(true);
+    input_box.set_child(Some(&input_scroll));
+    let input_placeholder = label("Сообщение", "dim-label");
+    input_placeholder.set_halign(gtk::Align::Start);
+    input_placeholder.set_valign(gtk::Align::Start);
+    input_placeholder.set_margin_start(10);
+    input_placeholder.set_margin_top(8);
+    input_placeholder.set_can_target(false);
+    input_placeholder.set_accessible_role(gtk::AccessibleRole::Presentation);
+    input_box.add_overlay(&input_placeholder);
     let send = icon_button("mail-send-symbolic", "Отправить");
     send.add_css_class("suggested-action");
     composer.append(&attach);
-    composer.append(&input);
+    composer.append(&input_box);
+    attach.set_valign(gtk::Align::End);
+    send.set_valign(gtk::Align::End);
     composer.append(&send);
     conversation.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     conversation.append(&reply_bar);
@@ -300,6 +326,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         older,
         latest,
         input,
+        input_placeholder,
         send,
         attach,
         upload_bar,
@@ -424,12 +451,37 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         ui,
         move |_| ui.send_message()
     ));
-    ui.input.connect_activate(glib::clone!(
+    let send_keys = gtk::EventControllerKey::new();
+    send_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    send_keys.connect_key_pressed(glib::clone!(
         #[weak]
         ui,
-        move |_| ui.send_message()
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |controller, key, _, modifiers| {
+            if !matches!(
+                key,
+                gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter | gtk::gdk::Key::ISO_Enter
+            ) || modifiers.intersects(
+                gtk::gdk::ModifierType::SHIFT_MASK
+                    | gtk::gdk::ModifierType::CONTROL_MASK
+                    | gtk::gdk::ModifierType::ALT_MASK
+                    | gtk::gdk::ModifierType::SUPER_MASK
+                    | gtk::gdk::ModifierType::META_MASK,
+            ) {
+                return glib::Propagation::Proceed;
+            }
+            if !controller
+                .current_event()
+                .is_some_and(|event| ui.input.im_context_filter_keypress(event))
+            {
+                ui.send_message();
+            }
+            glib::Propagation::Stop
+        }
     ));
-    ui.input.connect_changed(glib::clone!(
+    ui.input.add_controller(send_keys);
+    ui.input.buffer().connect_changed(glib::clone!(
         #[weak]
         ui,
         move |_| ui.update_send_button()
@@ -1071,13 +1123,14 @@ impl Ui {
             && anchor.is_none()
             && self.search_anchor.get().is_none()
         {
+            self.focus_composer();
             self.load_history(None, true);
             return;
         }
         if let Some(previous) = self.selection.replace(Some(id)) {
             self.drafts
                 .borrow_mut()
-                .insert(previous, self.input.text().to_string());
+                .insert(previous, self.composer_text().to_string());
         }
         self.update_archive_button();
         self.message_menu.popdown();
@@ -1094,14 +1147,15 @@ impl Ui {
         self.title
             .set_subtitle(if chat.broadcast { "Канал" } else { "" });
         self.content.set_visible_child_name("conversation");
-        self.input
-            .set_text(self.drafts.borrow().get(&id).map_or("", String::as_str));
+        let buffer = self.input.buffer();
+        buffer.set_text(self.drafts.borrow().get(&id).map_or("", String::as_str));
+        buffer.place_cursor(&buffer.end_iter());
         self.input.set_sensitive(!chat.broadcast);
-        self.input.set_placeholder_text(Some(if chat.broadcast {
+        self.input_placeholder.set_text(if chat.broadcast {
             "Канал только для чтения"
         } else {
             "Сообщение"
-        }));
+        });
         self.update_send_button();
         self.render_history(true);
         if self.is_demo.get() {
@@ -1127,6 +1181,30 @@ impl Ui {
         } else {
             self.load_history(None, true);
         }
+        if anchor.is_none() {
+            self.focus_composer();
+        }
+    }
+
+    fn focus_composer(self: &Rc<Self>) {
+        if !self.input.is_sensitive() || self.input.grab_focus() {
+            return;
+        }
+        let generation = self.generation.get();
+        after_layout(
+            &self.input,
+            glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move || {
+                    if ui.generation.get() == generation
+                        && (!ui.split.is_collapsed() || ui.split.shows_content())
+                    {
+                        ui.input.grab_focus();
+                    }
+                }
+            ),
+        );
     }
 
     fn load_history(self: &Rc<Self>, before: Option<i32>, mark_read: bool) {
@@ -1329,24 +1407,15 @@ impl Ui {
                 excerpt.set_text(&preview.text);
                 bubble.append(&quote);
             }
+            if let Some(chat) = self.selection.get() {
+                self.render_attachment_image(&bubble, chat, message);
+            }
             if !message.text.is_empty() {
                 let text = label(&message.text, "");
                 text.set_wrap(true);
                 text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
                 text.set_max_width_chars(64);
                 bubble.append(&text);
-            }
-            if let Some(name) = &message.attachment {
-                let file_name = label(name, "");
-                file_name.set_max_width_chars(32);
-                file_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                file.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
-                file.append(&file_name);
-                bubble.append(&file);
-            }
-            if let Some(chat) = self.selection.get() {
-                self.render_attachment_image(&bubble, chat, message);
             }
             let mut time = timestamp
                 .and_then(|time| time.format("%H:%M").ok())
@@ -1466,15 +1535,38 @@ impl Ui {
     }
 
     fn render_attachment_image(self: &Rc<Self>, bubble: &gtk::Box, chat: i64, message: &Message) {
+        if !message.photo_preview && message.thumbnail.is_none() && message.attachment.is_none() {
+            return;
+        }
         let id = message.id;
-        let picture = message.thumbnail.map(|media| {
-            let picture = gtk::Picture::builder()
-                .content_fit(gtk::ContentFit::Contain)
-                .can_shrink(true)
-                .visible(false)
-                .build();
-            picture.set_size_request(144, 94);
-            picture.update_property(&[gtk::accessible::Property::Label("Миниатюра вложения")]);
+        let preview = gtk::Stack::new();
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Contain)
+            .can_shrink(true)
+            .build();
+        picture.update_property(&[gtk::accessible::Property::Label("Миниатюра вложения")]);
+        let fallback = if message.photo_preview {
+            let icon = gtk::Image::from_icon_name("image-x-generic-symbolic");
+            icon.set_pixel_size(48);
+            icon.set_size_request(260, 128);
+            icon.upcast::<gtk::Widget>()
+        } else if let Some(name) = &message.attachment {
+            let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let name = label(name, "");
+            name.set_max_width_chars(32);
+            name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            file.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
+            file.append(&name);
+            file.upcast()
+        } else {
+            return;
+        };
+        preview.set_hhomogeneous(false);
+        preview.set_vhomogeneous(false);
+        preview.add_child(&fallback);
+        preview.add_child(&picture);
+        preview.set_visible_child(&fallback);
+        if let Some(media) = message.thumbnail {
             self.load_chat_image(
                 ChatImage::Attachment {
                     chat,
@@ -1484,32 +1576,29 @@ impl Ui {
                 glib::clone!(
                     #[weak]
                     picture,
+                    #[weak]
+                    preview,
                     move |texture: &gtk::gdk::Texture| {
+                        picture.set_size_request(texture.width(), texture.height());
                         picture.set_paintable(Some(texture));
-                        picture.set_visible(true);
+                        preview.set_visible_child(&picture);
                     }
                 ),
             );
-            picture
-        });
+        }
         if message.photo_preview {
-            let button = gtk::Button::new();
+            let button = gtk::Button::builder().child(&preview).build();
             button.add_css_class("flat");
-            button.set_tooltip_text(Some("Открыть фото"));
-            let body = gtk::Box::new(gtk::Orientation::Vertical, 3);
-            if let Some(picture) = picture {
-                body.append(&picture);
-            }
-            body.append(&label("Открыть фото", ""));
-            button.set_child(Some(&body));
+            button.add_css_class("attachment-preview");
+            button.update_property(&[gtk::accessible::Property::Label("Открыть фото")]);
             button.connect_clicked(glib::clone!(
                 #[weak(rename_to = ui)]
                 self,
                 move |_| ui.open_photo_preview(chat, id)
             ));
             bubble.append(&button);
-        } else if let Some(picture) = picture {
-            bubble.append(&picture);
+        } else {
+            bubble.append(&preview);
         }
     }
 
@@ -1531,7 +1620,13 @@ impl Ui {
     ) {
         if self.is_demo.get() {
             let texture = self.demo_image.get_or_init(demo_texture);
-            show(texture.upcast_ref());
+            if matches!(image, ChatImage::Attachment { .. }) {
+                if let Some(thumbnail) = scaled_thumbnail(texture.upcast_ref()) {
+                    show(&thumbnail);
+                }
+            } else {
+                show(texture.upcast_ref());
+            }
             return;
         }
         let Some(client) = self.client.borrow().clone() else {
@@ -1560,7 +1655,13 @@ impl Ui {
                             return;
                         };
                         let texture = result.ok().and_then(|bytes| {
-                            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+                            let texture =
+                                gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                                    .ok()?;
+                            match image {
+                                ChatImage::Avatar(_) => Some(texture),
+                                ChatImage::Attachment { .. } => scaled_thumbnail(&texture),
+                            }
                         });
                         if let Some(texture) = texture {
                             for show in targets {
@@ -1801,7 +1902,14 @@ impl Ui {
         Some(menu)
     }
 
+    fn composer_text(&self) -> glib::GString {
+        let buffer = self.input.buffer();
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true)
+    }
+
     fn update_send_button(&self) {
+        let text = self.composer_text();
+        self.input_placeholder.set_visible(text.is_empty());
         let uploads = self.uploads.borrow();
         let upload = self.selection.get().and_then(|chat| uploads.get(&chat));
         self.upload_bar.set_visible(upload.is_some());
@@ -1825,7 +1933,8 @@ impl Ui {
             .set_sensitive(self.input.is_sensitive() && !self.sending.get());
         self.send.set_sensitive(
             self.input.is_sensitive()
-                && (!self.input.text().trim().is_empty() || upload.is_some())
+                && (!text.trim().is_empty() || upload.is_some())
+                && text.trim().chars().count() <= 4096
                 && !self.sending.get(),
         );
     }
@@ -1882,7 +1991,7 @@ impl Ui {
         let Some(chat) = self.selection.get() else {
             return;
         };
-        let original = self.input.text().to_string();
+        let original = self.composer_text().to_string();
         let text = original.trim().to_owned();
         let upload = self.uploads.borrow().get(&chat).cloned();
         let reply = self.replies.borrow().get(&chat).cloned();
@@ -1890,11 +1999,7 @@ impl Ui {
         if self.is_demo.get() {
             let message = Message {
                 id: self.next_demo_message(),
-                text: if text.is_empty() {
-                    "Вложение".into()
-                } else {
-                    text
-                },
+                text,
                 sender: demo::OWN_NAME.into(),
                 sender_avatar: Some(demo::OWN_AVATAR),
                 outgoing: true,
@@ -1913,7 +2018,7 @@ impl Ui {
                 reactions: Vec::new(),
                 edited: false,
             };
-            self.input.set_text("");
+            self.input.buffer().set_text("");
             self.uploads.borrow_mut().remove(&chat);
             self.replies.borrow_mut().remove(&chat);
             self.update_send_button();
@@ -1946,8 +2051,8 @@ impl Ui {
                             ui.replies.borrow_mut().remove(&chat);
                         }
                         if ui.selection.get() == Some(chat) {
-                            if ui.input.text() == original {
-                                ui.input.set_text("");
+                            if ui.composer_text() == original {
+                                ui.input.buffer().set_text("");
                             }
                             if ui.search_anchor.get().is_some() {
                                 ui.show_chat(chat, None);
@@ -2072,7 +2177,11 @@ impl Ui {
             .iter_mut()
             .find(|item| item.id == chat)
         {
-            chat.preview.clone_from(&message.text);
+            chat.preview = if message.text.is_empty() && message.attachment.is_some() {
+                "Вложение".into()
+            } else {
+                message.text.clone()
+            };
             chat.preview_sender = chat.group.then(|| message.sender.clone());
         }
         if self.selection.get() == Some(chat) {
@@ -2549,6 +2658,28 @@ fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {
         quote.append(line);
     }
     (quote, author, excerpt)
+}
+
+fn scaled_thumbnail(texture: &gtk::gdk::Texture) -> Option<gtk::gdk::Texture> {
+    let width = f64::from(texture.width());
+    let height = f64::from(texture.height());
+    let scale = (264.0 / width).min(220.0 / height);
+    let width = (width * scale).round().max(1.0) as i32;
+    let height = (height * scale).round().max(1.0) as i32;
+    let mut download = gtk::gdk::TextureDownloader::new(texture);
+    download.set_format(gtk::gdk::MemoryFormat::R8g8b8a8);
+    let (bytes, stride) = download.download_bytes();
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+        &bytes,
+        gtk::gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        texture.width(),
+        texture.height(),
+        i32::try_from(stride).ok()?,
+    );
+    let thumbnail = pixbuf.scale_simple(width, height, gtk::gdk_pixbuf::InterpType::Bilinear)?;
+    Some(gtk::gdk::Texture::for_pixbuf(&thumbnail))
 }
 
 fn demo_texture() -> gtk::gdk::MemoryTexture {
