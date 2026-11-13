@@ -931,13 +931,30 @@ impl Ui {
                     bubble.append(&action);
                 }
             }
-            let time = timestamp
+            let mut time = timestamp
                 .and_then(|time| time.format("%H:%M").ok())
                 .unwrap_or_default();
+            if message.edited {
+                time = format!("Изменено · {time}").into();
+            }
             let time = label(&time, "message-time");
             time.add_css_class("dim-label");
             let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             footer.set_halign(gtk::Align::End);
+            if message.can_edit
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("document-edit-symbolic", "Редактировать");
+                button.add_css_class("flat");
+                let id = message.id;
+                let text = message.text.clone();
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.edit_message(chat, id, &text, false)
+                ));
+                footer.append(&button);
+            }
             if message.can_reply
                 && self.input.is_sensitive()
                 && let Some(chat) = self.selection.get()
@@ -1082,6 +1099,8 @@ impl Ui {
                 attachment: upload.as_ref().map(|upload| upload.name.clone()),
                 reply_to,
                 can_reply: true,
+                can_edit: upload.is_none(),
+                edited: false,
             };
             self.demo_messages
                 .borrow_mut()
@@ -1142,6 +1161,124 @@ impl Ui {
                 ui.update_send_button();
             },
         );
+    }
+
+    fn edit_message(self: &Rc<Self>, chat: i64, id: i32, initial: &str, retry: bool) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Редактировать сообщение")
+            .close_response("cancel")
+            .default_response("save")
+            .build();
+        dialog.add_response("cancel", "Отмена");
+        dialog.add_response("save", "Сохранить");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        let editor = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .accepts_tab(false)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
+            .build();
+        editor.update_property(&[gtk::accessible::Property::Label("Текст сообщения")]);
+        let buffer = editor.buffer();
+        buffer.set_text(initial);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&editor)
+            .min_content_height(96)
+            .max_content_height(230)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        scroll.add_css_class("card");
+        dialog.set_extra_child(Some(&scroll));
+        dialog.set_focus(Some(&editor));
+        dialog.set_response_enabled("save", retry);
+        buffer.connect_changed(glib::clone!(
+            #[weak]
+            dialog,
+            #[strong(rename_to = initial)]
+            initial.to_owned(),
+            move |buffer| {
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                let text = text.trim();
+                dialog.set_response_enabled(
+                    "save",
+                    !text.is_empty() && (retry || text != initial) && text.chars().count() <= 4096,
+                );
+            }
+        ));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if dialog.choose_future(Some(&window)).await != "save" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .trim()
+                .to_owned();
+            if ui.is_demo.get() {
+                ui.apply_text_edit(chat, id, text);
+                return;
+            }
+            let Some(client) = ui.client.borrow().clone() else {
+                return;
+            };
+            let request_text = text.clone();
+            ui.job(
+                async move { client.edit_text(chat, id, request_text).await },
+                move |ui, result| match result {
+                    Ok(()) => {
+                        ui.apply_text_edit(chat, id, text);
+                        ui.refresh_chats();
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => {
+                        if ui.selection.get() == Some(chat) {
+                            ui.edit_message(chat, id, &text, true);
+                        }
+                        ui.toast(&format!("Не удалось сохранить правку. {error}"));
+                    }
+                },
+            );
+        });
+    }
+
+    fn apply_text_edit(self: &Rc<Self>, chat: i64, id: i32, text: String) {
+        if self.is_demo.get() {
+            let mut demo = self.demo_messages.borrow_mut();
+            if let Some(messages) = demo.get_mut(&chat)
+                && let Some(message) = messages.iter_mut().find(|message| message.id == id)
+            {
+                message.text.clone_from(&text);
+                message.edited = true;
+                if messages.last().is_some_and(|message| message.id == id)
+                    && let Some(chat) = self
+                        .chats
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|item| item.id == chat)
+                {
+                    chat.preview.clone_from(&text);
+                }
+                self.render_chats();
+            }
+        }
+        if self.selection.get() == Some(chat)
+            && let Some(message) = self.messages.borrow_mut().get_mut(&id)
+        {
+            message.text = text;
+            message.edited = true;
+        }
+        if self.selection.get() == Some(chat) {
+            self.render_history(false);
+        }
     }
 
     fn save_file(self: &Rc<Self>, chat: i64, id: i32, name: String) {

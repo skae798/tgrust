@@ -406,15 +406,34 @@ impl Telegram {
         }
     }
 
-    async fn attachment_media(&self, peer: PeerRef, id: i32) -> Result<Media> {
-        let message = self
-            .client
+    pub async fn edit_text(&self, chat: i64, id: i32, text: String) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        let message = self.message_by_id(peer, id).await?;
+        ensure!(can_edit_text(&message), "Это сообщение нельзя изменить");
+        let link_preview = matches!(message.media(), Some(Media::WebPage(_)));
+        let edit = self.client.edit_message(
+            peer,
+            id,
+            InputMessage::new().text(text).link_preview(link_preview),
+        );
+        match edit.await {
+            Err(error) if error.is("MESSAGE_NOT_MODIFIED") => Ok(()),
+            result => Ok(result?),
+        }
+    }
+
+    async fn message_by_id(&self, peer: PeerRef, id: i32) -> Result<TelegramMessage> {
+        self.client
             .get_messages_by_id(peer, &[id])
             .await?
             .into_iter()
             .next()
             .flatten()
-            .context("Сообщение больше недоступно")?;
+            .context("Сообщение больше недоступно")
+    }
+
+    async fn attachment_media(&self, peer: PeerRef, id: i32) -> Result<Media> {
+        let message = self.message_by_id(peer, id).await?;
         attachment(&message)
             .map(|(media, _)| media)
             .context("Вложение больше недоступно")
@@ -488,7 +507,25 @@ fn message_view(message: &TelegramMessage) -> Message {
             _ => None,
         },
         can_reply: matches!(message.raw, enums::Message::Message(_)),
+        can_edit: can_edit_text(message),
+        edited: message.edit_date().is_some() && !message.edit_hide(),
     }
+}
+
+fn can_edit_text(message: &TelegramMessage) -> bool {
+    let enums::Message::Message(raw) = &message.raw else {
+        return false;
+    };
+    message.outgoing()
+        && !message.text().is_empty()
+        && raw.fwd_from.is_none()
+        && raw.via_bot_id.is_none()
+        && raw.ttl_period.is_none()
+        && (raw.entities.as_ref().is_none_or(Vec::is_empty))
+        && matches!(
+            raw.media,
+            None | Some(enums::MessageMedia::Empty | enums::MessageMedia::WebPage(_))
+        )
 }
 
 fn preview(message: &TelegramMessage) -> String {
