@@ -13,8 +13,8 @@ use tokio::sync::watch;
 
 use crate::demo;
 use crate::model::{
-    COMMON_REACTIONS, Chat, ChatImage, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload,
-    UploadKind, merge_latest_history,
+    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Message, Reaction, Reply, SearchHit,
+    UpdateStatus, Upload, UploadKind, merge_latest_history,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -44,6 +44,7 @@ struct Ui {
     filter: gtk::SearchEntry,
     archive: gtk::ToggleButton,
     archive_chat: gtk::Button,
+    folder_picker: gtk::DropDown,
     content: gtk::Stack,
     title: adw::WindowTitle,
     history: gtk::Box,
@@ -65,6 +66,9 @@ struct Ui {
     login_step: Cell<LoginStep>,
     is_demo: Cell<bool>,
     chats: RefCell<Vec<Chat>>,
+    folders: RefCell<Vec<ChatFolder>>,
+    folders_generation: Cell<u64>,
+    updating_folders: Cell<bool>,
     search_chat: RefCell<Option<Chat>>,
     selection: Cell<Option<i64>>,
     generation: Cell<u64>,
@@ -180,6 +184,12 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .margin_end(10)
         .build();
     side_body.append(&filter);
+    let folder_picker = gtk::DropDown::from_strings(&["Все чаты"]);
+    folder_picker.set_margin_start(10);
+    folder_picker.set_margin_end(10);
+    folder_picker.set_visible(false);
+    folder_picker.update_property(&[gtk::accessible::Property::Label("Папки чатов")]);
+    side_body.append(&folder_picker);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("navigation-sidebar");
@@ -317,6 +327,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         filter,
         archive,
         archive_chat,
+        folder_picker,
         content,
         title,
         history,
@@ -338,6 +349,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         login_step: Cell::new(LoginStep::Phone),
         is_demo: Cell::new(false),
         chats: RefCell::new(Vec::new()),
+        folders: RefCell::new(Vec::new()),
+        folders_generation: Cell::new(0),
+        updating_folders: Cell::new(false),
         search_chat: RefCell::new(None),
         selection: Cell::new(None),
         generation: Cell::new(0),
@@ -392,6 +406,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         ui,
         move |_| {
             ui.refresh_chats();
+            ui.refresh_folders();
             ui.load_history(None, false);
         }
     ));
@@ -399,8 +414,18 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         #[weak]
         ui,
         move |_| {
+            ui.folder_picker.set_sensitive(!ui.archive.is_active());
             ui.render_chats();
             ui.split.set_show_content(false);
+        }
+    ));
+    ui.folder_picker.connect_selected_notify(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if !ui.updating_folders.get() {
+                ui.render_chats();
+            }
         }
     ));
     ui.archive_chat.connect_clicked(glib::clone!(
@@ -717,7 +742,7 @@ impl Ui {
         self.client.replace(None);
         self.root.set_visible_child_name("chats");
         self.chats.replace(demo::chats());
-        self.render_chats();
+        self.set_folders(demo::folders());
         if !self.split.is_collapsed() {
             self.select_chat(1);
         }
@@ -726,6 +751,7 @@ impl Ui {
     fn start_client(self: &Rc<Self>) {
         self.root.set_visible_child_name("chats");
         self.refresh_chats();
+        self.refresh_folders();
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
@@ -769,6 +795,9 @@ impl Ui {
                         ui.load_history(None, true);
                     }
                 }
+                if status.folders_revision != previous.folders_revision {
+                    ui.refresh_folders();
+                }
                 previous = status;
             }
         });
@@ -797,15 +826,75 @@ impl Ui {
         });
     }
 
+    fn refresh_folders(self: &Rc<Self>) {
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let request = self.folders_generation.get().wrapping_add(1);
+        self.folders_generation.set(request);
+        self.job(async move { client.folders().await }, move |ui, result| {
+            if request != ui.folders_generation.get() {
+                return;
+            }
+            match result {
+                Ok(folders) => ui.set_folders(folders),
+                Err(error) => ui.toast(&format!("Не удалось загрузить папки. {error}")),
+            }
+        });
+    }
+
+    fn set_folders(self: &Rc<Self>, folders: Vec<ChatFolder>) {
+        let current_id = self.selected_folder().map(|folder| folder.id);
+        let names = gtk::StringList::new(&["Все чаты"]);
+        let mut selection = 0;
+        for (index, folder) in folders.iter().enumerate() {
+            names.append(&folder.title);
+            if current_id == Some(folder.id) {
+                selection = index as u32 + 1;
+            }
+        }
+        self.updating_folders.set(true);
+        self.folder_picker.set_model(Some(&names));
+        self.folder_picker.set_selected(selection);
+        self.folder_picker.set_visible(!folders.is_empty());
+        self.folders.replace(folders);
+        self.updating_folders.set(false);
+        self.render_chats();
+    }
+
+    fn selected_folder(&self) -> Option<ChatFolder> {
+        let index = self.folder_picker.selected().checked_sub(1)? as usize;
+        self.folders.borrow().get(index).cloned()
+    }
+
     fn render_chats(self: &Rc<Self>) {
         self.update_archive_button();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
         let query = self.filter.text().trim().to_lowercase();
-        for chat in self.chats.borrow().iter().filter(|chat| {
-            chat.archived == self.archive.is_active() && chat.title.to_lowercase().contains(&query)
-        }) {
+        let archive = self.archive.is_active();
+        let folder = (!archive).then(|| self.selected_folder()).flatten();
+        let chats = self.chats.borrow();
+        let mut visible = chats
+            .iter()
+            .filter(|chat| {
+                let in_list = folder
+                    .as_ref()
+                    .map_or(chat.archived == archive, |folder| folder.contains(chat));
+                in_list && chat.title.to_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+        if let Some(folder) = &folder {
+            visible.sort_by_key(|chat| {
+                folder
+                    .pinned
+                    .iter()
+                    .position(|id| *id == chat.id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        for chat in visible {
             let row = gtk::ListBoxRow::new();
             row.set_widget_name(&chat.id.to_string());
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -1115,7 +1204,14 @@ impl Ui {
             return;
         };
         if self.chats.borrow().iter().any(|item| item.id == id) {
-            self.archive.set_active(chat.archived);
+            let in_folder = !self.archive.is_active()
+                && self
+                    .selected_folder()
+                    .is_some_and(|folder| folder.contains(&chat));
+            if !in_folder {
+                self.folder_picker.set_selected(0);
+                self.archive.set_active(chat.archived);
+            }
         }
         self.split.set_show_content(true);
         if self.selection.get() == Some(id)

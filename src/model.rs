@@ -12,7 +12,46 @@ pub struct Chat {
     pub broadcast: bool,
     pub saved_messages: bool,
     pub archived: bool,
+    pub kind: ChatKind,
+    pub muted: bool,
     pub avatar: Option<Avatar>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChatKind {
+    Contact,
+    User,
+    Group,
+    Broadcast,
+    Bot,
+}
+
+#[derive(Clone, Default)]
+pub struct ChatFolder {
+    pub id: i32,
+    pub title: String,
+    pub pinned: Vec<i64>,
+    pub included: Vec<i64>,
+    pub excluded: Vec<i64>,
+    pub kinds: Vec<ChatKind>,
+    pub exclude_muted: bool,
+    pub exclude_read: bool,
+    pub exclude_archived: bool,
+}
+
+impl ChatFolder {
+    pub fn contains(&self, chat: &Chat) -> bool {
+        if self.excluded.contains(&chat.id) {
+            return false;
+        }
+        if self.pinned.contains(&chat.id) || self.included.contains(&chat.id) {
+            return true;
+        }
+        self.kinds.contains(&chat.kind)
+            && (!self.exclude_muted || !chat.muted)
+            && (!self.exclude_read || chat.unread > 0)
+            && (!self.exclude_archived || !chat.archived)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -111,6 +150,7 @@ impl Message {
 #[derive(Clone, Copy, Default)]
 pub struct UpdateStatus {
     pub revision: u64,
+    pub folders_revision: u64,
     pub reconnecting: bool,
 }
 
@@ -158,6 +198,34 @@ pub fn merge_latest_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_folder_members_override_categories_and_archive_filter() {
+        let chat = Chat {
+            id: 1,
+            title: "Тест".into(),
+            preview: String::new(),
+            preview_sender: None,
+            group: true,
+            unread: 0,
+            broadcast: false,
+            saved_messages: false,
+            archived: true,
+            kind: ChatKind::Group,
+            muted: false,
+            avatar: None,
+        };
+        let mut folder = ChatFolder {
+            kinds: vec![ChatKind::Group],
+            exclude_archived: true,
+            ..ChatFolder::default()
+        };
+        assert!(!folder.contains(&chat));
+        folder.pinned.push(chat.id);
+        assert!(folder.contains(&chat));
+        folder.excluded.push(chat.id);
+        assert!(!folder.contains(&chat));
+    }
 
     fn messages(ids: &[i32]) -> Vec<Message> {
         ids.iter()

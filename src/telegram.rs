@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::client::{LoginToken, PasswordToken};
@@ -20,8 +20,8 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatImage, Message, Reaction, ReplyPreview, SearchHit,
-    UpdateStatus, Upload, UploadKind,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Message, Reaction,
+    ReplyPreview, SearchHit, UpdateStatus, Upload, UploadKind,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -221,8 +221,19 @@ impl Telegram {
                             | enums::Update::PinnedChannelMessages(_)
                             | enums::Update::MessageReactions(_)
                             | enums::Update::FolderPeers(_)
+                            | enums::Update::NotifySettings(_)
                     ) {
                         self.invalidate_views();
+                    }
+                    if matches!(
+                        update.raw(),
+                        enums::Update::DialogFilter(_)
+                            | enums::Update::DialogFilterOrder(_)
+                            | enums::Update::DialogFilters
+                    ) {
+                        self.changes.send_modify(|status| {
+                            status.folders_revision = status.folders_revision.wrapping_add(1)
+                        });
                     }
                 }
                 Err(error) if !self.runner.is_finished() && retry_update_error(&error) => {
@@ -264,6 +275,7 @@ impl Telegram {
                     self.changes.send_modify(|status| {
                         status.reconnecting = false;
                         status.revision = status.revision.wrapping_add(1);
+                        status.folders_revision = status.folders_revision.wrapping_add(1);
                     });
                     // The existing stream can now resume its pending difference request.
                     return Ok(());
@@ -288,6 +300,10 @@ impl Telegram {
 
     pub async fn chats(&self) -> Result<Vec<Chat>> {
         let profile = self.profile().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut chats = Vec::new();
         let mut peers = HashMap::new();
         let mut dialogs = self.client.iter_dialogs().limit(150);
@@ -323,11 +339,17 @@ impl Telegram {
                     })
                     .flatten(),
                 group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
-                unread: raw.unread_count,
+                unread: raw.unread_count.max(i32::from(raw.unread_mark)),
                 broadcast: matches!(peer, Peer::Channel(_)),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
                 avatar: peer_avatar(peer),
                 archived: raw.folder_id == Some(1),
+                kind: chat_kind(peer),
+                muted: match &raw.notify_settings {
+                    enums::PeerNotifySettings::Settings(settings) => settings
+                        .mute_until
+                        .is_some_and(|until| i64::from(until) > now as i64),
+                },
             });
             peers.insert(id, dialog.peer_ref());
         }
@@ -342,6 +364,19 @@ impl Telegram {
             .get(&id)
             .copied()
             .context("Чат не найден")
+    }
+
+    pub async fn folders(&self) -> Result<Vec<ChatFolder>> {
+        let self_id = self.self_id().await?;
+        let enums::messages::DialogFilters::Filters(result) = self
+            .client
+            .invoke(&grammers_client::tl::functions::messages::GetDialogFilters {})
+            .await?;
+        Ok(result
+            .filters
+            .into_iter()
+            .filter_map(|folder| folder_view(folder, self_id))
+            .collect())
     }
 
     pub async fn set_archived(&self, chat: i64, archived: bool) -> Result<()> {
@@ -418,6 +453,8 @@ impl Telegram {
                         || matches!(peer, Peer::User(user) if user.is_self()),
                     avatar: peer_avatar(peer),
                     archived: false,
+                    kind: chat_kind(peer),
+                    muted: false,
                 },
                 message: message_view(&message, self_id, profile),
             });
@@ -940,6 +977,74 @@ fn peer_avatar(peer: &Peer) -> Option<Avatar> {
         photo,
         dc,
     })
+}
+
+fn chat_kind(peer: &Peer) -> ChatKind {
+    match peer {
+        Peer::User(user) if user.is_bot() => ChatKind::Bot,
+        Peer::User(user) if user.contact() => ChatKind::Contact,
+        Peer::User(_) => ChatKind::User,
+        Peer::Channel(_) => ChatKind::Broadcast,
+        Peer::Group(_) | Peer::Community(_) => ChatKind::Group,
+    }
+}
+
+fn folder_view(folder: enums::DialogFilter, self_id: Option<PeerId>) -> Option<ChatFolder> {
+    fn peers(peers: Vec<enums::InputPeer>, self_id: Option<PeerId>) -> Vec<i64> {
+        peers
+            .into_iter()
+            .filter_map(|peer| {
+                match peer {
+                    enums::InputPeer::PeerSelf => self_id,
+                    enums::InputPeer::User(peer) => PeerId::user(peer.user_id),
+                    enums::InputPeer::Chat(peer) => PeerId::chat(peer.chat_id),
+                    enums::InputPeer::Channel(peer) => PeerId::channel(peer.channel_id),
+                    enums::InputPeer::UserFromMessage(peer) => PeerId::user(peer.user_id),
+                    enums::InputPeer::ChannelFromMessage(peer) => PeerId::channel(peer.channel_id),
+                    enums::InputPeer::Empty => None,
+                }?
+                .bot_api_dialog_id()
+            })
+            .collect()
+    }
+    let result = match folder {
+        enums::DialogFilter::Filter(folder) => {
+            let enums::TextWithEntities::Entities(title) = folder.title;
+            let kinds = [
+                (folder.contacts, ChatKind::Contact),
+                (folder.non_contacts, ChatKind::User),
+                (folder.groups, ChatKind::Group),
+                (folder.broadcasts, ChatKind::Broadcast),
+                (folder.bots, ChatKind::Bot),
+            ]
+            .into_iter()
+            .filter_map(|(enabled, kind)| enabled.then_some(kind))
+            .collect();
+            ChatFolder {
+                id: folder.id,
+                title: title.text,
+                pinned: peers(folder.pinned_peers, self_id),
+                included: peers(folder.include_peers, self_id),
+                excluded: peers(folder.exclude_peers, self_id),
+                kinds,
+                exclude_muted: folder.exclude_muted,
+                exclude_read: folder.exclude_read,
+                exclude_archived: folder.exclude_archived,
+            }
+        }
+        enums::DialogFilter::Chatlist(folder) => {
+            let enums::TextWithEntities::Entities(title) = folder.title;
+            ChatFolder {
+                id: folder.id,
+                title: title.text,
+                pinned: peers(folder.pinned_peers, self_id),
+                included: peers(folder.include_peers, self_id),
+                ..ChatFolder::default()
+            }
+        }
+        enums::DialogFilter::Default => return None,
+    };
+    Some(result)
 }
 
 fn pick_thumbnail(sizes: Vec<PhotoSize>) -> Option<PhotoSize> {
