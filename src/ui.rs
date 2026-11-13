@@ -57,6 +57,7 @@ struct Ui {
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
+    demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<i64, String>>,
     uploads: RefCell<HashMap<i64, Upload>>,
     replies: RefCell<HashMap<i64, Reply>>,
@@ -271,6 +272,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
         demo_messages: RefCell::new(HashMap::new()),
+        demo_next_message: Cell::new(100),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
@@ -941,6 +943,19 @@ impl Ui {
             time.add_css_class("dim-label");
             let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             footer.set_halign(gtk::Align::End);
+            if message.can_delete
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("user-trash-symbolic", "Удалить");
+                button.add_css_class("flat");
+                let id = message.id;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.delete_message(chat, id)
+                ));
+                footer.append(&button);
+            }
             if message.can_edit
                 && let Some(chat) = self.selection.get()
             {
@@ -1081,11 +1096,8 @@ impl Ui {
         let reply = self.replies.borrow().get(&chat).cloned();
         let reply_to = reply.as_ref().map(|reply| reply.id);
         if self.is_demo.get() {
-            let id = self
-                .messages
-                .borrow()
-                .last_key_value()
-                .map_or(1, |(&id, _)| id + 1);
+            let id = self.demo_next_message.get();
+            self.demo_next_message.set(id + 1);
             let message = Message {
                 id,
                 text: if text.is_empty() {
@@ -1100,6 +1112,7 @@ impl Ui {
                 reply_to,
                 can_reply: true,
                 can_edit: upload.is_none(),
+                can_delete: true,
                 edited: false,
             };
             self.demo_messages
@@ -1277,6 +1290,81 @@ impl Ui {
             message.edited = true;
         }
         if self.selection.get() == Some(chat) {
+            self.render_history(false);
+        }
+    }
+
+    fn delete_message(self: &Rc<Self>, chat: i64, id: i32) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Удалить сообщение?")
+            .body("Сообщение будет удалено для всех участников чата.")
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Отмена");
+        dialog.add_response("delete", "Удалить для всех");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if dialog.choose_future(Some(&window)).await != "delete" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.is_demo.get() {
+                ui.apply_deletion(chat, id);
+                return;
+            }
+            let Some(client) = ui.client.borrow().clone() else {
+                return;
+            };
+            ui.job(
+                async move { client.delete_message(chat, id).await },
+                move |ui, result| match result {
+                    Ok(()) => {
+                        ui.apply_deletion(chat, id);
+                        ui.refresh_chats();
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => ui.toast(&format!("Не удалось удалить сообщение. {error}")),
+                },
+            );
+        });
+    }
+
+    fn apply_deletion(self: &Rc<Self>, chat: i64, id: i32) {
+        if self.is_demo.get()
+            && let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
+        {
+            messages.retain(|message| message.id != id);
+            if let Some(chat) = self
+                .chats
+                .borrow_mut()
+                .iter_mut()
+                .find(|item| item.id == chat)
+            {
+                chat.preview = messages
+                    .last()
+                    .map(|message| message.text.clone())
+                    .unwrap_or_default();
+            }
+            self.render_chats();
+        }
+        if self
+            .replies
+            .borrow()
+            .get(&chat)
+            .is_some_and(|reply| reply.id == id)
+        {
+            self.replies.borrow_mut().remove(&chat);
+        }
+        if self.selection.get() == Some(chat) {
+            self.messages.borrow_mut().remove(&id);
+            self.update_send_button();
             self.render_history(false);
         }
     }

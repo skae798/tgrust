@@ -21,6 +21,7 @@ pub struct Message {
     pub reply_to: Option<i32>,
     pub can_reply: bool,
     pub can_edit: bool,
+    pub can_delete: bool,
     pub edited: bool,
 }
 
@@ -103,6 +104,7 @@ mod tests {
                 reply_to: None,
                 can_reply: true,
                 can_edit: false,
+                can_delete: false,
                 edited: false,
             })
             .collect()

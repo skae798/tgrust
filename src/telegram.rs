@@ -408,7 +408,10 @@ impl Telegram {
 
     pub async fn edit_text(&self, chat: i64, id: i32, text: String) -> Result<()> {
         let peer = self.peer(chat).await?;
-        let message = self.message_by_id(peer, id).await?;
+        let message = self
+            .message_by_id(peer, id)
+            .await?
+            .context("Сообщение больше недоступно")?;
         ensure!(can_edit_text(&message), "Это сообщение нельзя изменить");
         let link_preview = matches!(message.media(), Some(Media::WebPage(_)));
         let edit = self.client.edit_message(
@@ -422,18 +425,34 @@ impl Telegram {
         }
     }
 
-    async fn message_by_id(&self, peer: PeerRef, id: i32) -> Result<TelegramMessage> {
-        self.client
+    pub async fn delete_message(&self, chat: i64, id: i32) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        let Some(message) = self.message_by_id(peer, id).await? else {
+            return Ok(());
+        };
+        ensure!(
+            message.outgoing() && matches!(message.raw, enums::Message::Message(_)),
+            "Это сообщение нельзя удалить"
+        );
+        self.client.delete_messages(peer, &[id]).await?;
+        Ok(())
+    }
+
+    async fn message_by_id(&self, peer: PeerRef, id: i32) -> Result<Option<TelegramMessage>> {
+        Ok(self
+            .client
             .get_messages_by_id(peer, &[id])
             .await?
             .into_iter()
             .next()
-            .flatten()
-            .context("Сообщение больше недоступно")
+            .flatten())
     }
 
     async fn attachment_media(&self, peer: PeerRef, id: i32) -> Result<Media> {
-        let message = self.message_by_id(peer, id).await?;
+        let message = self
+            .message_by_id(peer, id)
+            .await?
+            .context("Сообщение больше недоступно")?;
         attachment(&message)
             .map(|(media, _)| media)
             .context("Вложение больше недоступно")
@@ -508,6 +527,7 @@ fn message_view(message: &TelegramMessage) -> Message {
         },
         can_reply: matches!(message.raw, enums::Message::Message(_)),
         can_edit: can_edit_text(message),
+        can_delete: outgoing && matches!(message.raw, enums::Message::Message(_)),
         edited: message.edit_date().is_some() && !message.edit_hide(),
     }
 }
