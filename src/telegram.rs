@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::client::{LoginToken, PasswordToken};
@@ -16,7 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 use crate::model::{Chat, Message};
-use crate::storage::{attachment_name, session_path};
+use crate::storage::{attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
 
@@ -46,15 +47,35 @@ pub struct Telegram {
 
 impl Telegram {
     pub async fn connect(api_id: i32, api_hash: String) -> Result<(Arc<Self>, LoginStep)> {
-        let session = Arc::new(SqliteSession::open(session_path(api_id)?).await?);
+        let (path, lock) = open_session_file(api_id)?;
+        let session = Arc::new(
+            SqliteSession::open(path)
+                .await
+                .context("Не удалось открыть базу сессии")?,
+        );
         let SenderPool {
             runner,
             updates,
             handle,
         } = SenderPool::new(session, api_id);
         let client = Client::new(handle);
-        tokio::spawn(runner.run());
-        let (state, step) = if client.is_authorized().await? {
+        let runner = tokio::spawn(async move {
+            let _lock = lock;
+            runner.run().await;
+        });
+        let authorized = match tokio::time::timeout(Duration::from_secs(20), client.is_authorized())
+            .await
+            .context("Telegram не ответил вовремя")
+            .and_then(|result| result.map_err(anyhow::Error::from))
+        {
+            Ok(authorized) => authorized,
+            Err(error) => {
+                runner.abort();
+                let _ = runner.await;
+                return Err(error);
+            }
+        };
+        let (state, step) = if authorized {
             (LoginState::Authorized, LoginStep::Authorized)
         } else {
             (LoginState::Phone, LoginStep::Phone)
@@ -71,6 +92,15 @@ impl Telegram {
             }),
             step,
         ))
+    }
+
+    pub async fn login_step(&self) -> LoginStep {
+        match &*self.state.lock().await {
+            LoginState::Phone => LoginStep::Phone,
+            LoginState::Code(_) => LoginStep::Code,
+            LoginState::Password(_) => LoginStep::Password,
+            LoginState::Authorized => LoginStep::Authorized,
+        }
     }
 
     pub async fn login(&self, value: &str) -> Result<LoginStep> {
