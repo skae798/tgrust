@@ -47,6 +47,8 @@ struct Ui {
     content: gtk::Stack,
     title: adw::WindowTitle,
     history: gtk::Box,
+    message_menu: gtk::Popover,
+    menu_message: Cell<Option<i32>>,
     scroll: gtk::ScrolledWindow,
     older: gtk::Button,
     latest: gtk::Button,
@@ -56,6 +58,7 @@ struct Ui {
     upload_bar: gtk::Box,
     upload_name: gtk::Label,
     reply_bar: gtk::Box,
+    reply_sender: gtk::Label,
     reply_label: gtk::Label,
     client: RefCell<Option<Arc<Telegram>>>,
     login_step: Cell<LoginStep>,
@@ -218,7 +221,13 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
-    conversation.append(&scroll);
+    let history_overlay = gtk::Overlay::new();
+    history_overlay.set_vexpand(true);
+    history_overlay.set_child(Some(&scroll));
+    let message_menu = gtk::Popover::new();
+    message_menu.set_has_arrow(false);
+    history_overlay.add_overlay(&message_menu);
+    conversation.append(&history_overlay);
 
     let composer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     composer.add_css_class("composer");
@@ -242,11 +251,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     reply_bar.add_css_class("composer");
     reply_bar.set_visible(false);
-    let reply_label = label("", "dim-label");
-    reply_label.set_hexpand(true);
-    reply_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let (reply_quote, reply_sender, reply_label) = reply_quote();
+    reply_quote.set_hexpand(true);
     let remove_reply = icon_button("edit-clear-symbolic", "Отменить ответ");
-    reply_bar.append(&reply_label);
+    reply_bar.append(&reply_quote);
     reply_bar.append(&remove_reply);
     let input = gtk::Entry::builder()
         .hexpand(true)
@@ -286,6 +294,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         content,
         title,
         history,
+        message_menu,
+        menu_message: Cell::new(None),
         scroll,
         older,
         latest,
@@ -295,6 +305,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         upload_bar,
         upload_name,
         reply_bar,
+        reply_sender,
         reply_label,
         client: RefCell::new(None),
         login_step: Cell::new(LoginStep::Phone),
@@ -455,6 +466,26 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
             }
         }
     ));
+
+    let menu_keys = gtk::EventControllerKey::new();
+    menu_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    menu_keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        ui,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, _| {
+            if key != gtk::gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            ui.message_menu.popdown();
+            if let Some(bubble) = ui.menu_message.get().and_then(|id| ui.message_bubble(id)) {
+                bubble.grab_focus();
+            }
+            glib::Propagation::Stop
+        }
+    ));
+    ui.message_menu.add_controller(menu_keys);
 
     window.connect_close_request({
         let ui = Rc::clone(&ui);
@@ -740,7 +771,11 @@ impl Ui {
             description.set_valign(gtk::Align::Center);
             let title = label(&chat.title, "heading");
             title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            let preview = label(&chat.preview, "chat-preview");
+            let preview_text = chat.preview_sender.as_ref().map_or_else(
+                || chat.preview.clone(),
+                |sender| format!("{sender}: {}", chat.preview),
+            );
+            let preview = label(&preview_text, "chat-preview");
             preview.add_css_class("dim-label");
             preview.set_single_line_mode(true);
             preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -1045,6 +1080,7 @@ impl Ui {
                 .insert(previous, self.input.text().to_string());
         }
         self.update_archive_button();
+        self.message_menu.popdown();
         self.generation.set(self.generation.get().wrapping_add(1));
         self.search_anchor.set(anchor);
         self.scroll_to_search_result.set(anchor.is_some());
@@ -1235,6 +1271,7 @@ impl Ui {
             }
             let bubble = gtk::Box::new(gtk::Orientation::Vertical, 4);
             bubble.add_css_class("message-bubble");
+            bubble.set_widget_name(&format!("message-{}", message.id));
             if self.search_anchor.get() == Some(message.id) {
                 bubble.add_css_class("search-result");
             }
@@ -1246,18 +1283,16 @@ impl Ui {
             } else {
                 gtk::Align::Start
             });
-            if !message.outgoing {
-                let author = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                let avatar = adw::Avatar::new(24, Some(&message.sender), true);
-                if let Some(photo) = message.sender_avatar {
-                    self.load_avatar(&avatar, ChatImage::Avatar(photo));
-                }
-                author.append(&avatar);
-                let name = label(&message.sender, "message-name");
-                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                author.append(&name);
-                bubble.append(&author);
+            let author = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let avatar = adw::Avatar::new(24, Some(&message.sender), true);
+            if let Some(photo) = message.sender_avatar {
+                self.load_avatar(&avatar, ChatImage::Avatar(photo));
             }
+            author.append(&avatar);
+            let name = label(&message.sender, "message-name");
+            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            author.append(&name);
+            bubble.append(&author);
             if message.forwarded {
                 bubble.append(&label("Пересланное сообщение", "dim-label"));
             }
@@ -1265,13 +1300,34 @@ impl Ui {
                 bubble.append(&label("Закреплено", "dim-label"));
             }
             if let Some(id) = message.reply_to {
-                let summary = messages
-                    .get(&id)
-                    .map_or_else(|| "Исходное сообщение".into(), Message::reply_summary);
-                let reply = label(&format!("Ответ · {summary}"), "dim-label");
-                reply.set_max_width_chars(44);
-                reply.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                bubble.append(&reply);
+                let original = messages.get(&id).map(Message::reply_preview);
+                let preview = message.reply_preview.as_ref().or(original.as_ref());
+                let (quote, author, excerpt) = reply_quote();
+                author.set_text(
+                    original
+                        .as_ref()
+                        .and_then(|item| item.sender.as_deref())
+                        .or_else(|| preview.and_then(|item| item.sender.as_deref()))
+                        .unwrap_or("Исходное сообщение"),
+                );
+                excerpt.set_text(preview.map_or("", |item| item.text.as_str()));
+                excerpt.set_visible(preview.is_some());
+                if let Some(chat) = self.selection.get() {
+                    let button = gtk::Button::builder().child(&quote).build();
+                    button.add_css_class("flat");
+                    button.add_css_class("reply-link");
+                    button.connect_clicked(glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        move |_| ui.open_reply(chat, id)
+                    ));
+                    bubble.append(&button);
+                }
+            } else if let Some(preview) = &message.reply_preview {
+                let (quote, author, excerpt) = reply_quote();
+                author.set_text("Цитата");
+                excerpt.set_text(&preview.text);
+                bubble.append(&quote);
             }
             if !message.text.is_empty() {
                 let text = label(&message.text, "");
@@ -1321,10 +1377,8 @@ impl Ui {
                 }
                 bubble.append(&reactions);
             }
-            if let Some(chat) = self.selection.get()
-                && let Some(menu) = self.message_menu(&bubble, chat, message)
-            {
-                footer.append(&menu);
+            if let Some(chat) = self.selection.get() {
+                self.connect_message_menu(&bubble, chat, message.id);
             }
             footer.append(&time);
             bubble.append(&footer);
@@ -1367,6 +1421,45 @@ impl Ui {
                             adjustment.set_value(adjustment.upper());
                         }
                     }
+                ),
+            );
+        }
+    }
+
+    fn message_bubble(&self, id: i32) -> Option<gtk::Widget> {
+        let name = format!("message-{id}");
+        let mut child = self.history.first_child();
+        while let Some(candidate) = child {
+            if candidate.widget_name() == name {
+                return Some(candidate);
+            }
+            child = candidate.next_sibling();
+        }
+        None
+    }
+
+    fn open_reply(self: &Rc<Self>, chat: i64, id: i32) {
+        if self.selection.get() != Some(chat) {
+            return;
+        }
+        if !self.messages.borrow().contains_key(&id) {
+            self.show_chat(chat, Some(id));
+            return;
+        }
+        let Some(bubble) = self.message_bubble(id) else {
+            return;
+        };
+        if let Some(bounds) = bubble.compute_bounds(&self.history) {
+            let adjustment = self.scroll.vadjustment();
+            adjustment.set_value(f64::from(bounds.y()) - adjustment.page_size() / 3.0);
+            bubble.grab_focus();
+            bubble.add_css_class("reply-target");
+            glib::timeout_add_local_once(
+                Duration::from_millis(850),
+                glib::clone!(
+                    #[weak]
+                    bubble,
+                    move || bubble.remove_css_class("reply-target")
                 ),
             );
         }
@@ -1488,19 +1581,92 @@ impl Ui {
         }
     }
 
-    fn message_menu(
-        self: &Rc<Self>,
-        bubble: &gtk::Box,
-        chat: i64,
-        message: &Message,
-    ) -> Option<gtk::MenuButton> {
+    fn connect_message_menu(self: &Rc<Self>, bubble: &gtk::Box, chat: i64, id: i32) {
+        bubble.set_focusable(true);
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(|gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        click.connect_released(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[weak]
+            bubble,
+            move |_, _, x, y| ui.open_message_menu(&bubble, chat, id, x, y)
+        ));
+        bubble.add_controller(click);
+
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[weak]
+            bubble,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, modifiers| {
+                if key == gtk::gdk::Key::Menu
+                    || (key == gtk::gdk::Key::F10
+                        && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+                {
+                    ui.open_message_menu(
+                        &bubble,
+                        chat,
+                        id,
+                        f64::from(bubble.width()) / 2.0,
+                        f64::from(bubble.height()) / 2.0,
+                    );
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        bubble.add_controller(keys);
+    }
+
+    fn open_message_menu(self: &Rc<Self>, bubble: &gtk::Box, chat: i64, id: i32, x: f64, y: f64) {
+        if self.selection.get() != Some(chat) {
+            return;
+        }
+        let Some(message) = self.messages.borrow().get(&id).cloned() else {
+            return;
+        };
+        let Some(parent) = self.message_menu.parent() else {
+            return;
+        };
+        let Some(point) =
+            bubble.compute_point(&parent, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        let Some(menu) = self.message_menu_content(chat, &message) else {
+            return;
+        };
+        self.menu_message.set(Some(id));
+        self.message_menu.set_child(Some(&menu));
+        self.message_menu
+            .set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                point.x() as i32,
+                point.y() as i32,
+                1,
+                1,
+            )));
+        self.message_menu.popup();
+        self.message_menu
+            .child_focus(gtk::DirectionType::TabForward);
+    }
+
+    fn message_menu_content(self: &Rc<Self>, chat: i64, message: &Message) -> Option<gtk::Box> {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let id = message.id;
         if message.can_reply {
             if self.input.is_sensitive() {
                 let reply = Reply {
                     id,
-                    summary: message.reply_summary(),
+                    preview: message.reply_preview(),
                 };
                 add_menu_button(
                     &menu,
@@ -1632,42 +1798,7 @@ impl Ui {
             );
         }
         menu.first_child()?;
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&menu));
-        let button = gtk::MenuButton::builder()
-            .icon_name("view-more-symbolic")
-            .tooltip_text("Действия с сообщением")
-            .popover(&popover)
-            .build();
-        button.add_css_class("flat");
-        let click = gtk::GestureClick::new();
-        click.set_button(gtk::gdk::BUTTON_SECONDARY);
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        click.connect_pressed(glib::clone!(
-            #[weak]
-            bubble,
-            #[weak]
-            button,
-            #[weak]
-            popover,
-            move |gesture, _, x, y| {
-                if let Some(point) =
-                    bubble.compute_point(&button, &gtk::graphene::Point::new(x as f32, y as f32))
-                {
-                    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                        point.x() as i32,
-                        point.y() as i32,
-                        1,
-                        1,
-                    )));
-                }
-                gesture.set_state(gtk::EventSequenceState::Claimed);
-                button.popup();
-            }
-        ));
-        popover.connect_closed(|popover| popover.set_pointing_to(None));
-        bubble.add_controller(click);
-        Some(button)
+        Some(menu)
     }
 
     fn update_send_button(&self) {
@@ -1681,8 +1812,14 @@ impl Ui {
         let reply = self.selection.get().and_then(|chat| replies.get(&chat));
         self.reply_bar.set_visible(reply.is_some());
         if let Some(reply) = reply {
-            self.reply_label
-                .set_text(&format!("Ответ · {}", reply.summary));
+            self.reply_sender.set_text(
+                reply
+                    .preview
+                    .sender
+                    .as_deref()
+                    .unwrap_or("Исходное сообщение"),
+            );
+            self.reply_label.set_text(&reply.preview.text);
         }
         self.attach
             .set_sensitive(self.input.is_sensitive() && !self.sending.get());
@@ -1758,14 +1895,15 @@ impl Ui {
                 } else {
                     text
                 },
-                sender: "Вы".into(),
-                sender_avatar: None,
+                sender: demo::OWN_NAME.into(),
+                sender_avatar: Some(demo::OWN_AVATAR),
                 outgoing: true,
                 timestamp: demo::now(),
                 attachment: upload.as_ref().map(|upload| upload.name.clone()),
                 photo_preview: false,
                 thumbnail: None,
                 reply_to,
+                reply_preview: reply.map(|reply| reply.preview),
                 can_reply: true,
                 can_edit: upload.is_none(),
                 can_delete: true,
@@ -1796,7 +1934,11 @@ impl Ui {
             move |ui, result| {
                 ui.sending.set(false);
                 match result {
-                    Ok(message) => {
+                    Ok(mut message) => {
+                        if message.reply_to == reply_to && message.reply_preview.is_none() {
+                            message.reply_preview =
+                                reply.as_ref().map(|reply| reply.preview.clone());
+                        }
                         if ui.uploads.borrow().get(&chat) == upload.as_ref() {
                             ui.uploads.borrow_mut().remove(&chat);
                         }
@@ -1931,6 +2073,7 @@ impl Ui {
             .find(|item| item.id == chat)
         {
             chat.preview.clone_from(&message.text);
+            chat.preview_sender = chat.group.then(|| message.sender.clone());
         }
         if self.selection.get() == Some(chat) {
             self.messages.borrow_mut().insert(message.id, message);
@@ -1992,10 +2135,11 @@ impl Ui {
                     Message {
                         id: ui.next_demo_message(),
                         timestamp: demo::now(),
-                        sender: "Вы".into(),
-                        sender_avatar: None,
+                        sender: demo::OWN_NAME.into(),
+                        sender_avatar: Some(demo::OWN_AVATAR),
                         outgoing: true,
                         reply_to: None,
+                        reply_preview: None,
                         can_edit: false,
                         can_delete: true,
                         forwarded: true,
@@ -2140,10 +2284,11 @@ impl Ui {
                 .iter_mut()
                 .find(|item| item.id == chat)
             {
-                chat.preview = messages
-                    .last()
-                    .map(|message| message.text.clone())
-                    .unwrap_or_default();
+                let last = messages.last();
+                chat.preview = last.map(|message| message.text.clone()).unwrap_or_default();
+                chat.preview_sender = last
+                    .filter(|_| chat.group)
+                    .map(|message| message.sender.clone());
             }
             self.render_chats();
         }
@@ -2311,10 +2456,12 @@ impl Ui {
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        let dialog = adw::Dialog::builder()
+        let viewer = adw::Window::builder()
             .title("Фотография")
-            .content_width(640)
-            .content_height(500)
+            .default_width(720)
+            .default_height(540)
+            .transient_for(&window)
+            .destroy_with_parent(true)
             .build();
         let toolbar = adw::ToolbarView::new();
         toolbar.add_top_bar(&adw::HeaderBar::new());
@@ -2334,8 +2481,24 @@ impl Ui {
         content.add_child(&status);
         content.add_child(&picture);
         toolbar.set_content(Some(&content));
-        dialog.set_child(Some(&toolbar));
-        dialog.present(Some(&window));
+        viewer.set_content(Some(&toolbar));
+        let close = gtk::EventControllerKey::new();
+        close.connect_key_pressed(glib::clone!(
+            #[weak]
+            viewer,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    viewer.close();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        viewer.add_controller(close);
+        viewer.present();
         if self.is_demo.get() {
             picture.set_paintable(Some(self.demo_image.get_or_init(demo_texture)));
             content.set_visible_child(&picture);
@@ -2372,6 +2535,20 @@ impl Ui {
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
+}
+
+fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {
+    let quote = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    quote.add_css_class("reply-quote");
+    let author = label("", "message-name");
+    let excerpt = label("", "reply-excerpt");
+    for line in [&author, &excerpt] {
+        line.set_single_line_mode(true);
+        line.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        line.set_max_width_chars(42);
+        quote.append(line);
+    }
+    (quote, author, excerpt)
 }
 
 fn demo_texture() -> gtk::gdk::MemoryTexture {

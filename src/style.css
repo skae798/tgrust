@@ -31,7 +31,9 @@
   color: var(--view-fg-color);
 }
 
-.message-bubble.search-result {
+.message-bubble.search-result,
+.message-bubble.reply-target,
+.message-bubble:focus-visible {
   outline: 2px solid var(--accent-color);
   outline-offset: -2px;
 }
@@ -48,4 +50,24 @@
 
 .composer {
   padding: 8px 14px 10px;
+}
+
+.reply-link {
+  padding: 0;
+}
+
+.reply-quote {
+  padding: 5px 8px;
+  border-left: 3px solid var(--accent-color);
+  border-radius: 5px;
+  background: alpha(var(--accent-bg-color), 0.12);
+}
+
+.reply-excerpt {
+  font-size: 0.9em;
+}
+
+.reply-quote:dir(rtl) {
+  border-left-width: 0;
+  border-right: 3px solid var(--accent-color);
 }

@@ -6,6 +6,8 @@ pub struct Chat {
     pub id: i64,
     pub title: String,
     pub preview: String,
+    pub preview_sender: Option<String>,
+    pub group: bool,
     pub unread: i32,
     pub broadcast: bool,
     pub saved_messages: bool,
@@ -53,6 +55,7 @@ pub struct Message {
     pub photo_preview: bool,
     pub thumbnail: Option<AttachmentThumbnail>,
     pub reply_to: Option<i32>,
+    pub reply_preview: Option<ReplyPreview>,
     pub can_reply: bool,
     pub can_edit: bool,
     pub can_delete: bool,
@@ -75,10 +78,27 @@ pub const COMMON_REACTIONS: &[&str] = &["👍", "❤️", "🔥", "😂", "👏"
 #[derive(Clone, PartialEq, Eq)]
 pub struct Reply {
     pub id: i32,
-    pub summary: String,
+    pub preview: ReplyPreview,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReplyPreview {
+    pub sender: Option<String>,
+    pub text: String,
 }
 
 impl Message {
+    pub fn reply_preview(&self) -> ReplyPreview {
+        let text = self.text.lines().find(|line| !line.trim().is_empty());
+        ReplyPreview {
+            sender: Some(self.sender.clone()),
+            text: text
+                .or(self.attachment.as_deref())
+                .unwrap_or("Сообщение")
+                .to_owned(),
+        }
+    }
+
     pub fn reply_summary(&self) -> String {
         let text = self.text.lines().find(|line| !line.trim().is_empty());
         match text.or(self.attachment.as_deref()) {
@@ -152,6 +172,7 @@ mod tests {
                 photo_preview: false,
                 thumbnail: None,
                 reply_to: None,
+                reply_preview: None,
                 can_reply: true,
                 can_edit: false,
                 can_delete: false,

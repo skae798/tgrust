@@ -2,6 +2,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{AttachmentThumbnail, Avatar, Chat, Message};
 
+pub const OWN_NAME: &str = "Алексей";
+pub const OWN_AVATAR: Avatar = Avatar {
+    peer: 4,
+    photo: 4,
+    dc: 0,
+};
 pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
 
@@ -20,6 +26,8 @@ pub fn chats() -> Vec<Chat> {
         id,
         title: title.to_owned(),
         preview: preview.to_owned(),
+        preview_sender: (id == 1).then(|| "@anna_demo".to_owned()),
+        group: id == 1,
         unread,
         broadcast,
         saved_messages: id == 2,
@@ -44,7 +52,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 None,
             ),
             (
-                "Вы",
+                OWN_NAME,
                 "Стало проще найти нужный диалог. Давай ещё проверим, как окно ведёт себя при сужении.",
                 true,
                 None,
@@ -58,7 +66,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             ("Анна", "Пробный кадр", false, None),
         ],
         2 => vec![
-            ("Вы", "Проверить сборку на ноутбуке", true, None),
+            (OWN_NAME, "Проверить сборку на ноутбуке", true, None),
             ("Анна", "Сохранённая заметка", false, None),
         ],
         _ => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
@@ -69,18 +77,23 @@ pub fn history(chat: i64) -> Vec<Message> {
         .map(|(index, (sender, text, outgoing, attachment))| Message {
             id: index as i32 + 1,
             sender: sender.to_owned(),
-            sender_avatar: (!outgoing && chat != 2).then_some(Avatar {
-                peer: chat,
-                photo: chat,
-                dc: 0,
-            }),
+            sender_avatar: if outgoing {
+                Some(OWN_AVATAR)
+            } else {
+                (chat != 2).then_some(Avatar {
+                    peer: chat,
+                    photo: chat,
+                    dc: 0,
+                })
+            },
             timestamp: today - 60 * (5 - index as i64),
             text: text.to_owned(),
             outgoing,
             attachment: attachment.map(str::to_owned),
             photo_preview: chat == 1 && index == 3,
             thumbnail: (chat == 1 && index == 3).then_some(AttachmentThumbnail::Photo(1)),
-            reply_to: None,
+            reply_to: (chat == 1 && index == 1).then_some(1),
+            reply_preview: None,
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
             can_delete: outgoing || chat == 2,
