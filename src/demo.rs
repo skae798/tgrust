@@ -72,6 +72,8 @@ pub fn history(chat: i64) -> Vec<Message> {
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
             can_delete: outgoing,
+            can_forward: true,
+            forwarded: false,
             edited: false,
         })
         .collect()
