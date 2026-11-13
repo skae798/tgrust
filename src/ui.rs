@@ -12,7 +12,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::model::{Chat, Message, UpdateStatus, Upload, UploadKind, merge_latest_history};
+use crate::model::{Chat, Message, Reply, UpdateStatus, Upload, UploadKind, merge_latest_history};
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -41,6 +41,8 @@ struct Ui {
     attach: gtk::MenuButton,
     upload_bar: gtk::Box,
     upload_name: gtk::Label,
+    reply_bar: gtk::Box,
+    reply_label: gtk::Label,
     client: RefCell<Option<Arc<Telegram>>>,
     login_step: Cell<LoginStep>,
     is_demo: Cell<bool>,
@@ -57,6 +59,7 @@ struct Ui {
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     drafts: RefCell<HashMap<i64, String>>,
     uploads: RefCell<HashMap<i64, Upload>>,
+    replies: RefCell<HashMap<i64, Reply>>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -200,6 +203,15 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let remove_upload = icon_button("edit-clear-symbolic", "Убрать вложение");
     upload_bar.append(&upload_name);
     upload_bar.append(&remove_upload);
+    let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    reply_bar.add_css_class("composer");
+    reply_bar.set_visible(false);
+    let reply_label = label("", "dim-label");
+    reply_label.set_hexpand(true);
+    reply_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let remove_reply = icon_button("edit-clear-symbolic", "Отменить ответ");
+    reply_bar.append(&reply_label);
+    reply_bar.append(&remove_reply);
     let input = gtk::Entry::builder()
         .hexpand(true)
         .placeholder_text("Сообщение")
@@ -211,6 +223,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     composer.append(&input);
     composer.append(&send);
     conversation.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    conversation.append(&reply_bar);
     conversation.append(&upload_bar);
     conversation.append(&composer);
     content.add_named(&conversation, Some("conversation"));
@@ -242,6 +255,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         attach,
         upload_bar,
         upload_name,
+        reply_bar,
+        reply_label,
         client: RefCell::new(None),
         login_step: Cell::new(LoginStep::Phone),
         is_demo: Cell::new(false),
@@ -258,6 +273,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         demo_messages: RefCell::new(HashMap::new()),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
+        replies: RefCell::new(HashMap::new()),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -351,6 +367,16 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         move |_| {
             if let Some(chat) = ui.selection.get() {
                 ui.uploads.borrow_mut().remove(&chat);
+                ui.update_send_button();
+            }
+        }
+    ));
+    remove_reply.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(chat) = ui.selection.get() {
+                ui.replies.borrow_mut().remove(&chat);
                 ui.update_send_button();
             }
         }
@@ -861,6 +887,15 @@ impl Ui {
             if !message.outgoing {
                 bubble.append(&label(&message.sender, "message-name"));
             }
+            if let Some(id) = message.reply_to {
+                let summary = messages
+                    .get(&id)
+                    .map_or_else(|| "Исходное сообщение".into(), Message::reply_summary);
+                let reply = label(&format!("Ответ · {summary}"), "dim-label");
+                reply.set_max_width_chars(44);
+                reply.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                bubble.append(&reply);
+            }
             if !message.text.is_empty() {
                 let text = label(&message.text, "");
                 text.set_wrap(true);
@@ -901,8 +936,33 @@ impl Ui {
                 .unwrap_or_default();
             let time = label(&time, "message-time");
             time.add_css_class("dim-label");
-            time.set_halign(gtk::Align::End);
-            bubble.append(&time);
+            let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            footer.set_halign(gtk::Align::End);
+            if message.can_reply
+                && self.input.is_sensitive()
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("mail-reply-sender-symbolic", "Ответить");
+                button.add_css_class("flat");
+                let reply = Reply {
+                    id: message.id,
+                    summary: message.reply_summary(),
+                };
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| {
+                        if ui.selection.get() == Some(chat) {
+                            ui.replies.borrow_mut().insert(chat, reply.clone());
+                            ui.update_send_button();
+                            ui.input.grab_focus();
+                        }
+                    }
+                ));
+                footer.append(&button);
+            }
+            footer.append(&time);
+            bubble.append(&footer);
             self.history.append(&bubble);
         }
         if bottom {
@@ -929,6 +989,13 @@ impl Ui {
         self.upload_bar.set_visible(upload.is_some());
         if let Some(upload) = upload {
             self.upload_name.set_text(&upload.name);
+        }
+        let replies = self.replies.borrow();
+        let reply = self.selection.get().and_then(|chat| replies.get(&chat));
+        self.reply_bar.set_visible(reply.is_some());
+        if let Some(reply) = reply {
+            self.reply_label
+                .set_text(&format!("Ответ · {}", reply.summary));
         }
         self.attach
             .set_sensitive(self.input.is_sensitive() && !self.sending.get());
@@ -994,6 +1061,8 @@ impl Ui {
         let original = self.input.text().to_string();
         let text = original.trim().to_owned();
         let upload = self.uploads.borrow().get(&chat).cloned();
+        let reply = self.replies.borrow().get(&chat).cloned();
+        let reply_to = reply.as_ref().map(|reply| reply.id);
         if self.is_demo.get() {
             let id = self
                 .messages
@@ -1011,6 +1080,8 @@ impl Ui {
                 outgoing: true,
                 timestamp: demo::now(),
                 attachment: upload.as_ref().map(|upload| upload.name.clone()),
+                reply_to,
+                can_reply: true,
             };
             self.demo_messages
                 .borrow_mut()
@@ -1027,6 +1098,7 @@ impl Ui {
             }
             self.input.set_text("");
             self.uploads.borrow_mut().remove(&chat);
+            self.replies.borrow_mut().remove(&chat);
             self.update_send_button();
             self.messages.borrow_mut().insert(id, message);
             self.render_chats();
@@ -1043,13 +1115,16 @@ impl Ui {
         }
         let request_upload = upload.clone();
         self.job(
-            async move { client.send(chat, text, request_upload).await },
+            async move { client.send(chat, text, request_upload, reply_to).await },
             move |ui, result| {
                 ui.sending.set(false);
                 match result {
                     Ok(message) => {
                         if ui.uploads.borrow().get(&chat) == upload.as_ref() {
                             ui.uploads.borrow_mut().remove(&chat);
+                        }
+                        if ui.replies.borrow().get(&chat) == reply.as_ref() {
+                            ui.replies.borrow_mut().remove(&chat);
                         }
                         if ui.selection.get() == Some(chat) {
                             if ui.input.text() == original {

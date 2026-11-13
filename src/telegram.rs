@@ -340,9 +340,15 @@ impl Telegram {
         Ok((result, has_older, marked))
     }
 
-    pub async fn send(&self, id: i64, text: String, upload: Option<Upload>) -> Result<Message> {
+    pub async fn send(
+        &self,
+        id: i64,
+        text: String,
+        upload: Option<Upload>,
+        reply_to: Option<i32>,
+    ) -> Result<Message> {
         let peer = self.peer(id).await?;
-        let mut message = InputMessage::new().text(text);
+        let mut message = InputMessage::new().text(text).reply_to(reply_to);
         if let Some(upload) = upload {
             let metadata = tokio::fs::metadata(&upload.path)
                 .await
@@ -470,6 +476,18 @@ fn message_view(message: &TelegramMessage) -> Message {
         text: preview(message),
         outgoing,
         attachment: attachment(message).map(|(_, name)| name),
+        reply_to: match &message.raw {
+            enums::Message::Message(raw)
+                if matches!(
+                    &raw.reply_to,
+                    Some(enums::MessageReplyHeader::Header(header)) if header.reply_to_peer_id.is_none()
+                ) =>
+            {
+                message.reply_to_message_id()
+            }
+            _ => None,
+        },
+        can_reply: matches!(message.raw, enums::Message::Message(_)),
     }
 }
 
