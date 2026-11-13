@@ -23,6 +23,8 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/tgrust-rustup.sh
           sh /tmp/tgrust-rustup.sh -y --profile minimal --default-toolchain 1.100.0 --component rustfmt --component clippy
           printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Check updater syntax
+        run: bash -n scripts/update.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
