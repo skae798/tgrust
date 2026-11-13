@@ -36,7 +36,7 @@ TGRUST_API_ID="$TGRUST_API_ID" TGRUST_API_HASH="$TGRUST_API_HASH" cargo run --lo
 unset TGRUST_API_ID TGRUST_API_HASH
 ```
 
-Введите номер в международном формате, затем код и, если Telegram запросит, облачный пароль. Сессия находится в `${XDG_DATA_HOME:-$HOME/.local/share}/tgrust/<api_id>.session`. Каталог сессии доступен только владельцу. Файл содержит ключ авторизации и даёт доступ к аккаунту. Храните его локально.
+Введите номер в международном формате, затем код и, если Telegram запросит, облачный пароль. При следующем запуске tgrust автоматически подключится, если сохранена одна действующая сессия. Для повторного входа после истечения сессии снова передайте ключи приложения. Сессия находится в `${XDG_DATA_HOME:-$HOME/.local/share}/tgrust/<api_id>.session`. Каталог сессии доступен только владельцу. Файл содержит ключ авторизации и даёт доступ к аккаунту. Храните его локально.
 
 ### Локальная установка
 
@@ -44,9 +44,11 @@ unset TGRUST_API_ID TGRUST_API_HASH
 cargo install --locked --path .
 install -Dm644 data/io.github.skae798.tgrust.desktop \
   "${XDG_DATA_HOME:-$HOME/.local/share}/applications/io.github.skae798.tgrust.desktop"
+install -Dm644 data/icons/hicolor/256x256/apps/io.github.skae798.tgrust.png \
+  "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps/io.github.skae798.tgrust.png"
 ```
 
-Убедитесь, что `$HOME/.cargo/bin` доступен в `PATH` графической сессии. Для подключения запускайте `tgrust` с переменными окружения, как показано выше. Пункт меню, запущенный без этих переменных, предложит открыть деморежим.
+Убедитесь, что `$HOME/.cargo/bin` доступен в `PATH` графической сессии. Найдите tgrust в меню GNOME и выберите «Добавить в избранное», чтобы закрепить приложение в доке. Ярлык использует сохранённую сессию при запуске.
 
 ## Устройство проекта
 
