@@ -314,9 +314,9 @@ impl Telegram {
         id: i64,
         before: Option<i32>,
         mark_read: bool,
-    ) -> Result<(Vec<Message>, bool)> {
+    ) -> Result<(Vec<Message>, bool, bool)> {
         let peer = self.peer(id).await?;
-        let mut iter = self.client.iter_messages(peer).limit(PAGE_SIZE);
+        let mut iter = self.client.iter_messages(peer).limit(PAGE_SIZE + 1);
         if let Some(before) = before {
             iter = iter.offset_id(before);
         }
@@ -325,16 +325,20 @@ impl Telegram {
         if let Some(message) = &newest {
             result.push(message_view(message));
         }
-        while let Some(message) = iter.next().await? {
+        while result.len() < PAGE_SIZE {
+            let Some(message) = iter.next().await? else {
+                break;
+            };
             result.push(message_view(&message));
         }
+        let has_older = iter.next().await?.is_some();
         let marked = if mark_read && let Some(message) = newest {
             message.mark_as_read().await.is_ok()
         } else {
             false
         };
         result.reverse();
-        Ok((result, marked))
+        Ok((result, has_older, marked))
     }
 
     pub async fn send(&self, id: i64, text: String) -> Result<Message> {
