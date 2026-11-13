@@ -154,6 +154,13 @@ pub struct UpdateStatus {
     pub reconnecting: bool,
 }
 
+pub struct IncomingMessage {
+    pub chat: i64,
+    pub message: i32,
+    pub title: String,
+    pub kind: ChatKind,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UploadKind {
     File,
