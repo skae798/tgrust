@@ -1,9 +1,9 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use anyhow::Result;
@@ -13,11 +13,19 @@ use tokio::sync::watch;
 
 use crate::demo;
 use crate::model::{
-    COMMON_REACTIONS, Chat, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload, UploadKind,
-    merge_latest_history,
+    COMMON_REACTIONS, Chat, ChatImage, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload,
+    UploadKind, merge_latest_history,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
+
+type ImageTarget = Box<dyn FnOnce(&gtk::gdk::Texture)>;
+
+enum ImageCacheEntry {
+    Loading(Vec<ImageTarget>),
+    Ready(gtk::gdk::Texture),
+    Unavailable(Instant),
+}
 
 struct Ui {
     runtime: Handle,
@@ -69,6 +77,8 @@ struct Ui {
     uploads: RefCell<HashMap<i64, Upload>>,
     replies: RefCell<HashMap<i64, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
+    images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
+    demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -295,6 +305,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
         reacting: RefCell::new(HashSet::new()),
+        images: RefCell::new(HashMap::new()),
+        demo_image: OnceCell::new(),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -675,7 +687,7 @@ impl Ui {
         });
     }
 
-    fn render_chats(&self) {
+    fn render_chats(self: &Rc<Self>) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -690,7 +702,14 @@ impl Ui {
             row.set_widget_name(&chat.id.to_string());
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
             line.add_css_class("chat-row");
-            line.append(&adw::Avatar::new(38, Some(&chat.title), true));
+            let avatar = adw::Avatar::new(38, Some(&chat.title), true);
+            if chat.saved_messages {
+                avatar.set_icon_name(Some("user-bookmarks-symbolic"));
+                avatar.set_show_initials(false);
+            } else if let Some(photo) = chat.avatar {
+                self.load_avatar(&avatar, ChatImage::Avatar(photo));
+            }
+            line.append(&avatar);
             let description = gtk::Box::new(gtk::Orientation::Vertical, 3);
             description.set_hexpand(true);
             description.set_valign(gtk::Align::Center);
@@ -1114,7 +1133,16 @@ impl Ui {
                 gtk::Align::Start
             });
             if !message.outgoing {
-                bubble.append(&label(&message.sender, "message-name"));
+                let author = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                let avatar = adw::Avatar::new(24, Some(&message.sender), true);
+                if let Some(photo) = message.sender_avatar {
+                    self.load_avatar(&avatar, ChatImage::Avatar(photo));
+                }
+                author.append(&avatar);
+                let name = label(&message.sender, "message-name");
+                name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                author.append(&name);
+                bubble.append(&author);
             }
             if message.forwarded {
                 bubble.append(&label("Пересланное сообщение", "dim-label"));
@@ -1147,18 +1175,8 @@ impl Ui {
                 file.append(&file_name);
                 bubble.append(&file);
             }
-            if message.photo_preview
-                && let Some(chat) = self.selection.get()
-            {
-                let button = gtk::Button::with_label("Открыть фото");
-                button.add_css_class("flat");
-                let id = message.id;
-                button.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| ui.open_photo_preview(chat, id)
-                ));
-                bubble.append(&button);
+            if let Some(chat) = self.selection.get() {
+                self.render_attachment_image(&bubble, chat, message);
             }
             let mut time = timestamp
                 .and_then(|time| time.format("%H:%M").ok())
@@ -1237,6 +1255,122 @@ impl Ui {
                     }
                 ),
             );
+        }
+    }
+
+    fn render_attachment_image(self: &Rc<Self>, bubble: &gtk::Box, chat: i64, message: &Message) {
+        let id = message.id;
+        let picture = message.thumbnail.map(|media| {
+            let picture = gtk::Picture::builder()
+                .content_fit(gtk::ContentFit::Contain)
+                .can_shrink(true)
+                .visible(false)
+                .build();
+            picture.set_size_request(144, 94);
+            picture.update_property(&[gtk::accessible::Property::Label("Миниатюра вложения")]);
+            self.load_chat_image(
+                ChatImage::Attachment {
+                    chat,
+                    message: id,
+                    media,
+                },
+                glib::clone!(
+                    #[weak]
+                    picture,
+                    move |texture: &gtk::gdk::Texture| {
+                        picture.set_paintable(Some(texture));
+                        picture.set_visible(true);
+                    }
+                ),
+            );
+            picture
+        });
+        if message.photo_preview {
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            button.set_tooltip_text(Some("Открыть фото"));
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            if let Some(picture) = picture {
+                body.append(&picture);
+            }
+            body.append(&label("Открыть фото", ""));
+            button.set_child(Some(&body));
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move |_| ui.open_photo_preview(chat, id)
+            ));
+            bubble.append(&button);
+        } else if let Some(picture) = picture {
+            bubble.append(&picture);
+        }
+    }
+
+    fn load_avatar(self: &Rc<Self>, avatar: &adw::Avatar, image: ChatImage) {
+        self.load_chat_image(
+            image,
+            glib::clone!(
+                #[weak]
+                avatar,
+                move |texture: &gtk::gdk::Texture| avatar.set_custom_image(Some(texture))
+            ),
+        );
+    }
+
+    fn load_chat_image(
+        self: &Rc<Self>,
+        image: ChatImage,
+        show: impl FnOnce(&gtk::gdk::Texture) + 'static,
+    ) {
+        if self.is_demo.get() {
+            let texture = self.demo_image.get_or_init(demo_texture);
+            show(texture.upcast_ref());
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let mut cache = self.images.borrow_mut();
+        match cache.get_mut(&image) {
+            Some(ImageCacheEntry::Ready(texture)) => show(texture),
+            Some(ImageCacheEntry::Loading(targets)) => targets.push(Box::new(show)),
+            Some(ImageCacheEntry::Unavailable(retry_after)) if Instant::now() < *retry_after => {}
+            _ => {
+                if cache.len() >= 256
+                    && let Some(key) = cache.iter().find_map(|(key, entry)| {
+                        (!matches!(entry, ImageCacheEntry::Loading(_))).then_some(*key)
+                    })
+                {
+                    cache.remove(&key);
+                }
+                cache.insert(image, ImageCacheEntry::Loading(vec![Box::new(show)]));
+                drop(cache);
+                self.job(
+                    async move { client.chat_image(image).await },
+                    move |ui, result| {
+                        let mut cache = ui.images.borrow_mut();
+                        let Some(ImageCacheEntry::Loading(targets)) = cache.remove(&image) else {
+                            return;
+                        };
+                        let texture = result.ok().and_then(|bytes| {
+                            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok()
+                        });
+                        if let Some(texture) = texture {
+                            for show in targets {
+                                show(&texture);
+                            }
+                            cache.insert(image, ImageCacheEntry::Ready(texture));
+                        } else {
+                            cache.insert(
+                                image,
+                                ImageCacheEntry::Unavailable(
+                                    Instant::now() + Duration::from_secs(30),
+                                ),
+                            );
+                        }
+                    },
+                );
+            }
         }
     }
 
@@ -1511,10 +1645,12 @@ impl Ui {
                     text
                 },
                 sender: "Вы".into(),
+                sender_avatar: None,
                 outgoing: true,
                 timestamp: demo::now(),
                 attachment: upload.as_ref().map(|upload| upload.name.clone()),
                 photo_preview: false,
+                thumbnail: None,
                 reply_to,
                 can_reply: true,
                 can_edit: upload.is_none(),
@@ -1743,6 +1879,7 @@ impl Ui {
                         id: ui.next_demo_message(),
                         timestamp: demo::now(),
                         sender: "Вы".into(),
+                        sender_avatar: None,
                         outgoing: true,
                         reply_to: None,
                         can_edit: false,
@@ -2086,15 +2223,7 @@ impl Ui {
         dialog.set_child(Some(&toolbar));
         dialog.present(Some(&window));
         if self.is_demo.get() {
-            let bytes = glib::Bytes::from_owned(demo::preview_pixels());
-            let texture = gtk::gdk::MemoryTexture::new(
-                480,
-                300,
-                gtk::gdk::MemoryFormat::R8g8b8,
-                &bytes,
-                1440,
-            );
-            picture.set_paintable(Some(&texture));
+            picture.set_paintable(Some(self.demo_image.get_or_init(demo_texture)));
             content.set_visible_child(&picture);
         } else if let Some(client) = self.client.borrow().clone() {
             self.job(
@@ -2129,6 +2258,11 @@ impl Ui {
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
+}
+
+fn demo_texture() -> gtk::gdk::MemoryTexture {
+    let bytes = glib::Bytes::from_owned(demo::preview_pixels());
+    gtk::gdk::MemoryTexture::new(480, 300, gtk::gdk::MemoryFormat::R8g8b8, &bytes, 1440)
 }
 
 fn add_menu_button(menu: &gtk::Box, title: &str, activate: impl Fn() + 'static) {

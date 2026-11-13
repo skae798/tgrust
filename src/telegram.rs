@@ -17,9 +17,12 @@ use grammers_session::{
     storages::SqliteSession,
     types::{PeerId, PeerRef},
 };
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
 
-use crate::model::{Chat, Message, Reaction, SearchHit, UpdateStatus, Upload, UploadKind};
+use crate::model::{
+    AttachmentThumbnail, Avatar, Chat, ChatImage, Message, Reaction, SearchHit, UpdateStatus,
+    Upload, UploadKind,
+};
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
@@ -49,6 +52,7 @@ pub struct Telegram {
     state: Mutex<LoginState>,
     peers: RwLock<HashMap<i64, PeerRef>>,
     changes: watch::Sender<UpdateStatus>,
+    image_downloads: Semaphore,
 }
 
 impl Telegram {
@@ -99,6 +103,7 @@ impl Telegram {
                 state: Mutex::new(state),
                 peers: RwLock::new(HashMap::new()),
                 changes,
+                image_downloads: Semaphore::new(4),
             }),
             step,
         ))
@@ -301,6 +306,7 @@ impl Telegram {
                 unread: raw.unread_count,
                 broadcast: matches!(peer, Peer::Channel(_)),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
+                avatar: peer_avatar(peer),
             });
             peers.insert(id, dialog.peer_ref());
         }
@@ -359,6 +365,7 @@ impl Telegram {
                     broadcast: matches!(peer, Peer::Channel(_)),
                     saved_messages: Some(peer_ref.id) == self_id
                         || matches!(peer, Peer::User(user) if user.is_self()),
+                    avatar: peer_avatar(peer),
                 },
                 message: message_view(&message, self_id),
             });
@@ -552,6 +559,83 @@ impl Telegram {
         unreachable!("the second download either succeeds or returns an error")
     }
 
+    pub async fn chat_image(&self, image: ChatImage) -> Result<Vec<u8>> {
+        let _permit = self.image_downloads.acquire().await?;
+        tokio::time::timeout(Duration::from_secs(15), self.fetch_chat_image(image))
+            .await
+            .context("Не удалось загрузить изображение вовремя")?
+    }
+
+    async fn fetch_chat_image(&self, image: ChatImage) -> Result<Vec<u8>> {
+        match image {
+            ChatImage::Avatar(avatar) => {
+                let id = PeerId::from_bot_api_dialog_id(avatar.peer).context("Чат не найден")?;
+                let cached = self.peers.read().await.get(&avatar.peer).copied();
+                let peer = if let Some(peer) = cached {
+                    peer
+                } else {
+                    let peer = self.session.peer(id).await?.context("Чат не найден")?;
+                    PeerRef {
+                        id,
+                        auth: peer.auth().context("Фото профиля недоступно")?,
+                    }
+                };
+                let location = types::InputPeerPhotoFileLocation {
+                    big: false,
+                    peer: peer.into(),
+                    photo_id: avatar.photo,
+                };
+                self.load_image(&PeerPhoto {
+                    location,
+                    dc: avatar.dc,
+                })
+                .await
+            }
+            ChatImage::Attachment {
+                chat,
+                message,
+                media,
+            } => {
+                let peer = self.peer(chat).await?;
+                let message = self
+                    .message_by_id(peer, message)
+                    .await?
+                    .context("Сообщение больше недоступно")?;
+                let (attachment, _) = attachment(&message).context("Вложение больше недоступно")?;
+                ensure!(
+                    attachment_id(&attachment) == Some(media),
+                    "Вложение в сообщении изменилось"
+                );
+                let (sizes, dc) = match attachment {
+                    Media::Photo(photo) if !photo.is_spoiler() => (photo.thumbs(), photo.dc_id()),
+                    Media::Document(document) if !document.is_spoiler() => {
+                        (document.thumbs(), document.dc_id())
+                    }
+                    _ => bail!("Миниатюра недоступна"),
+                };
+                let thumbnail = pick_thumbnail(sizes).context("Миниатюра недоступна")?;
+                self.load_image(&PhotoPreview { thumbnail, dc }).await
+            }
+        }
+    }
+
+    async fn load_image(&self, source: &impl Downloadable) -> Result<Vec<u8>> {
+        let mut download = self.client.iter_download(source);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = download.next().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= 512 * 1024,
+                "Миниатюра слишком большая"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        ensure!(
+            !bytes.is_empty() && source.size().is_none_or(|size| bytes.len() == size),
+            "Миниатюра загружена не полностью"
+        );
+        Ok(bytes)
+    }
+
     pub async fn edit_text(&self, chat: i64, id: i32, text: String) -> Result<()> {
         let peer = self.peer(chat).await?;
         let message = self
@@ -685,6 +769,21 @@ struct PhotoPreview {
     dc: Option<i32>,
 }
 
+struct PeerPhoto {
+    location: types::InputPeerPhotoFileLocation,
+    dc: i32,
+}
+
+impl Downloadable for PeerPhoto {
+    fn to_raw_input_location(&self) -> Option<enums::InputFileLocation> {
+        Some(self.location.clone().into())
+    }
+
+    fn dc_id(&self) -> Option<i32> {
+        Some(self.dc)
+    }
+}
+
 impl Downloadable for PhotoPreview {
     fn to_raw_input_location(&self) -> Option<enums::InputFileLocation> {
         self.thumbnail.to_raw_input_location()
@@ -703,18 +802,55 @@ impl Downloadable for PhotoPreview {
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum AttachmentId {
-    Photo(i64),
-    Document(i64),
-}
-
-fn attachment_id(media: &Media) -> Option<AttachmentId> {
+fn attachment_id(media: &Media) -> Option<AttachmentThumbnail> {
     match media {
-        Media::Photo(photo) => Some(AttachmentId::Photo(photo.id())),
-        Media::Document(document) => Some(AttachmentId::Document(document.id())),
+        Media::Photo(photo) => Some(AttachmentThumbnail::Photo(photo.id())),
+        Media::Document(document) => Some(AttachmentThumbnail::Document(document.id())),
         _ => None,
     }
+}
+
+fn peer_avatar(peer: &Peer) -> Option<Avatar> {
+    let (photo, dc) = match peer {
+        Peer::User(user) => {
+            let photo = user.photo()?;
+            (photo.photo_id, photo.dc_id)
+        }
+        Peer::Group(group) => {
+            let photo = group.photo()?;
+            (photo.photo_id, photo.dc_id)
+        }
+        Peer::Channel(channel) => {
+            let photo = channel.photo()?;
+            (photo.photo_id, photo.dc_id)
+        }
+        Peer::Community(community) => {
+            let photo = community.photo()?;
+            (photo.photo_id, photo.dc_id)
+        }
+    };
+    Some(Avatar {
+        peer: peer.id().bot_api_dialog_id()?,
+        photo,
+        dc,
+    })
+}
+
+fn pick_thumbnail(sizes: Vec<PhotoSize>) -> Option<PhotoSize> {
+    sizes
+        .into_iter()
+        .filter(|thumb| {
+            let (width, height) = match thumb {
+                PhotoSize::Size(size) => (size.width, size.height),
+                PhotoSize::Progressive(size) => (size.width, size.height),
+                PhotoSize::Cached(size) => (size.width, size.height),
+                _ => return false,
+            };
+            (1..=480).contains(&width)
+                && (1..=480).contains(&height)
+                && (1..=512 * 1024).contains(&thumb.size())
+        })
+        .max_by_key(PhotoSize::size)
 }
 
 fn expired_file_reference(error: &InvocationError) -> bool {
@@ -745,6 +881,19 @@ fn message_view(message: &TelegramMessage, self_id: Option<PeerId>) -> Message {
     let outgoing = message.outgoing();
     let attachment = attachment(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
+    let thumbnail = match attachment.as_ref() {
+        Some((Media::Photo(photo), _))
+            if !photo.is_spoiler() && pick_thumbnail(photo.thumbs()).is_some() =>
+        {
+            Some(AttachmentThumbnail::Photo(photo.id()))
+        }
+        Some((Media::Document(document), _))
+            if !document.is_spoiler() && pick_thumbnail(document.thumbs()).is_some() =>
+        {
+            Some(AttachmentThumbnail::Document(document.id()))
+        }
+        _ => None,
+    };
     Message {
         id: message.id(),
         sender: if outgoing {
@@ -756,11 +905,18 @@ fn message_view(message: &TelegramMessage, self_id: Option<PeerId>) -> Message {
                 .unwrap_or("Сообщение")
                 .to_owned()
         },
+        sender_avatar: message.sender().and_then(peer_avatar).or_else(|| {
+            match (message.sender_id(), message.peer()) {
+                (None, Some(peer @ Peer::Channel(_))) => peer_avatar(peer),
+                _ => None,
+            }
+        }),
         timestamp: message.date().as_second(),
         text: preview(message),
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
+        thumbnail,
         reply_to: match &message.raw {
             enums::Message::Message(raw)
                 if matches!(
@@ -884,6 +1040,39 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn attachment_thumbnail_uses_a_supported_size_under_the_limit() {
+        let size = |name: &str, side, bytes| {
+            types::PhotoSize {
+                r#type: name.to_owned(),
+                w: side,
+                h: side,
+                size: bytes,
+            }
+            .into()
+        };
+        let photo = grammers_client::media::Photo::from_raw(
+            types::Photo {
+                has_stickers: false,
+                id: 1,
+                access_hash: 0,
+                file_reference: Vec::new(),
+                date: 0,
+                sizes: vec![
+                    size("s", 120, 20_000),
+                    size("m", 320, 60_000),
+                    size("x", 800, 90_000),
+                    size("y", 400, 600_000),
+                ],
+                video_sizes: None,
+                dc_id: 1,
+            }
+            .into(),
+        );
+        let selected = pick_thumbnail(photo.thumbs()).unwrap();
+        assert_eq!(selected.photo_type(), "m");
+    }
 
     #[test]
     fn download_retries_only_errors_that_require_a_fresh_file_reference() {
