@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,8 +12,12 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::model::{Chat, Message};
-use crate::telegram::{LoginStep, PAGE_SIZE, Telegram};
+use crate::model::{
+    COMMON_REACTIONS, Chat, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload, UploadKind,
+    merge_latest_history,
+};
+use crate::storage::{PendingSave, attachment_name};
+use crate::telegram::{LoginStep, Telegram};
 
 struct Ui {
     runtime: Handle,
@@ -25,6 +29,7 @@ struct Ui {
     login_entry: gtk::PasswordEntry,
     login_submit: gtk::Button,
     login_reset: gtk::Button,
+    connect_retry: gtk::Button,
     split: adw::NavigationSplitView,
     toasts: adw::ToastOverlay,
     list: gtk::ListBox,
@@ -34,21 +39,36 @@ struct Ui {
     history: gtk::Box,
     scroll: gtk::ScrolledWindow,
     older: gtk::Button,
+    latest: gtk::Button,
     input: gtk::Entry,
     send: gtk::Button,
+    attach: gtk::MenuButton,
+    upload_bar: gtk::Box,
+    upload_name: gtk::Label,
+    reply_bar: gtk::Box,
+    reply_label: gtk::Label,
     client: RefCell<Option<Arc<Telegram>>>,
     login_step: Cell<LoginStep>,
     is_demo: Cell<bool>,
     chats: RefCell<Vec<Chat>>,
+    search_chat: RefCell<Option<Chat>>,
     selection: Cell<Option<i64>>,
     generation: Cell<u64>,
     chat_refresh: Cell<bool>,
+    chat_refresh_pending: Cell<bool>,
     history_refresh: Cell<bool>,
+    latest_history_pending: Cell<Option<bool>>,
+    search_anchor: Cell<Option<i32>>,
+    scroll_to_search_result: Cell<bool>,
     sending: Cell<bool>,
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
+    demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<i64, String>>,
+    uploads: RefCell<HashMap<i64, Upload>>,
+    replies: RefCell<HashMap<i64, Reply>>,
+    reacting: RefCell<HashSet<(i64, i32)>>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -92,6 +112,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     login_submit.add_css_class("suggested-action");
     let login_reset = gtk::Button::with_label("Запросить новый код");
     login_reset.add_css_class("flat");
+    login_reset.set_visible(false);
+    let connect_retry = gtk::Button::with_label("Повторить подключение");
+    connect_retry.add_css_class("suggested-action");
+    connect_retry.set_visible(false);
     let demo_button = gtk::Button::with_label("Открыть деморежим");
     demo_button.add_css_class("flat");
     for widget in [
@@ -100,6 +124,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         login_entry.upcast_ref(),
         login_submit.upcast_ref(),
         login_reset.upcast_ref(),
+        connect_retry.upcast_ref(),
         demo_button.upcast_ref(),
     ] {
         login_box.append(widget);
@@ -121,7 +146,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let side_header = adw::HeaderBar::new();
     side_header.set_title_widget(Some(&adw::WindowTitle::new("tgrust", "")));
     let refresh = icon_button("view-refresh-symbolic", "Обновить чаты");
+    let search_messages = icon_button("system-search-symbolic", "Поиск по сообщениям");
     side_header.pack_end(&refresh);
+    side_header.pack_end(&search_messages);
     sidebar.add_top_bar(&side_header);
     let side_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let filter = gtk::SearchEntry::builder()
@@ -155,6 +182,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .build();
     content.add_named(&empty, Some("empty"));
     let conversation = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let latest = gtk::Button::with_label("К последним сообщениям");
+    latest.add_css_class("flat");
+    latest.set_visible(false);
+    conversation.append(&latest);
     let history = gtk::Box::new(gtk::Orientation::Vertical, 9);
     history.set_valign(gtk::Align::End);
     history.add_css_class("conversation");
@@ -170,6 +201,32 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
 
     let composer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     composer.add_css_class("composer");
+    let attach = gtk::MenuButton::builder()
+        .icon_name("mail-attachment-symbolic")
+        .tooltip_text("Добавить вложение")
+        .build();
+    let attach_menu = gtk::gio::Menu::new();
+    attach_menu.append(Some("Файл"), Some("win.attach-file"));
+    attach_menu.append(Some("Фотография"), Some("win.attach-photo"));
+    attach.set_menu_model(Some(&attach_menu));
+    let upload_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    upload_bar.add_css_class("composer");
+    upload_bar.set_visible(false);
+    let upload_name = label("", "");
+    upload_name.set_hexpand(true);
+    upload_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    let remove_upload = icon_button("edit-clear-symbolic", "Убрать вложение");
+    upload_bar.append(&upload_name);
+    upload_bar.append(&remove_upload);
+    let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    reply_bar.add_css_class("composer");
+    reply_bar.set_visible(false);
+    let reply_label = label("", "dim-label");
+    reply_label.set_hexpand(true);
+    reply_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    let remove_reply = icon_button("edit-clear-symbolic", "Отменить ответ");
+    reply_bar.append(&reply_label);
+    reply_bar.append(&remove_reply);
     let input = gtk::Entry::builder()
         .hexpand(true)
         .placeholder_text("Сообщение")
@@ -177,9 +234,12 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .build();
     let send = icon_button("mail-send-symbolic", "Отправить");
     send.add_css_class("suggested-action");
+    composer.append(&attach);
     composer.append(&input);
     composer.append(&send);
     conversation.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    conversation.append(&reply_bar);
+    conversation.append(&upload_bar);
     conversation.append(&composer);
     content.add_named(&conversation, Some("conversation"));
     pane.set_content(Some(&content));
@@ -195,6 +255,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         login_entry,
         login_submit,
         login_reset,
+        connect_retry,
         split,
         toasts,
         list,
@@ -204,21 +265,36 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         history,
         scroll,
         older,
+        latest,
         input,
         send,
+        attach,
+        upload_bar,
+        upload_name,
+        reply_bar,
+        reply_label,
         client: RefCell::new(None),
         login_step: Cell::new(LoginStep::Phone),
         is_demo: Cell::new(false),
         chats: RefCell::new(Vec::new()),
+        search_chat: RefCell::new(None),
         selection: Cell::new(None),
         generation: Cell::new(0),
         chat_refresh: Cell::new(false),
+        chat_refresh_pending: Cell::new(false),
         history_refresh: Cell::new(false),
+        latest_history_pending: Cell::new(None),
+        search_anchor: Cell::new(None),
+        scroll_to_search_result: Cell::new(false),
         sending: Cell::new(false),
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
         demo_messages: RefCell::new(HashMap::new()),
+        demo_next_message: Cell::new(100),
         drafts: RefCell::new(HashMap::new()),
+        uploads: RefCell::new(HashMap::new()),
+        replies: RefCell::new(HashMap::new()),
+        reacting: RefCell::new(HashSet::new()),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -237,6 +313,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         ui,
         move |_| ui.restart_login()
     ));
+    ui.connect_retry.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.connect()
+    ));
     demo_button.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -248,6 +329,20 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         move |_| {
             ui.refresh_chats();
             ui.load_history(None, false);
+        }
+    ));
+    search_messages.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.open_message_search()
+    ));
+    ui.latest.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(chat) = ui.selection.get() {
+                ui.show_chat(chat, None);
+            }
         }
     ));
     ui.filter.connect_search_changed(glib::clone!(
@@ -288,6 +383,38 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         #[weak]
         ui,
         move |_| ui.update_send_button()
+    ));
+    for (name, kind) in [
+        ("attach-file", UploadKind::File),
+        ("attach-photo", UploadKind::Photo),
+    ] {
+        let action = gtk::gio::SimpleAction::new(name, None);
+        action.connect_activate(glib::clone!(
+            #[weak]
+            ui,
+            move |_, _| ui.choose_upload(kind)
+        ));
+        window.add_action(&action);
+    }
+    remove_upload.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(chat) = ui.selection.get() {
+                ui.uploads.borrow_mut().remove(&chat);
+                ui.update_send_button();
+            }
+        }
+    ));
+    remove_reply.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(chat) = ui.selection.get() {
+                ui.replies.borrow_mut().remove(&chat);
+                ui.update_send_button();
+            }
+        }
     ));
 
     window.connect_close_request({
@@ -330,6 +457,9 @@ impl Ui {
     fn connect(self: &Rc<Self>) {
         self.root.set_visible_child_name("login");
         self.set_login_busy(true);
+        self.connect_retry.set_visible(false);
+        self.login_entry.set_visible(false);
+        self.login_submit.set_visible(false);
         match crate::credentials() {
             Ok(Some((id, hash))) => {
                 self.login_status.set_text("Подключение…");
@@ -342,9 +472,12 @@ impl Ui {
                             ui.client.replace(Some(client));
                             ui.show_step(step);
                         }
-                        Err(error) => ui
-                            .login_status
-                            .set_text(&format!("Не удалось подключиться. {error}")),
+                        Err(error) => {
+                            ui.login_status
+                                .set_text(&format!("Не удалось подключиться. {error}"));
+                            ui.connect_retry.set_visible(true);
+                            ui.connect_retry.grab_focus();
+                        }
                     }
                 });
             }
@@ -363,6 +496,8 @@ impl Ui {
 
     fn show_step(self: &Rc<Self>, step: LoginStep) {
         self.login_step.set(step);
+        self.login_entry.set_visible(true);
+        self.login_submit.set_visible(true);
         self.login_entry.set_text("");
         self.set_login_busy(false);
         self.login_reset
@@ -412,19 +547,29 @@ impl Ui {
         }
         self.set_login_busy(true);
         self.login_status.set_text("Проверка…");
-        self.job(async move { client.login(&value).await }, |ui, result| {
-            if ui.is_demo.get() {
-                return;
-            }
-            match result {
-                Ok(step) => ui.show_step(step),
-                Err(error) => {
-                    ui.login_entry.set_text("");
-                    ui.login_status.set_text(&error.to_string());
-                    ui.set_login_busy(false);
+        self.job(
+            async move {
+                let result = client.login(&value).await;
+                Ok((result, client.login_step().await))
+            },
+            |ui, result| {
+                if ui.is_demo.get() {
+                    return;
                 }
-            }
-        });
+                match result {
+                    Ok((Ok(step), _)) => ui.show_step(step),
+                    Ok((Err(error), step)) => {
+                        ui.show_step(step);
+                        ui.login_status.set_text(&error.to_string());
+                    }
+                    Err(error) => {
+                        ui.login_entry.set_text("");
+                        ui.login_status.set_text(&error.to_string());
+                        ui.set_login_busy(false);
+                    }
+                }
+            },
+        );
     }
 
     fn restart_login(self: &Rc<Self>) {
@@ -467,7 +612,7 @@ impl Ui {
         self.job(client.listen(stop), |ui, result| {
             if result.is_err() {
                 ui.toast(
-                    "Связь с Telegram прервана. Обновите чаты вручную или перезапустите клиент.",
+                    "Обновления Telegram остановлены. Перезапустите клиент, чтобы проверить сессию.",
                 );
             }
         });
@@ -481,9 +626,8 @@ impl Ui {
                     change = changes.changed() => {
                         if change.is_err() { break; }
                         tokio::time::sleep(Duration::from_millis(700)).await;
-                        changes.borrow_and_update();
-                        if notify.is_closed() { break; }
-                        let _ = notify.try_send(());
+                        let status = *changes.borrow_and_update();
+                        if notify.send(status).await.is_err() { break; }
                     }
                 }
             }
@@ -491,12 +635,19 @@ impl Ui {
 
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            while notifications.recv().await.is_some() {
+            let mut previous = UpdateStatus::default();
+            while let Some(status) = notifications.recv().await {
                 let Some(ui) = weak.upgrade() else { break };
-                ui.refresh_chats();
-                if !ui.split.is_collapsed() || ui.split.shows_content() {
-                    ui.load_history(None, true);
+                if status.reconnecting && !previous.reconnecting {
+                    ui.toast("Восстанавливаем связь с Telegram…");
                 }
+                if status.revision != previous.revision {
+                    ui.refresh_chats();
+                    if !ui.split.is_collapsed() || ui.split.shows_content() {
+                        ui.load_history(None, true);
+                    }
+                }
+                previous = status;
             }
         });
     }
@@ -506,6 +657,7 @@ impl Ui {
             return;
         };
         if self.chat_refresh.replace(true) {
+            self.chat_refresh_pending.set(true);
             return;
         }
         self.job(async move { client.chats().await }, move |ui, result| {
@@ -516,6 +668,9 @@ impl Ui {
                     ui.render_chats();
                 }
                 Err(error) => ui.toast(&format!("Не удалось загрузить чаты. {error}")),
+            }
+            if ui.chat_refresh_pending.replace(false) {
+                ui.refresh_chats();
             }
         });
     }
@@ -562,17 +717,193 @@ impl Ui {
     }
 
     fn select_chat(self: &Rc<Self>, id: i64) {
+        self.show_chat(id, None);
+    }
+
+    fn open_message_search(self: &Rc<Self>) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::Dialog::builder()
+            .title("Поиск по сообщениям")
+            .content_width(520)
+            .content_height(480)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.set_margin_top(8);
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Текст сообщения")
+            .hexpand(true)
+            .build();
+        let submit = gtk::Button::with_label("Найти");
+        submit.add_css_class("suggested-action");
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        bar.append(&search);
+        bar.append(&submit);
+        content.append(&bar);
+        let status = label("", "dim-label");
+        status.set_wrap(true);
+        content.append(&status);
+        let results = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&results)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        content.append(&scroll);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.set_focus(Some(&search));
+        let generation = Rc::new(Cell::new(0_u64));
+        submit.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[weak]
+            dialog,
+            #[weak]
+            search,
+            #[weak]
+            status,
+            #[weak]
+            results,
+            #[strong]
+            generation,
+            move |_| {
+                let query = search.text().trim().to_owned();
+                if query.is_empty() {
+                    return;
+                }
+                let request = generation.get().wrapping_add(1);
+                generation.set(request);
+                while let Some(child) = results.first_child() {
+                    results.remove(&child);
+                }
+                status.set_text("Поиск…");
+                if ui.is_demo.get() {
+                    let query = query.to_lowercase();
+                    let history = ui.demo_messages.borrow();
+                    let hits = ui
+                        .chats
+                        .borrow()
+                        .iter()
+                        .flat_map(|chat| {
+                            history
+                                .get(&chat.id)
+                                .cloned()
+                                .unwrap_or_else(|| demo::history(chat.id))
+                                .into_iter()
+                                .map(move |message| SearchHit {
+                                    chat: chat.clone(),
+                                    message,
+                                })
+                        })
+                        .filter(|hit| hit.message.text.to_lowercase().contains(&query))
+                        .take(50)
+                        .collect();
+                    ui.show_search_results(&dialog, &results, &status, hits);
+                } else if let Some(client) = ui.client.borrow().clone() {
+                    ui.job(
+                        async move { client.search(&query).await },
+                        glib::clone!(
+                            #[weak]
+                            dialog,
+                            #[weak]
+                            status,
+                            #[weak]
+                            results,
+                            #[strong]
+                            generation,
+                            move |ui, result| {
+                                if generation.get() == request {
+                                    match result {
+                                        Ok(hits) => {
+                                            ui.show_search_results(&dialog, &results, &status, hits)
+                                        }
+                                        Err(error) => status.set_text(&format!(
+                                            "Не удалось выполнить поиск. {error}"
+                                        )),
+                                    }
+                                }
+                            }
+                        ),
+                    );
+                }
+            }
+        ));
+        search.connect_activate(glib::clone!(
+            #[weak]
+            submit,
+            move |_| submit.emit_clicked()
+        ));
+        dialog.present(Some(&window));
+    }
+
+    fn show_search_results(
+        self: &Rc<Self>,
+        dialog: &adw::Dialog,
+        results: &gtk::Box,
+        status: &gtk::Label,
+        hits: Vec<SearchHit>,
+    ) {
+        status.set_text(if hits.is_empty() {
+            "Сообщения не найдены"
+        } else {
+            ""
+        });
+        for hit in hits {
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            let title = label(&hit.chat.title, "heading");
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let excerpt = label(&hit.message.reply_summary(), "dim-label");
+            excerpt.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            body.append(&title);
+            body.append(&excerpt);
+            button.set_child(Some(&body));
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                #[weak]
+                dialog,
+                move |_| {
+                    let chat = hit.chat.id;
+                    ui.search_chat.replace(Some(hit.chat.clone()));
+                    dialog.close();
+                    ui.show_chat(chat, Some(hit.message.id));
+                }
+            ));
+            results.append(&button);
+        }
+    }
+
+    fn show_chat(self: &Rc<Self>, id: i64, anchor: Option<i32>) {
         let Some(chat) = self
             .chats
             .borrow()
             .iter()
             .find(|chat| chat.id == id)
             .cloned()
+            .or_else(|| {
+                self.search_chat
+                    .borrow()
+                    .as_ref()
+                    .filter(|chat| chat.id == id)
+                    .cloned()
+            })
         else {
             return;
         };
         self.split.set_show_content(true);
-        if self.selection.get() == Some(id) && self.loaded.get() {
+        if self.selection.get() == Some(id)
+            && self.loaded.get()
+            && anchor.is_none()
+            && self.search_anchor.get().is_none()
+        {
             self.load_history(None, true);
             return;
         }
@@ -582,7 +913,11 @@ impl Ui {
                 .insert(previous, self.input.text().to_string());
         }
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.search_anchor.set(anchor);
+        self.scroll_to_search_result.set(anchor.is_some());
+        self.latest.set_visible(anchor.is_some());
         self.history_refresh.set(false);
+        self.latest_history_pending.set(None);
         self.loaded.set(false);
         self.has_older.set(false);
         self.messages.borrow_mut().clear();
@@ -619,7 +954,7 @@ impl Ui {
             }
             self.loaded.set(true);
             self.render_chats();
-            self.render_history(true);
+            self.render_history(anchor.is_none());
         } else {
             self.load_history(None, true);
         }
@@ -633,9 +968,16 @@ impl Ui {
             return;
         };
         if self.history_refresh.replace(true) {
+            if before.is_none() {
+                self.latest_history_pending.set(Some(
+                    mark_read || self.latest_history_pending.get() == Some(true),
+                ));
+            }
             return;
         }
         let generation = self.generation.get();
+        let anchor = self.search_anchor.get();
+        let requested_through = self.messages.borrow().last_key_value().map(|(&id, _)| id);
         self.older.set_sensitive(false);
         let has_unread = self
             .chats
@@ -643,7 +985,16 @@ impl Ui {
             .iter()
             .any(|chat| chat.id == id && chat.unread > 0);
         self.job(
-            async move { client.history(id, before, mark_read).await },
+            async move {
+                if before.is_none()
+                    && let Some(anchor) = anchor
+                {
+                    let (messages, older) = client.history_around(id, anchor).await?;
+                    Ok((messages, older, false))
+                } else {
+                    client.history(id, before, mark_read).await
+                }
+            },
             move |ui, result| {
                 if generation != ui.generation.get() {
                     return;
@@ -651,38 +1002,52 @@ impl Ui {
                 ui.history_refresh.set(false);
                 ui.older.set_sensitive(true);
                 match result {
-                    Ok((messages, marked)) => {
+                    Ok((messages, has_older, marked)) => {
                         let was_loaded = ui.loaded.replace(true);
                         let adjustment = ui.scroll.vadjustment();
                         let at_bottom =
                             adjustment.upper() - adjustment.page_size() - adjustment.value() < 36.0;
                         let mut current = ui.messages.borrow_mut();
-                        if !was_loaded || before.is_some() {
-                            ui.has_older.set(messages.len() == PAGE_SIZE);
-                        }
-                        if before.is_none() {
-                            if messages.len() < PAGE_SIZE {
-                                current.clear();
-                            } else if let (Some(first), Some(last)) =
-                                (messages.first(), messages.last())
-                            {
-                                current.retain(|&id, _| id < first.id || id > last.id);
+                        if before.is_some() {
+                            current
+                                .extend(messages.into_iter().map(|message| (message.id, message)));
+                            ui.has_older.set(has_older);
+                        } else {
+                            let older_loaded = merge_latest_history(
+                                &mut current,
+                                messages,
+                                has_older,
+                                requested_through,
+                            );
+                            if !older_loaded {
+                                ui.has_older.set(has_older);
                             }
                         }
-                        current.extend(messages.into_iter().map(|message| (message.id, message)));
                         drop(current);
-                        ui.render_history(before.is_none() && (!was_loaded || at_bottom));
+                        ui.render_history(
+                            anchor.is_none() && before.is_none() && (!was_loaded || at_bottom),
+                        );
                         if marked && has_unread {
                             ui.refresh_chats();
                         }
                         if before.is_some() {
                             let old_height = adjustment.upper();
                             let old_position = adjustment.value();
-                            after_layout(&ui.history, move || {
-                                adjustment.set_value(
-                                    old_position + (adjustment.upper() - old_height).max(0.0),
-                                );
-                            });
+                            after_layout(
+                                &ui.history,
+                                glib::clone!(
+                                    #[weak]
+                                    ui,
+                                    move || {
+                                        if ui.generation.get() == generation {
+                                            adjustment.set_value(
+                                                old_position
+                                                    + (adjustment.upper() - old_height).max(0.0),
+                                            );
+                                        }
+                                    }
+                                ),
+                            );
                         }
                     }
                     Err(error) => {
@@ -696,6 +1061,12 @@ impl Ui {
                         }
                         ui.toast(&format!("Не удалось загрузить историю. {error}"));
                     }
+                }
+                if let Some(mark_read) = ui.latest_history_pending.replace(None) {
+                    ui.load_history(
+                        None,
+                        mark_read && (!ui.split.is_collapsed() || ui.split.shows_content()),
+                    );
                 }
             },
         );
@@ -731,6 +1102,9 @@ impl Ui {
             }
             let bubble = gtk::Box::new(gtk::Orientation::Vertical, 4);
             bubble.add_css_class("message-bubble");
+            if self.search_anchor.get() == Some(message.id) {
+                bubble.add_css_class("search-result");
+            }
             if message.outgoing {
                 bubble.add_css_class("outgoing");
             }
@@ -742,6 +1116,21 @@ impl Ui {
             if !message.outgoing {
                 bubble.append(&label(&message.sender, "message-name"));
             }
+            if message.forwarded {
+                bubble.append(&label("Пересланное сообщение", "dim-label"));
+            }
+            if message.pinned {
+                bubble.append(&label("Закреплено", "dim-label"));
+            }
+            if let Some(id) = message.reply_to {
+                let summary = messages
+                    .get(&id)
+                    .map_or_else(|| "Исходное сообщение".into(), Message::reply_summary);
+                let reply = label(&format!("Ответ · {summary}"), "dim-label");
+                reply.set_max_width_chars(44);
+                reply.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                bubble.append(&reply);
+            }
             if !message.text.is_empty() {
                 let text = label(&message.text, "");
                 text.set_wrap(true);
@@ -752,50 +1141,286 @@ impl Ui {
             if let Some(name) = &message.attachment
                 && let Some(chat) = self.selection.get()
             {
-                let action = gtk::Button::new();
-                action.add_css_class("flat");
-                action.set_tooltip_text(Some("Сохранить вложение"));
-                let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                file.append(&gtk::Image::from_icon_name("document-save-symbolic"));
                 let file_name = label(name, "");
                 file_name.set_max_width_chars(32);
                 file_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                file.append(&file_name);
-                action.set_child(Some(&file));
                 let id = message.id;
-                let name = name.clone();
-                action.connect_clicked(glib::clone!(
+                if self.is_demo.get() && !demo::has_sample_attachment(chat, id) {
+                    bubble.append(&file_name);
+                } else {
+                    let action = gtk::Button::new();
+                    action.add_css_class("flat");
+                    action.set_tooltip_text(Some("Сохранить вложение"));
+                    let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                    file.append(&gtk::Image::from_icon_name("document-save-symbolic"));
+                    file.append(&file_name);
+                    action.set_child(Some(&file));
+                    let name = name.clone();
+                    action.connect_clicked(glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        move |_| {
+                            ui.save_file(chat, id, name.clone());
+                        }
+                    ));
+                    bubble.append(&action);
+                }
+            }
+            let mut time = timestamp
+                .and_then(|time| time.format("%H:%M").ok())
+                .unwrap_or_default();
+            if message.edited {
+                time = format!("Изменено · {time}").into();
+            }
+            let time = label(&time, "message-time");
+            time.add_css_class("dim-label");
+            let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            footer.set_halign(gtk::Align::End);
+            if message.can_reply
+                && let Some(chat) = self.selection.get()
+            {
+                let actions = gtk::FlowBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .column_spacing(4)
+                    .row_spacing(3)
+                    .build();
+                let choices = gtk::FlowBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .column_spacing(4)
+                    .row_spacing(3)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .margin_start(6)
+                    .margin_end(6)
+                    .build();
+                let popover = gtk::Popover::new();
+                popover.set_child(Some(&choices));
+                let picker = gtk::MenuButton::builder()
+                    .icon_name("face-smile-symbolic")
+                    .tooltip_text("Добавить реакцию")
+                    .popover(&popover)
+                    .build();
+                picker.add_css_class("flat");
+                for &emoji in COMMON_REACTIONS {
+                    let button = self.reaction_button(chat, message.id, emoji, emoji, false);
+                    button.connect_clicked(glib::clone!(
+                        #[weak]
+                        popover,
+                        move |_| popover.popdown()
+                    ));
+                    choices.insert(&button, -1);
+                }
+                for reaction in &message.reactions {
+                    let text = format!("{} {}", reaction.emoji, reaction.count);
+                    let button = self.reaction_button(
+                        chat,
+                        message.id,
+                        &reaction.emoji,
+                        &text,
+                        reaction.chosen,
+                    );
+                    actions.insert(&button, -1);
+                }
+                actions.insert(&picker, -1);
+                bubble.append(&actions);
+            }
+            if message.can_reply
+                && let Some(chat) = self.selection.get()
+            {
+                let title = if message.pinned {
+                    "Открепить"
+                } else {
+                    "Закрепить"
+                };
+                let button = icon_button("view-pin-symbolic", title);
+                button.add_css_class("flat");
+                if message.pinned {
+                    button.add_css_class("accent");
+                }
+                let id = message.id;
+                let pinned = !message.pinned;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.set_message_pinned(chat, id, pinned)
+                ));
+                footer.append(&button);
+            }
+            if message.can_forward
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("mail-forward-symbolic", "Переслать");
+                button.add_css_class("flat");
+                let message = message.clone();
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.forward_message(chat, message.clone())
+                ));
+                footer.append(&button);
+            }
+            if message.can_delete
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("user-trash-symbolic", "Удалить");
+                button.add_css_class("flat");
+                let id = message.id;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.delete_message(chat, id)
+                ));
+                footer.append(&button);
+            }
+            if message.can_edit
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("document-edit-symbolic", "Редактировать");
+                button.add_css_class("flat");
+                let id = message.id;
+                let text = message.text.clone();
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.edit_message(chat, id, &text, false)
+                ));
+                footer.append(&button);
+            }
+            if message.can_reply
+                && self.input.is_sensitive()
+                && let Some(chat) = self.selection.get()
+            {
+                let button = icon_button("mail-reply-sender-symbolic", "Ответить");
+                button.add_css_class("flat");
+                let reply = Reply {
+                    id: message.id,
+                    summary: message.reply_summary(),
+                };
+                button.connect_clicked(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
                     move |_| {
-                        ui.save_file(chat, id, name.clone());
+                        if ui.selection.get() == Some(chat) {
+                            ui.replies.borrow_mut().insert(chat, reply.clone());
+                            ui.update_send_button();
+                            ui.input.grab_focus();
+                        }
                     }
                 ));
-                bubble.append(&action);
+                footer.append(&button);
             }
-            let time = timestamp
-                .and_then(|time| time.format("%H:%M").ok())
-                .unwrap_or_default();
-            let time = label(&time, "message-time");
-            time.add_css_class("dim-label");
-            time.set_halign(gtk::Align::End);
-            bubble.append(&time);
+            footer.append(&time);
+            bubble.append(&footer);
             self.history.append(&bubble);
+            if self.search_anchor.get() == Some(message.id)
+                && self.scroll_to_search_result.replace(false)
+            {
+                let weak = bubble.downgrade();
+                let generation = self.generation.get();
+                after_layout(
+                    &self.history,
+                    glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        move || {
+                            if ui.generation.get() == generation
+                                && let Some(bubble) = weak.upgrade()
+                                && let Some(bounds) = bubble.compute_bounds(&ui.history)
+                            {
+                                let adjustment = ui.scroll.vadjustment();
+                                adjustment.set_value(
+                                    f64::from(bounds.y()) - adjustment.page_size() / 3.0,
+                                );
+                            }
+                        }
+                    ),
+                );
+            }
         }
         if bottom {
             let adjustment = self.scroll.vadjustment();
-            after_layout(&self.history, move || {
-                adjustment.set_value(adjustment.upper())
-            });
+            let generation = self.generation.get();
+            after_layout(
+                &self.history,
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || {
+                        if ui.generation.get() == generation {
+                            adjustment.set_value(adjustment.upper());
+                        }
+                    }
+                ),
+            );
         }
     }
 
     fn update_send_button(&self) {
+        let uploads = self.uploads.borrow();
+        let upload = self.selection.get().and_then(|chat| uploads.get(&chat));
+        self.upload_bar.set_visible(upload.is_some());
+        if let Some(upload) = upload {
+            self.upload_name.set_text(&upload.name);
+        }
+        let replies = self.replies.borrow();
+        let reply = self.selection.get().and_then(|chat| replies.get(&chat));
+        self.reply_bar.set_visible(reply.is_some());
+        if let Some(reply) = reply {
+            self.reply_label
+                .set_text(&format!("Ответ · {}", reply.summary));
+        }
+        self.attach
+            .set_sensitive(self.input.is_sensitive() && !self.sending.get());
         self.send.set_sensitive(
             self.input.is_sensitive()
-                && !self.input.text().trim().is_empty()
+                && (!self.input.text().trim().is_empty() || upload.is_some())
                 && !self.sending.get(),
         );
+    }
+
+    fn choose_upload(self: &Rc<Self>, kind: UploadKind) {
+        if !self.attach.is_sensitive() {
+            return;
+        }
+        let (Some(window), Some(chat)) = (self.window.upgrade(), self.selection.get()) else {
+            return;
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title(match kind {
+                UploadKind::File => "Выберите файл",
+                UploadKind::Photo => "Выберите фотографию",
+            })
+            .build();
+        if kind == UploadKind::Photo {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Фотографии"));
+            filter.add_mime_type("image/*");
+            let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            dialog.set_filters(Some(&filters));
+        }
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = dialog.open_future(Some(&window)).await;
+            let (Some(ui), Ok(file)) = (weak.upgrade(), result) else {
+                return;
+            };
+            if ui.window.upgrade().is_none() {
+                return;
+            }
+            let Some(path) = file.path() else {
+                ui.toast("Выберите локальный файл");
+                return;
+            };
+            let name = attachment_name(
+                &path.file_name().unwrap_or_default().to_string_lossy(),
+                "Вложение",
+            );
+            ui.uploads
+                .borrow_mut()
+                .insert(chat, Upload { path, name, kind });
+            ui.update_send_button();
+        });
     }
 
     fn send_message(self: &Rc<Self>) {
@@ -807,38 +1432,36 @@ impl Ui {
         };
         let original = self.input.text().to_string();
         let text = original.trim().to_owned();
-        let generation = self.generation.get();
+        let upload = self.uploads.borrow().get(&chat).cloned();
+        let reply = self.replies.borrow().get(&chat).cloned();
+        let reply_to = reply.as_ref().map(|reply| reply.id);
         if self.is_demo.get() {
-            let id = self
-                .messages
-                .borrow()
-                .last_key_value()
-                .map_or(1, |(&id, _)| id + 1);
             let message = Message {
-                id,
-                text,
+                id: self.next_demo_message(),
+                text: if text.is_empty() {
+                    "Вложение".into()
+                } else {
+                    text
+                },
                 sender: "Вы".into(),
                 outgoing: true,
                 timestamp: demo::now(),
-                attachment: None,
+                attachment: upload.as_ref().map(|upload| upload.name.clone()),
+                reply_to,
+                can_reply: true,
+                can_edit: upload.is_none(),
+                can_delete: true,
+                can_forward: true,
+                forwarded: false,
+                pinned: false,
+                reactions: Vec::new(),
+                edited: false,
             };
-            self.demo_messages
-                .borrow_mut()
-                .entry(chat)
-                .or_default()
-                .push(message.clone());
-            if let Some(chat) = self
-                .chats
-                .borrow_mut()
-                .iter_mut()
-                .find(|candidate| candidate.id == chat)
-            {
-                chat.preview.clone_from(&message.text);
-            }
             self.input.set_text("");
-            self.messages.borrow_mut().insert(id, message);
-            self.render_chats();
-            self.render_history(true);
+            self.uploads.borrow_mut().remove(&chat);
+            self.replies.borrow_mut().remove(&chat);
+            self.update_send_button();
+            self.add_demo_message(chat, message);
             return;
         }
         let Some(client) = self.client.borrow().clone() else {
@@ -846,18 +1469,32 @@ impl Ui {
         };
         self.sending.set(true);
         self.update_send_button();
+        if upload.is_some() {
+            self.toast("Отправляем вложение…");
+        }
+        let request_upload = upload.clone();
         self.job(
-            async move { client.send(chat, text).await },
+            async move { client.send(chat, text, request_upload, reply_to).await },
             move |ui, result| {
                 ui.sending.set(false);
                 match result {
                     Ok(message) => {
-                        if generation == ui.generation.get() {
+                        if ui.uploads.borrow().get(&chat) == upload.as_ref() {
+                            ui.uploads.borrow_mut().remove(&chat);
+                        }
+                        if ui.replies.borrow().get(&chat) == reply.as_ref() {
+                            ui.replies.borrow_mut().remove(&chat);
+                        }
+                        if ui.selection.get() == Some(chat) {
                             if ui.input.text() == original {
                                 ui.input.set_text("");
                             }
-                            ui.messages.borrow_mut().insert(message.id, message);
-                            ui.render_history(true);
+                            if ui.search_anchor.get().is_some() {
+                                ui.show_chat(chat, None);
+                            } else {
+                                ui.messages.borrow_mut().insert(message.id, message);
+                                ui.render_history(true);
+                            }
                         } else if ui.drafts.borrow().get(&chat) == Some(&original) {
                             ui.drafts.borrow_mut().remove(&chat);
                         }
@@ -868,6 +1505,450 @@ impl Ui {
                 ui.update_send_button();
             },
         );
+    }
+
+    fn edit_message(self: &Rc<Self>, chat: i64, id: i32, initial: &str, retry: bool) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Редактировать сообщение")
+            .close_response("cancel")
+            .default_response("save")
+            .build();
+        dialog.add_response("cancel", "Отмена");
+        dialog.add_response("save", "Сохранить");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        let editor = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .accepts_tab(false)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(10)
+            .right_margin(10)
+            .build();
+        editor.update_property(&[gtk::accessible::Property::Label("Текст сообщения")]);
+        let buffer = editor.buffer();
+        buffer.set_text(initial);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&editor)
+            .min_content_height(96)
+            .max_content_height(230)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        scroll.add_css_class("card");
+        dialog.set_extra_child(Some(&scroll));
+        dialog.set_focus(Some(&editor));
+        dialog.set_response_enabled("save", retry);
+        buffer.connect_changed(glib::clone!(
+            #[weak]
+            dialog,
+            #[strong(rename_to = initial)]
+            initial.to_owned(),
+            move |buffer| {
+                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+                let text = text.trim();
+                dialog.set_response_enabled(
+                    "save",
+                    !text.is_empty() && (retry || text != initial) && text.chars().count() <= 4096,
+                );
+            }
+        ));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if dialog.choose_future(Some(&window)).await != "save" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            let text = buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .trim()
+                .to_owned();
+            if ui.is_demo.get() {
+                ui.apply_text_edit(chat, id, text);
+                return;
+            }
+            let Some(client) = ui.client.borrow().clone() else {
+                return;
+            };
+            let request_text = text.clone();
+            ui.job(
+                async move { client.edit_text(chat, id, request_text).await },
+                move |ui, result| match result {
+                    Ok(()) => {
+                        ui.apply_text_edit(chat, id, text);
+                        ui.refresh_chats();
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => {
+                        if ui.selection.get() == Some(chat) {
+                            ui.edit_message(chat, id, &text, true);
+                        }
+                        ui.toast(&format!("Не удалось сохранить правку. {error}"));
+                    }
+                },
+            );
+        });
+    }
+
+    fn next_demo_message(&self) -> i32 {
+        let id = self.demo_next_message.get();
+        self.demo_next_message.set(id + 1);
+        id
+    }
+
+    fn add_demo_message(self: &Rc<Self>, chat: i64, message: Message) {
+        self.demo_messages
+            .borrow_mut()
+            .entry(chat)
+            .or_insert_with(|| demo::history(chat))
+            .push(message.clone());
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|item| item.id == chat)
+        {
+            chat.preview.clone_from(&message.text);
+        }
+        if self.selection.get() == Some(chat) {
+            self.messages.borrow_mut().insert(message.id, message);
+            self.render_history(true);
+        }
+        self.render_chats();
+    }
+
+    fn forward_message(self: &Rc<Self>, source: i64, message: Message) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        if self.sending.get() {
+            self.toast("Дождитесь текущей отправки");
+            return;
+        }
+        let dialog = adw::AlertDialog::builder()
+            .heading("Переслать сообщение")
+            .close_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Отмена");
+        let chats = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let destination = Rc::new(Cell::new(None));
+        for chat in self.chats.borrow().iter().filter(|chat| !chat.broadcast) {
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            let title = label(&chat.title, "");
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            button.set_child(Some(&title));
+            let chat = chat.id;
+            button.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                #[strong]
+                destination,
+                move |_| {
+                    destination.set(Some(chat));
+                    dialog.close();
+                }
+            ));
+            chats.append(&button);
+        }
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&chats)
+            .max_content_height(280)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        dialog.set_extra_child(Some(&scroll));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            dialog.choose_future(Some(&window)).await;
+            let (Some(ui), Some(chat)) = (weak.upgrade(), destination.get()) else {
+                return;
+            };
+            if ui.is_demo.get() {
+                ui.add_demo_message(
+                    chat,
+                    Message {
+                        id: ui.next_demo_message(),
+                        timestamp: demo::now(),
+                        sender: "Вы".into(),
+                        outgoing: true,
+                        reply_to: None,
+                        can_edit: false,
+                        can_delete: true,
+                        forwarded: true,
+                        pinned: false,
+                        reactions: Vec::new(),
+                        edited: false,
+                        ..message
+                    },
+                );
+                ui.toast("Сообщение переслано");
+                return;
+            }
+            let Some(client) = ui.client.borrow().clone() else {
+                return;
+            };
+            ui.sending.set(true);
+            ui.update_send_button();
+            ui.job(
+                async move { client.forward_message(source, message.id, chat).await },
+                move |ui, result| {
+                    ui.sending.set(false);
+                    ui.update_send_button();
+                    match result {
+                        Ok(message) => {
+                            if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none()
+                            {
+                                ui.messages.borrow_mut().insert(message.id, message);
+                                ui.render_history(true);
+                            }
+                            ui.refresh_chats();
+                            ui.toast("Сообщение переслано");
+                        }
+                        Err(error) => ui.toast(&format!("Не удалось переслать сообщение. {error}")),
+                    }
+                },
+            );
+        });
+    }
+
+    fn apply_text_edit(self: &Rc<Self>, chat: i64, id: i32, text: String) {
+        if self.is_demo.get() {
+            let mut demo = self.demo_messages.borrow_mut();
+            if let Some(messages) = demo.get_mut(&chat)
+                && let Some(message) = messages.iter_mut().find(|message| message.id == id)
+            {
+                message.text.clone_from(&text);
+                message.edited = true;
+                if messages.last().is_some_and(|message| message.id == id)
+                    && let Some(chat) = self
+                        .chats
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|item| item.id == chat)
+                {
+                    chat.preview.clone_from(&text);
+                }
+                self.render_chats();
+            }
+        }
+        if self.selection.get() == Some(chat)
+            && let Some(message) = self.messages.borrow_mut().get_mut(&id)
+        {
+            message.text = text;
+            message.edited = true;
+        }
+        if self.selection.get() == Some(chat) {
+            self.render_history(false);
+        }
+    }
+
+    fn delete_message(self: &Rc<Self>, chat: i64, id: i32) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Удалить сообщение?")
+            .body("Сообщение будет удалено для всех участников чата.")
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+        dialog.add_response("cancel", "Отмена");
+        dialog.add_response("delete", "Удалить для всех");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if dialog.choose_future(Some(&window)).await != "delete" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.is_demo.get() {
+                ui.apply_deletion(chat, id);
+                return;
+            }
+            let Some(client) = ui.client.borrow().clone() else {
+                return;
+            };
+            ui.job(
+                async move { client.delete_message(chat, id).await },
+                move |ui, result| match result {
+                    Ok(()) => {
+                        ui.apply_deletion(chat, id);
+                        ui.refresh_chats();
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => ui.toast(&format!("Не удалось удалить сообщение. {error}")),
+                },
+            );
+        });
+    }
+
+    fn apply_deletion(self: &Rc<Self>, chat: i64, id: i32) {
+        if self.is_demo.get()
+            && let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
+        {
+            messages.retain(|message| message.id != id);
+            if let Some(chat) = self
+                .chats
+                .borrow_mut()
+                .iter_mut()
+                .find(|item| item.id == chat)
+            {
+                chat.preview = messages
+                    .last()
+                    .map(|message| message.text.clone())
+                    .unwrap_or_default();
+            }
+            self.render_chats();
+        }
+        if self
+            .replies
+            .borrow()
+            .get(&chat)
+            .is_some_and(|reply| reply.id == id)
+        {
+            self.replies.borrow_mut().remove(&chat);
+        }
+        if self.selection.get() == Some(chat) {
+            self.messages.borrow_mut().remove(&id);
+            self.update_send_button();
+            self.render_history(false);
+        }
+    }
+
+    fn set_message_pinned(self: &Rc<Self>, chat: i64, id: i32, pinned: bool) {
+        if self.is_demo.get() {
+            if let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
+                && let Some(message) = messages.iter_mut().find(|message| message.id == id)
+            {
+                message.pinned = pinned;
+            }
+            self.apply_message_pin(chat, id, pinned);
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        self.job(
+            async move { client.set_message_pinned(chat, id, pinned).await },
+            move |ui, result| match result {
+                Ok(()) => {
+                    ui.apply_message_pin(chat, id, pinned);
+                    ui.refresh_chats();
+                    if ui.selection.get() == Some(chat) {
+                        ui.load_history(None, false);
+                    }
+                }
+                Err(error) => ui.toast(&format!("Не удалось изменить закрепление. {error}")),
+            },
+        );
+    }
+
+    fn apply_message_pin(self: &Rc<Self>, chat: i64, id: i32, pinned: bool) {
+        if self.selection.get() != Some(chat) {
+            return;
+        }
+        if let Some(message) = self.messages.borrow_mut().get_mut(&id) {
+            message.pinned = pinned;
+        }
+        self.render_history(false);
+    }
+
+    fn reaction_button(
+        self: &Rc<Self>,
+        chat: i64,
+        id: i32,
+        emoji: &str,
+        text: &str,
+        chosen: bool,
+    ) -> gtk::Button {
+        let button = gtk::Button::with_label(text);
+        if chosen {
+            button.add_css_class("suggested-action");
+        } else {
+            button.add_css_class("flat");
+        }
+        button.set_tooltip_text(Some(&format!(
+            "{} {emoji}",
+            if chosen {
+                "Убрать реакцию"
+            } else {
+                "Поставить реакцию"
+            }
+        )));
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[strong(rename_to = emoji)]
+            emoji.to_owned(),
+            move |_| ui.toggle_reaction(chat, id, emoji.clone())
+        ));
+        button
+    }
+
+    fn toggle_reaction(self: &Rc<Self>, chat: i64, id: i32, emoji: String) {
+        if self.is_demo.get() {
+            let mut history = self.demo_messages.borrow_mut();
+            let Some(message) = history
+                .get_mut(&chat)
+                .and_then(|messages| messages.iter_mut().find(|message| message.id == id))
+            else {
+                return;
+            };
+            if let Some(reaction) = message
+                .reactions
+                .iter_mut()
+                .find(|item| item.emoji == emoji)
+            {
+                reaction.chosen = !reaction.chosen;
+                reaction.count += if reaction.chosen { 1 } else { -1 };
+                message.reactions.retain(|item| item.count > 0);
+            } else {
+                message.reactions.push(Reaction {
+                    emoji,
+                    count: 1,
+                    chosen: true,
+                });
+            }
+            self.apply_reactions(chat, id, message.reactions.clone());
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if !self.reacting.borrow_mut().insert((chat, id)) {
+            return;
+        }
+        self.job(
+            async move { client.toggle_reaction(chat, id, emoji).await },
+            move |ui, result| {
+                ui.reacting.borrow_mut().remove(&(chat, id));
+                match result {
+                    Ok(reactions) => {
+                        ui.apply_reactions(chat, id, reactions);
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => ui.toast(&format!("Не удалось изменить реакцию. {error}")),
+                }
+            },
+        );
+    }
+
+    fn apply_reactions(self: &Rc<Self>, chat: i64, id: i32, reactions: Vec<Reaction>) {
+        if self.selection.get() == Some(chat) {
+            if let Some(message) = self.messages.borrow_mut().get_mut(&id) {
+                message.reactions = reactions;
+            }
+            self.render_history(false);
+        }
     }
 
     fn save_file(self: &Rc<Self>, chat: i64, id: i32, name: String) {
@@ -902,14 +1983,9 @@ impl Ui {
                     if let Some(client) = client {
                         client.save(chat, id, path).await
                     } else {
-                        use std::io::Write;
-                        let directory = path
-                            .parent()
-                            .ok_or_else(|| anyhow::anyhow!("У файла нет каталога"))?;
-                        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-                        temporary.write_all(demo::FILE_CONTENT.as_bytes())?;
-                        temporary.persist_noclobber(path)?;
-                        Ok(())
+                        let mut output = PendingSave::new(path)?;
+                        output.write(demo::FILE_CONTENT.as_bytes()).await?;
+                        output.finish(Some(demo::FILE_CONTENT.len())).await
                     }
                 },
                 |ui, result| {
