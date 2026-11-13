@@ -70,7 +70,8 @@ exec_path=${exec_path//\"/\\\"}
 exec_path=${exec_path//\$/\\\$}
 exec_path=${exec_path//\`/\\\`}
 exec_path=${exec_path//%/%%}
-desktop-file-edit --set-key=Exec --set-value="\"$exec_path\"" \
+# GIO проверяет первое слово Exec до раскрытия кодов вроде %%.
+desktop-file-edit --set-key=Exec --set-value="/usr/bin/env -- \"$exec_path\"" \
     --set-icon="$icon" "$source_dir/data/$app_id.desktop"
 desktop-file-validate "$source_dir/data/$app_id.desktop"
 
