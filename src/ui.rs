@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +12,10 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::model::{Chat, Message, Reply, UpdateStatus, Upload, UploadKind, merge_latest_history};
+use crate::model::{
+    COMMON_REACTIONS, Chat, Message, Reaction, Reply, UpdateStatus, Upload, UploadKind,
+    merge_latest_history,
+};
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -61,6 +64,7 @@ struct Ui {
     drafts: RefCell<HashMap<i64, String>>,
     uploads: RefCell<HashMap<i64, Upload>>,
     replies: RefCell<HashMap<i64, Reply>>,
+    reacting: RefCell<HashSet<(i64, i32)>>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -276,6 +280,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
+        reacting: RefCell::new(HashSet::new()),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -952,6 +957,54 @@ impl Ui {
             if message.can_reply
                 && let Some(chat) = self.selection.get()
             {
+                let actions = gtk::FlowBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .column_spacing(4)
+                    .row_spacing(3)
+                    .build();
+                let choices = gtk::FlowBox::builder()
+                    .selection_mode(gtk::SelectionMode::None)
+                    .column_spacing(4)
+                    .row_spacing(3)
+                    .margin_top(6)
+                    .margin_bottom(6)
+                    .margin_start(6)
+                    .margin_end(6)
+                    .build();
+                let popover = gtk::Popover::new();
+                popover.set_child(Some(&choices));
+                let picker = gtk::MenuButton::builder()
+                    .icon_name("face-smile-symbolic")
+                    .tooltip_text("Добавить реакцию")
+                    .popover(&popover)
+                    .build();
+                picker.add_css_class("flat");
+                for &emoji in COMMON_REACTIONS {
+                    let button = self.reaction_button(chat, message.id, emoji, emoji, false);
+                    button.connect_clicked(glib::clone!(
+                        #[weak]
+                        popover,
+                        move |_| popover.popdown()
+                    ));
+                    choices.insert(&button, -1);
+                }
+                for reaction in &message.reactions {
+                    let text = format!("{} {}", reaction.emoji, reaction.count);
+                    let button = self.reaction_button(
+                        chat,
+                        message.id,
+                        &reaction.emoji,
+                        &text,
+                        reaction.chosen,
+                    );
+                    actions.insert(&button, -1);
+                }
+                actions.insert(&picker, -1);
+                bubble.append(&actions);
+            }
+            if message.can_reply
+                && let Some(chat) = self.selection.get()
+            {
                 let title = if message.pinned {
                     "Открепить"
                 } else {
@@ -1155,6 +1208,7 @@ impl Ui {
                 can_forward: true,
                 forwarded: false,
                 pinned: false,
+                reactions: Vec::new(),
                 edited: false,
             };
             self.input.set_text("");
@@ -1377,6 +1431,7 @@ impl Ui {
                         can_delete: true,
                         forwarded: true,
                         pinned: false,
+                        reactions: Vec::new(),
                         edited: false,
                         ..message
                     },
@@ -1552,6 +1607,97 @@ impl Ui {
             message.pinned = pinned;
         }
         self.render_history(false);
+    }
+
+    fn reaction_button(
+        self: &Rc<Self>,
+        chat: i64,
+        id: i32,
+        emoji: &str,
+        text: &str,
+        chosen: bool,
+    ) -> gtk::Button {
+        let button = gtk::Button::with_label(text);
+        if chosen {
+            button.add_css_class("suggested-action");
+        } else {
+            button.add_css_class("flat");
+        }
+        button.set_tooltip_text(Some(&format!(
+            "{} {emoji}",
+            if chosen {
+                "Убрать реакцию"
+            } else {
+                "Поставить реакцию"
+            }
+        )));
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[strong(rename_to = emoji)]
+            emoji.to_owned(),
+            move |_| ui.toggle_reaction(chat, id, emoji.clone())
+        ));
+        button
+    }
+
+    fn toggle_reaction(self: &Rc<Self>, chat: i64, id: i32, emoji: String) {
+        if self.is_demo.get() {
+            let mut history = self.demo_messages.borrow_mut();
+            let Some(message) = history
+                .get_mut(&chat)
+                .and_then(|messages| messages.iter_mut().find(|message| message.id == id))
+            else {
+                return;
+            };
+            if let Some(reaction) = message
+                .reactions
+                .iter_mut()
+                .find(|item| item.emoji == emoji)
+            {
+                reaction.chosen = !reaction.chosen;
+                reaction.count += if reaction.chosen { 1 } else { -1 };
+                message.reactions.retain(|item| item.count > 0);
+            } else {
+                message.reactions.push(Reaction {
+                    emoji,
+                    count: 1,
+                    chosen: true,
+                });
+            }
+            self.apply_reactions(chat, id, message.reactions.clone());
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if !self.reacting.borrow_mut().insert((chat, id)) {
+            return;
+        }
+        self.job(
+            async move { client.toggle_reaction(chat, id, emoji).await },
+            move |ui, result| {
+                ui.reacting.borrow_mut().remove(&(chat, id));
+                match result {
+                    Ok(reactions) => {
+                        ui.apply_reactions(chat, id, reactions);
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => ui.toast(&format!("Не удалось изменить реакцию. {error}")),
+                }
+            },
+        );
+    }
+
+    fn apply_reactions(self: &Rc<Self>, chat: i64, id: i32, reactions: Vec<Reaction>) {
+        if self.selection.get() == Some(chat) {
+            if let Some(message) = self.messages.borrow_mut().get_mut(&id) {
+                message.reactions = reactions;
+            }
+            self.render_history(false);
+        }
     }
 
     fn save_file(self: &Rc<Self>, chat: i64, id: i32, name: String) {

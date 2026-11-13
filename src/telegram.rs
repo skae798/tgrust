@@ -9,13 +9,13 @@ use grammers_client::media::{Downloadable, Media};
 use grammers_client::message::{InputMessage, Message as TelegramMessage};
 use grammers_client::peer::Peer;
 use grammers_client::sender::{SenderPool, SenderPoolHandle, UpdatesConfiguration};
-use grammers_client::tl::enums;
+use grammers_client::tl::{enums, types};
 use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError, SignInError};
 use grammers_session::{Session, storages::SqliteSession, types::PeerRef};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
-use crate::model::{Chat, Message, UpdateStatus, Upload, UploadKind};
+use crate::model::{Chat, Message, Reaction, UpdateStatus, Upload, UploadKind};
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
@@ -201,6 +201,7 @@ impl Telegram {
                             | enums::Update::ReadChannelInbox(_)
                             | enums::Update::PinnedMessages(_)
                             | enums::Update::PinnedChannelMessages(_)
+                            | enums::Update::MessageReactions(_)
                     ) {
                         self.invalidate_views();
                     }
@@ -451,6 +452,50 @@ impl Telegram {
         Ok(())
     }
 
+    pub async fn toggle_reaction(
+        &self,
+        chat: i64,
+        id: i32,
+        emoji: String,
+    ) -> Result<Vec<Reaction>> {
+        let peer = self.peer(chat).await?;
+        let message = self
+            .message_by_id(peer, id)
+            .await?
+            .context("Сообщение больше недоступно")?;
+        let mut chosen = reaction_counts(&message)
+            .iter()
+            .filter_map(|enums::ReactionCount::Count(reaction)| {
+                reaction
+                    .chosen_order
+                    .map(|order| (order, reaction.reaction.clone()))
+            })
+            .filter(|(_, reaction)| {
+                !matches!(reaction, enums::Reaction::Paid | enums::Reaction::Empty)
+            })
+            .collect::<Vec<_>>();
+        chosen.sort_by_key(|(order, _)| *order);
+        let selected = enums::Reaction::Emoji(types::ReactionEmoji { emoticon: emoji });
+        if let Some(index) = chosen
+            .iter()
+            .position(|(_, reaction)| *reaction == selected)
+        {
+            chosen.remove(index);
+        } else {
+            chosen.push((0, selected));
+        }
+        let reactions = chosen
+            .into_iter()
+            .map(|(_, reaction)| reaction)
+            .collect::<Vec<_>>();
+        self.client.send_reactions(peer, id, reactions).await?;
+        let message = self
+            .message_by_id(peer, id)
+            .await?
+            .context("Сообщение больше недоступно")?;
+        Ok(message_reactions(&message))
+    }
+
     pub async fn forward_message(&self, source: i64, id: i32, destination: i64) -> Result<Message> {
         let source = self.peer(source).await?;
         let destination = self.peer(destination).await?;
@@ -563,8 +608,35 @@ fn message_view(message: &TelegramMessage) -> Message {
         can_forward: can_forward(message),
         forwarded: matches!(&message.raw, enums::Message::Message(raw) if raw.fwd_from.is_some()),
         pinned: message.pinned(),
+        reactions: message_reactions(message),
         edited: message.edit_date().is_some() && !message.edit_hide(),
     }
+}
+
+fn reaction_counts(message: &TelegramMessage) -> &[enums::ReactionCount] {
+    if let enums::Message::Message(raw) = &message.raw
+        && let Some(enums::MessageReactions::Reactions(reactions)) = &raw.reactions
+    {
+        &reactions.results
+    } else {
+        &[]
+    }
+}
+
+fn message_reactions(message: &TelegramMessage) -> Vec<Reaction> {
+    reaction_counts(message)
+        .iter()
+        .filter_map(|enums::ReactionCount::Count(reaction)| {
+            let enums::Reaction::Emoji(emoji) = &reaction.reaction else {
+                return None;
+            };
+            Some(Reaction {
+                emoji: emoji.emoticon.clone(),
+                count: reaction.count,
+                chosen: reaction.chosen_order.is_some(),
+            })
+        })
+        .collect()
 }
 
 fn can_forward(message: &TelegramMessage) -> bool {

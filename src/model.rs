@@ -25,8 +25,18 @@ pub struct Message {
     pub can_forward: bool,
     pub forwarded: bool,
     pub pinned: bool,
+    pub reactions: Vec<Reaction>,
     pub edited: bool,
 }
+
+#[derive(Clone)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: i32,
+    pub chosen: bool,
+}
+
+pub const COMMON_REACTIONS: &[&str] = &["👍", "❤️", "🔥", "😂", "👏", "😢"];
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -111,6 +121,7 @@ mod tests {
                 can_forward: false,
                 forwarded: false,
                 pinned: false,
+                reactions: Vec::new(),
                 edited: false,
             })
             .collect()
