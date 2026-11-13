@@ -197,7 +197,10 @@ impl Telegram {
                             | Update::MessageDeleted(_)
                     ) || matches!(
                         update.raw(),
-                        enums::Update::ReadHistoryInbox(_) | enums::Update::ReadChannelInbox(_)
+                        enums::Update::ReadHistoryInbox(_)
+                            | enums::Update::ReadChannelInbox(_)
+                            | enums::Update::PinnedMessages(_)
+                            | enums::Update::PinnedChannelMessages(_)
                     ) {
                         self.invalidate_views();
                     }
@@ -438,6 +441,16 @@ impl Telegram {
         Ok(())
     }
 
+    pub async fn set_message_pinned(&self, chat: i64, id: i32, pinned: bool) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        if pinned {
+            self.client.pin_message(peer, id).await?;
+        } else {
+            self.client.unpin_message(peer, id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn forward_message(&self, source: i64, id: i32, destination: i64) -> Result<Message> {
         let source = self.peer(source).await?;
         let destination = self.peer(destination).await?;
@@ -549,6 +562,7 @@ fn message_view(message: &TelegramMessage) -> Message {
         can_delete: outgoing && matches!(message.raw, enums::Message::Message(_)),
         can_forward: can_forward(message),
         forwarded: matches!(&message.raw, enums::Message::Message(raw) if raw.fwd_from.is_some()),
+        pinned: message.pinned(),
         edited: message.edit_date().is_some() && !message.edit_hide(),
     }
 }
