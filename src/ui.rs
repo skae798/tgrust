@@ -12,7 +12,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::model::{Chat, Message};
+use crate::model::{Chat, Message, UpdateStatus};
 use crate::telegram::{LoginStep, PAGE_SIZE, Telegram};
 
 struct Ui {
@@ -497,7 +497,7 @@ impl Ui {
         self.job(client.listen(stop), |ui, result| {
             if result.is_err() {
                 ui.toast(
-                    "Связь с Telegram прервана. Обновите чаты вручную или перезапустите клиент.",
+                    "Обновления Telegram остановлены. Перезапустите клиент, чтобы проверить сессию.",
                 );
             }
         });
@@ -511,9 +511,8 @@ impl Ui {
                     change = changes.changed() => {
                         if change.is_err() { break; }
                         tokio::time::sleep(Duration::from_millis(700)).await;
-                        changes.borrow_and_update();
-                        if notify.is_closed() { break; }
-                        let _ = notify.try_send(());
+                        let status = *changes.borrow_and_update();
+                        if notify.send(status).await.is_err() { break; }
                     }
                 }
             }
@@ -521,12 +520,19 @@ impl Ui {
 
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            while notifications.recv().await.is_some() {
+            let mut previous = UpdateStatus::default();
+            while let Some(status) = notifications.recv().await {
                 let Some(ui) = weak.upgrade() else { break };
-                ui.refresh_chats();
-                if !ui.split.is_collapsed() || ui.split.shows_content() {
-                    ui.load_history(None, true);
+                if status.reconnecting && !previous.reconnecting {
+                    ui.toast("Восстанавливаем связь с Telegram…");
                 }
+                if status.revision != previous.revision {
+                    ui.refresh_chats();
+                    if !ui.split.is_collapsed() || ui.split.shows_content() {
+                        ui.load_history(None, true);
+                    }
+                }
+                previous = status;
             }
         });
     }

@@ -8,15 +8,15 @@ use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::media::{Downloadable, Media};
 use grammers_client::message::Message as TelegramMessage;
 use grammers_client::peer::Peer;
-use grammers_client::sender::{SenderPool, UpdatesConfiguration};
+use grammers_client::sender::{SenderPool, SenderPoolHandle, UpdatesConfiguration};
 use grammers_client::tl::enums;
 use grammers_client::update::Update;
-use grammers_client::{Client, SignInError};
-use grammers_session::{storages::SqliteSession, types::PeerRef};
+use grammers_client::{Client, InvocationError, SignInError};
+use grammers_session::{Session, storages::SqliteSession, types::PeerRef};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
-use crate::model::{Chat, Message};
+use crate::model::{Chat, Message, UpdateStatus};
 use crate::storage::{attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
@@ -38,11 +38,14 @@ enum LoginState {
 
 pub struct Telegram {
     client: Client,
+    session: Arc<SqliteSession>,
+    sender: SenderPoolHandle,
+    runner: tokio::task::AbortHandle,
     updates: Mutex<Option<mpsc::Receiver<grammers_session::updates::UpdatesLike>>>,
     api_hash: String,
     state: Mutex<LoginState>,
     peers: RwLock<HashMap<i64, PeerRef>>,
-    changes: watch::Sender<u64>,
+    changes: watch::Sender<UpdateStatus>,
 }
 
 impl Telegram {
@@ -57,7 +60,8 @@ impl Telegram {
             runner,
             updates,
             handle,
-        } = SenderPool::new(session, api_id);
+        } = SenderPool::new(session.clone(), api_id);
+        let sender = (*handle).clone();
         let client = Client::new(handle);
         let runner = tokio::spawn(async move {
             let _lock = lock;
@@ -80,10 +84,13 @@ impl Telegram {
         } else {
             (LoginState::Phone, LoginStep::Phone)
         };
-        let (changes, _) = watch::channel(0);
+        let (changes, _) = watch::channel(UpdateStatus::default());
         Ok((
             Arc::new(Self {
                 client,
+                session,
+                sender,
+                runner: runner.abort_handle(),
                 updates: Mutex::new(Some(updates)),
                 api_hash,
                 state: Mutex::new(state),
@@ -162,7 +169,7 @@ impl Telegram {
         }
     }
 
-    pub fn changes(&self) -> watch::Receiver<u64> {
+    pub fn changes(&self) -> watch::Receiver<UpdateStatus> {
         self.changes.subscribe()
     }
 
@@ -175,23 +182,86 @@ impl Telegram {
             .stream_updates(receiver, UpdatesConfiguration { catch_up: true })
             .await
             .map_err(anyhow::Error::from_boxed)?;
-        loop {
-            tokio::select! {
-                _ = stop.changed() => break,
-                update = updates.next() => {
-                    let update = update?;
-                    if matches!(update, Update::NewMessage(_) | Update::MessageEdited(_) | Update::MessageDeleted(_))
-                        || matches!(update.raw(), enums::Update::ReadHistoryInbox(_) | enums::Update::ReadChannelInbox(_))
-                    {
-                        self.changes.send_modify(|version| *version = version.wrapping_add(1));
+        let mut retry_delay = Duration::from_secs(1);
+        let result = 'listen: loop {
+            let result = tokio::select! {
+                _ = stop.changed() => break Ok(()),
+                update = updates.next() => update,
+            };
+            match result {
+                Ok(update) => {
+                    retry_delay = Duration::from_secs(1);
+                    if matches!(
+                        update,
+                        Update::NewMessage(_)
+                            | Update::MessageEdited(_)
+                            | Update::MessageDeleted(_)
+                    ) || matches!(
+                        update.raw(),
+                        enums::Update::ReadHistoryInbox(_) | enums::Update::ReadChannelInbox(_)
+                    ) {
+                        self.invalidate_views();
                     }
+                }
+                Err(error) if !self.runner.is_finished() && retry_update_error(&error) => {
+                    let reconnect = self.reconnect_updates(error, &mut retry_delay);
+                    tokio::select! {
+                        _ = stop.changed() => break 'listen Ok(()),
+                        result = reconnect => {
+                            if let Err(error) = result {
+                                break Err(error);
+                            }
+                        },
+                    }
+                }
+                Err(error) => break Err(error.into()),
+            }
+        };
+        let sync = updates
+            .sync_update_state()
+            .await
+            .map_err(anyhow::Error::from_boxed);
+        result.and(sync)
+    }
+
+    async fn reconnect_updates(
+        &self,
+        mut error: InvocationError,
+        retry_delay: &mut Duration,
+    ) -> Result<()> {
+        self.changes.send_if_modified(|status| {
+            let changed = !status.reconnecting;
+            status.reconnecting = true;
+            changed
+        });
+        loop {
+            tokio::time::sleep(update_retry_delay(&error, *retry_delay)).await;
+            *retry_delay = (*retry_delay * 2).min(Duration::from_secs(30));
+            match tokio::time::timeout(Duration::from_secs(15), self.client.is_authorized()).await {
+                Ok(Ok(true)) => {
+                    self.changes.send_modify(|status| {
+                        status.reconnecting = false;
+                        status.revision = status.revision.wrapping_add(1);
+                    });
+                    // The existing stream can now resume its pending difference request.
+                    return Ok(());
+                }
+                Ok(Ok(false)) => bail!("Сессия Telegram больше не авторизована"),
+                Ok(Err(next)) if !self.runner.is_finished() && retry_update_error(&next) => {
+                    error = next;
+                }
+                Ok(Err(error)) => return Err(error.into()),
+                Err(timeout) => {
+                    self.sender.disconnect_from_dc(self.session.home_dc_id()?);
+                    error = InvocationError::Io(timeout.into());
                 }
             }
         }
-        updates
-            .sync_update_state()
-            .await
-            .map_err(anyhow::Error::from_boxed)
+    }
+
+    fn invalidate_views(&self) {
+        self.changes
+            .send_modify(|status| status.revision = status.revision.wrapping_add(1));
     }
 
     pub async fn chats(&self) -> Result<Vec<Chat>> {
@@ -305,6 +375,26 @@ impl Telegram {
     }
 }
 
+fn retry_update_error(error: &InvocationError) -> bool {
+    match error {
+        InvocationError::Io(_) | InvocationError::Dropped(_) | InvocationError::Transport(_) => {
+            true
+        }
+        InvocationError::Rpc(error) => error.code == 420 || error.code >= 500,
+        _ => false,
+    }
+}
+
+fn update_retry_delay(error: &InvocationError, backoff: Duration) -> Duration {
+    if let InvocationError::Rpc(error) = error
+        && error.code == 420
+        && let Some(seconds) = error.value
+    {
+        return backoff.max(Duration::from_secs(seconds.into()));
+    }
+    backoff
+}
+
 fn message_view(message: &TelegramMessage) -> Message {
     let outgoing = message.outgoing();
     Message {
@@ -358,4 +448,36 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
         _ => return None,
     };
     (media.to_raw_input_location().is_some() || media.to_data().is_some()).then_some((media, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grammers_client::sender::RpcError;
+
+    #[test]
+    fn update_retry_respects_server_delay_and_stops_on_revoked_session() {
+        let backoff = Duration::from_secs(4);
+        let flood_wait = InvocationError::Rpc(RpcError {
+            code: 420,
+            name: "FLOOD_WAIT".into(),
+            value: Some(90),
+            caused_by: None,
+        });
+        let offline = InvocationError::Io(std::io::ErrorKind::NotConnected.into());
+        let revoked = InvocationError::Rpc(RpcError {
+            code: 401,
+            name: "SESSION_REVOKED".into(),
+            value: None,
+            caused_by: None,
+        });
+        assert!(retry_update_error(&flood_wait));
+        assert_eq!(
+            update_retry_delay(&flood_wait, backoff),
+            Duration::from_secs(90)
+        );
+        assert!(retry_update_error(&offline));
+        assert_eq!(update_retry_delay(&offline, backoff), backoff);
+        assert!(!retry_update_error(&revoked));
+    }
 }
