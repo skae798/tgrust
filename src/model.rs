@@ -16,3 +16,9 @@ pub struct Message {
     pub outgoing: bool,
     pub attachment: Option<String>,
 }
+
+#[derive(Clone, Copy, Default)]
+pub struct UpdateStatus {
+    pub revision: u64,
+    pub reconnecting: bool,
+}
