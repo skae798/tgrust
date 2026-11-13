@@ -25,6 +25,7 @@ struct Ui {
     login_entry: gtk::PasswordEntry,
     login_submit: gtk::Button,
     login_reset: gtk::Button,
+    connect_retry: gtk::Button,
     split: adw::NavigationSplitView,
     toasts: adw::ToastOverlay,
     list: gtk::ListBox,
@@ -92,6 +93,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     login_submit.add_css_class("suggested-action");
     let login_reset = gtk::Button::with_label("Запросить новый код");
     login_reset.add_css_class("flat");
+    login_reset.set_visible(false);
+    let connect_retry = gtk::Button::with_label("Повторить подключение");
+    connect_retry.add_css_class("suggested-action");
+    connect_retry.set_visible(false);
     let demo_button = gtk::Button::with_label("Открыть деморежим");
     demo_button.add_css_class("flat");
     for widget in [
@@ -100,6 +105,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         login_entry.upcast_ref(),
         login_submit.upcast_ref(),
         login_reset.upcast_ref(),
+        connect_retry.upcast_ref(),
         demo_button.upcast_ref(),
     ] {
         login_box.append(widget);
@@ -195,6 +201,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         login_entry,
         login_submit,
         login_reset,
+        connect_retry,
         split,
         toasts,
         list,
@@ -236,6 +243,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         #[weak]
         ui,
         move |_| ui.restart_login()
+    ));
+    ui.connect_retry.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.connect()
     ));
     demo_button.connect_clicked(glib::clone!(
         #[weak]
@@ -330,6 +342,9 @@ impl Ui {
     fn connect(self: &Rc<Self>) {
         self.root.set_visible_child_name("login");
         self.set_login_busy(true);
+        self.connect_retry.set_visible(false);
+        self.login_entry.set_visible(false);
+        self.login_submit.set_visible(false);
         match crate::credentials() {
             Ok(Some((id, hash))) => {
                 self.login_status.set_text("Подключение…");
@@ -342,9 +357,12 @@ impl Ui {
                             ui.client.replace(Some(client));
                             ui.show_step(step);
                         }
-                        Err(error) => ui
-                            .login_status
-                            .set_text(&format!("Не удалось подключиться. {error}")),
+                        Err(error) => {
+                            ui.login_status
+                                .set_text(&format!("Не удалось подключиться. {error}"));
+                            ui.connect_retry.set_visible(true);
+                            ui.connect_retry.grab_focus();
+                        }
                     }
                 });
             }
@@ -363,6 +381,8 @@ impl Ui {
 
     fn show_step(self: &Rc<Self>, step: LoginStep) {
         self.login_step.set(step);
+        self.login_entry.set_visible(true);
+        self.login_submit.set_visible(true);
         self.login_entry.set_text("");
         self.set_login_busy(false);
         self.login_reset
@@ -412,19 +432,29 @@ impl Ui {
         }
         self.set_login_busy(true);
         self.login_status.set_text("Проверка…");
-        self.job(async move { client.login(&value).await }, |ui, result| {
-            if ui.is_demo.get() {
-                return;
-            }
-            match result {
-                Ok(step) => ui.show_step(step),
-                Err(error) => {
-                    ui.login_entry.set_text("");
-                    ui.login_status.set_text(&error.to_string());
-                    ui.set_login_busy(false);
+        self.job(
+            async move {
+                let result = client.login(&value).await;
+                Ok((result, client.login_step().await))
+            },
+            |ui, result| {
+                if ui.is_demo.get() {
+                    return;
                 }
-            }
-        });
+                match result {
+                    Ok((Ok(step), _)) => ui.show_step(step),
+                    Ok((Err(error), step)) => {
+                        ui.show_step(step);
+                        ui.login_status.set_text(&error.to_string());
+                    }
+                    Err(error) => {
+                        ui.login_entry.set_text("");
+                        ui.login_status.set_text(&error.to_string());
+                        ui.set_login_busy(false);
+                    }
+                }
+            },
+        );
     }
 
     fn restart_login(self: &Rc<Self>) {
