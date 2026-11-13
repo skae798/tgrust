@@ -41,15 +41,15 @@ pub struct Telegram {
     sender: SenderPoolHandle,
     runner: tokio::task::AbortHandle,
     updates: Mutex<Option<mpsc::Receiver<grammers_session::updates::UpdatesLike>>>,
-    api_hash: String,
+    api_hash: Option<String>,
     state: Mutex<LoginState>,
     peers: RwLock<HashMap<i64, PeerRef>>,
     changes: watch::Sender<UpdateStatus>,
 }
 
 impl Telegram {
-    pub async fn connect(api_id: i32, api_hash: String) -> Result<(Arc<Self>, LoginStep)> {
-        let (path, lock) = open_session_file(api_id)?;
+    pub async fn connect(api_id: i32, api_hash: Option<String>) -> Result<(Arc<Self>, LoginStep)> {
+        let (path, lock) = open_session_file(api_id, api_hash.is_some())?;
         let session = Arc::new(
             SqliteSession::open(path)
                 .await
@@ -81,6 +81,10 @@ impl Telegram {
         let (state, step) = if authorized {
             (LoginState::Authorized, LoginStep::Authorized)
         } else {
+            ensure!(
+                api_hash.is_some(),
+                "Сессия истекла. Запустите tgrust с TGRUST_API_ID и TGRUST_API_HASH для повторного входа."
+            );
             (LoginState::Phone, LoginStep::Phone)
         };
         let (changes, _) = watch::channel(UpdateStatus::default());
@@ -119,10 +123,11 @@ impl Telegram {
                         && value[1..].bytes().all(|c| c.is_ascii_digit()),
                     "Введите номер в международном формате, например +380…"
                 );
-                let token = self
-                    .client
-                    .request_login_code(value, &self.api_hash)
-                    .await?;
+                let api_hash = self
+                    .api_hash
+                    .as_deref()
+                    .context("Для входа нужен API hash")?;
+                let token = self.client.request_login_code(value, api_hash).await?;
                 *state = LoginState::Code(token);
                 Ok(LoginStep::Code)
             }

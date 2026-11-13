@@ -10,11 +10,13 @@ use std::process::ExitCode;
 use adw::prelude::*;
 use anyhow::{Context, Result, ensure};
 
-fn credentials() -> Result<Option<(i32, String)>> {
+const APP_ID: &str = "io.github.skae798.tgrust";
+
+fn credentials() -> Result<Option<(i32, Option<String>)>> {
     let id = env::var("TGRUST_API_ID").ok();
     let hash = env::var("TGRUST_API_HASH").ok();
     match (id, hash) {
-        (None, None) => Ok(None),
+        (None, None) => Ok(storage::saved_session_api_id()?.map(|id| (id, None))),
         (Some(id), Some(hash)) => {
             let id: i32 = id
                 .parse()
@@ -24,7 +26,7 @@ fn credentials() -> Result<Option<(i32, String)>> {
                 hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
                 "TGRUST_API_HASH должен содержать 32 шестнадцатеричных символа"
             );
-            Ok(Some((id, hash)))
+            Ok(Some((id, Some(hash))))
         }
         _ => anyhow::bail!("Укажите TGRUST_API_ID и TGRUST_API_HASH вместе"),
     }
@@ -46,9 +48,8 @@ fn main() -> ExitCode {
     };
     let runtime = tokio::runtime::Runtime::new().expect("Не удалось запустить Tokio");
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
-    let app = adw::Application::builder()
-        .application_id("io.github.skae798.tgrust")
-        .build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
     app.connect_activate({
         let handle = runtime.handle().clone();
         move |app| {
