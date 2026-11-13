@@ -9,6 +9,30 @@ pub struct Chat {
     pub unread: i32,
     pub broadcast: bool,
     pub saved_messages: bool,
+    pub avatar: Option<Avatar>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Avatar {
+    pub peer: i64,
+    pub photo: i64,
+    pub dc: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttachmentThumbnail {
+    Photo(i64),
+    Document(i64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChatImage {
+    Avatar(Avatar),
+    Attachment {
+        chat: i64,
+        message: i32,
+        media: AttachmentThumbnail,
+    },
 }
 
 pub struct SearchHit {
@@ -20,11 +44,13 @@ pub struct SearchHit {
 pub struct Message {
     pub id: i32,
     pub sender: String,
+    pub sender_avatar: Option<Avatar>,
     pub timestamp: i64,
     pub text: String,
     pub outgoing: bool,
     pub attachment: Option<String>,
     pub photo_preview: bool,
+    pub thumbnail: Option<AttachmentThumbnail>,
     pub reply_to: Option<i32>,
     pub can_reply: bool,
     pub can_edit: bool,
@@ -117,11 +143,13 @@ mod tests {
             .map(|&id| Message {
                 id,
                 sender: "Тест".into(),
+                sender_avatar: None,
                 timestamp: 0,
                 text: String::new(),
                 outgoing: false,
                 attachment: None,
                 photo_preview: false,
+                thumbnail: None,
                 reply_to: None,
                 can_reply: true,
                 can_edit: false,
