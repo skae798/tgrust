@@ -1166,6 +1166,19 @@ impl Ui {
                     bubble.append(&action);
                 }
             }
+            if message.photo_preview
+                && let Some(chat) = self.selection.get()
+            {
+                let button = gtk::Button::with_label("Открыть фото");
+                button.add_css_class("flat");
+                let id = message.id;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.open_photo_preview(chat, id)
+                ));
+                bubble.append(&button);
+            }
             let mut time = timestamp
                 .and_then(|time| time.format("%H:%M").ok())
                 .unwrap_or_default();
@@ -1447,6 +1460,7 @@ impl Ui {
                 outgoing: true,
                 timestamp: demo::now(),
                 attachment: upload.as_ref().map(|upload| upload.name.clone()),
+                photo_preview: false,
                 reply_to,
                 can_reply: true,
                 can_edit: upload.is_none(),
@@ -1997,6 +2011,76 @@ impl Ui {
                 },
             );
         });
+    }
+
+    fn open_photo_preview(self: &Rc<Self>, chat: i64, id: i32) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::Dialog::builder()
+            .title("Фотография")
+            .content_width(640)
+            .content_height(500)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Contain)
+            .can_shrink(true)
+            .alternative_text("Предпросмотр фотографии")
+            .build();
+        picture.update_property(&[gtk::accessible::Property::Label("Предпросмотр фотографии")]);
+        let status = label("Загрузка фотографии…", "dim-label");
+        status.set_wrap(true);
+        status.set_halign(gtk::Align::Center);
+        status.set_valign(gtk::Align::Center);
+        status.set_margin_start(12);
+        status.set_margin_end(12);
+        let content = gtk::Stack::new();
+        content.add_child(&status);
+        content.add_child(&picture);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.present(Some(&window));
+        if self.is_demo.get() {
+            let bytes = glib::Bytes::from_owned(demo::preview_pixels());
+            let texture = gtk::gdk::MemoryTexture::new(
+                480,
+                300,
+                gtk::gdk::MemoryFormat::R8g8b8,
+                &bytes,
+                1440,
+            );
+            picture.set_paintable(Some(&texture));
+            content.set_visible_child(&picture);
+        } else if let Some(client) = self.client.borrow().clone() {
+            self.job(
+                async move { client.photo_preview(chat, id).await },
+                glib::clone!(
+                    #[weak]
+                    content,
+                    #[weak]
+                    picture,
+                    #[weak]
+                    status,
+                    move |_, result| {
+                        let texture = result.and_then(|bytes| {
+                            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                                .map_err(anyhow::Error::from)
+                        });
+                        match texture {
+                            Ok(texture) => {
+                                picture.set_paintable(Some(&texture));
+                                content.set_visible_child(&picture);
+                            }
+                            Err(error) => {
+                                status.set_text(&format!("Не удалось открыть фотографию. {error}"))
+                            }
+                        }
+                    }
+                ),
+            );
+        }
     }
 
     fn toast(&self, message: &str) {
