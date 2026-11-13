@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 use crate::demo;
 use crate::model::{Chat, Message, UpdateStatus, merge_latest_history};
+use crate::storage::PendingSave;
 use crate::telegram::{LoginStep, Telegram};
 
 struct Ui {
@@ -980,14 +981,9 @@ impl Ui {
                     if let Some(client) = client {
                         client.save(chat, id, path).await
                     } else {
-                        use std::io::Write;
-                        let directory = path
-                            .parent()
-                            .ok_or_else(|| anyhow::anyhow!("У файла нет каталога"))?;
-                        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-                        temporary.write_all(demo::FILE_CONTENT.as_bytes())?;
-                        temporary.persist_noclobber(path)?;
-                        Ok(())
+                        let mut output = PendingSave::new(path)?;
+                        output.write(demo::FILE_CONTENT.as_bytes()).await?;
+                        output.finish(Some(demo::FILE_CONTENT.len())).await
                     }
                 },
                 |ui, result| {
