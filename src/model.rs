@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct Chat {
@@ -23,6 +24,19 @@ pub struct Message {
 pub struct UpdateStatus {
     pub revision: u64,
     pub reconnecting: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UploadKind {
+    File,
+    Photo,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Upload {
+    pub path: PathBuf,
+    pub name: String,
+    pub kind: UploadKind,
 }
 /// Replace the refreshed range. Retain older pages only when the ranges meet,
 /// and preserve messages delivered by a send that completed during the request.

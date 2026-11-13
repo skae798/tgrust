@@ -12,8 +12,8 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::model::{Chat, Message, UpdateStatus, merge_latest_history};
-use crate::storage::PendingSave;
+use crate::model::{Chat, Message, UpdateStatus, Upload, UploadKind, merge_latest_history};
+use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
 struct Ui {
@@ -38,6 +38,9 @@ struct Ui {
     older: gtk::Button,
     input: gtk::Entry,
     send: gtk::Button,
+    attach: gtk::MenuButton,
+    upload_bar: gtk::Box,
+    upload_name: gtk::Label,
     client: RefCell<Option<Arc<Telegram>>>,
     login_step: Cell<LoginStep>,
     is_demo: Cell<bool>,
@@ -53,6 +56,7 @@ struct Ui {
     messages: RefCell<BTreeMap<i32, Message>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     drafts: RefCell<HashMap<i64, String>>,
+    uploads: RefCell<HashMap<i64, Upload>>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -179,6 +183,23 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
 
     let composer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     composer.add_css_class("composer");
+    let attach = gtk::MenuButton::builder()
+        .icon_name("mail-attachment-symbolic")
+        .tooltip_text("Добавить вложение")
+        .build();
+    let attach_menu = gtk::gio::Menu::new();
+    attach_menu.append(Some("Файл"), Some("win.attach-file"));
+    attach_menu.append(Some("Фотография"), Some("win.attach-photo"));
+    attach.set_menu_model(Some(&attach_menu));
+    let upload_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    upload_bar.add_css_class("composer");
+    upload_bar.set_visible(false);
+    let upload_name = label("", "");
+    upload_name.set_hexpand(true);
+    upload_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    let remove_upload = icon_button("edit-clear-symbolic", "Убрать вложение");
+    upload_bar.append(&upload_name);
+    upload_bar.append(&remove_upload);
     let input = gtk::Entry::builder()
         .hexpand(true)
         .placeholder_text("Сообщение")
@@ -186,9 +207,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .build();
     let send = icon_button("mail-send-symbolic", "Отправить");
     send.add_css_class("suggested-action");
+    composer.append(&attach);
     composer.append(&input);
     composer.append(&send);
     conversation.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    conversation.append(&upload_bar);
     conversation.append(&composer);
     content.add_named(&conversation, Some("conversation"));
     pane.set_content(Some(&content));
@@ -216,6 +239,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         older,
         input,
         send,
+        attach,
+        upload_bar,
+        upload_name,
         client: RefCell::new(None),
         login_step: Cell::new(LoginStep::Phone),
         is_demo: Cell::new(false),
@@ -231,6 +257,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         messages: RefCell::new(BTreeMap::new()),
         demo_messages: RefCell::new(HashMap::new()),
         drafts: RefCell::new(HashMap::new()),
+        uploads: RefCell::new(HashMap::new()),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -305,6 +332,28 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         #[weak]
         ui,
         move |_| ui.update_send_button()
+    ));
+    for (name, kind) in [
+        ("attach-file", UploadKind::File),
+        ("attach-photo", UploadKind::Photo),
+    ] {
+        let action = gtk::gio::SimpleAction::new(name, None);
+        action.connect_activate(glib::clone!(
+            #[weak]
+            ui,
+            move |_, _| ui.choose_upload(kind)
+        ));
+        window.add_action(&action);
+    }
+    remove_upload.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(chat) = ui.selection.get() {
+                ui.uploads.borrow_mut().remove(&chat);
+                ui.update_send_button();
+            }
+        }
     ));
 
     window.connect_close_request({
@@ -822,26 +871,30 @@ impl Ui {
             if let Some(name) = &message.attachment
                 && let Some(chat) = self.selection.get()
             {
-                let action = gtk::Button::new();
-                action.add_css_class("flat");
-                action.set_tooltip_text(Some("Сохранить вложение"));
-                let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                file.append(&gtk::Image::from_icon_name("document-save-symbolic"));
                 let file_name = label(name, "");
                 file_name.set_max_width_chars(32);
                 file_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                file.append(&file_name);
-                action.set_child(Some(&file));
                 let id = message.id;
-                let name = name.clone();
-                action.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| {
-                        ui.save_file(chat, id, name.clone());
-                    }
-                ));
-                bubble.append(&action);
+                if self.is_demo.get() && !demo::has_sample_attachment(chat, id) {
+                    bubble.append(&file_name);
+                } else {
+                    let action = gtk::Button::new();
+                    action.add_css_class("flat");
+                    action.set_tooltip_text(Some("Сохранить вложение"));
+                    let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                    file.append(&gtk::Image::from_icon_name("document-save-symbolic"));
+                    file.append(&file_name);
+                    action.set_child(Some(&file));
+                    let name = name.clone();
+                    action.connect_clicked(glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        move |_| {
+                            ui.save_file(chat, id, name.clone());
+                        }
+                    ));
+                    bubble.append(&action);
+                }
             }
             let time = timestamp
                 .and_then(|time| time.format("%H:%M").ok())
@@ -871,11 +924,64 @@ impl Ui {
     }
 
     fn update_send_button(&self) {
+        let uploads = self.uploads.borrow();
+        let upload = self.selection.get().and_then(|chat| uploads.get(&chat));
+        self.upload_bar.set_visible(upload.is_some());
+        if let Some(upload) = upload {
+            self.upload_name.set_text(&upload.name);
+        }
+        self.attach
+            .set_sensitive(self.input.is_sensitive() && !self.sending.get());
         self.send.set_sensitive(
             self.input.is_sensitive()
-                && !self.input.text().trim().is_empty()
+                && (!self.input.text().trim().is_empty() || upload.is_some())
                 && !self.sending.get(),
         );
+    }
+
+    fn choose_upload(self: &Rc<Self>, kind: UploadKind) {
+        if !self.attach.is_sensitive() {
+            return;
+        }
+        let (Some(window), Some(chat)) = (self.window.upgrade(), self.selection.get()) else {
+            return;
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title(match kind {
+                UploadKind::File => "Выберите файл",
+                UploadKind::Photo => "Выберите фотографию",
+            })
+            .build();
+        if kind == UploadKind::Photo {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Фотографии"));
+            filter.add_mime_type("image/*");
+            let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            dialog.set_filters(Some(&filters));
+        }
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = dialog.open_future(Some(&window)).await;
+            let (Some(ui), Ok(file)) = (weak.upgrade(), result) else {
+                return;
+            };
+            if ui.window.upgrade().is_none() {
+                return;
+            }
+            let Some(path) = file.path() else {
+                ui.toast("Выберите локальный файл");
+                return;
+            };
+            let name = attachment_name(
+                &path.file_name().unwrap_or_default().to_string_lossy(),
+                "Вложение",
+            );
+            ui.uploads
+                .borrow_mut()
+                .insert(chat, Upload { path, name, kind });
+            ui.update_send_button();
+        });
     }
 
     fn send_message(self: &Rc<Self>) {
@@ -887,6 +993,7 @@ impl Ui {
         };
         let original = self.input.text().to_string();
         let text = original.trim().to_owned();
+        let upload = self.uploads.borrow().get(&chat).cloned();
         if self.is_demo.get() {
             let id = self
                 .messages
@@ -895,11 +1002,15 @@ impl Ui {
                 .map_or(1, |(&id, _)| id + 1);
             let message = Message {
                 id,
-                text,
+                text: if text.is_empty() {
+                    "Вложение".into()
+                } else {
+                    text
+                },
                 sender: "Вы".into(),
                 outgoing: true,
                 timestamp: demo::now(),
-                attachment: None,
+                attachment: upload.as_ref().map(|upload| upload.name.clone()),
             };
             self.demo_messages
                 .borrow_mut()
@@ -915,6 +1026,8 @@ impl Ui {
                 chat.preview.clone_from(&message.text);
             }
             self.input.set_text("");
+            self.uploads.borrow_mut().remove(&chat);
+            self.update_send_button();
             self.messages.borrow_mut().insert(id, message);
             self.render_chats();
             self.render_history(true);
@@ -925,12 +1038,19 @@ impl Ui {
         };
         self.sending.set(true);
         self.update_send_button();
+        if upload.is_some() {
+            self.toast("Отправляем вложение…");
+        }
+        let request_upload = upload.clone();
         self.job(
-            async move { client.send(chat, text).await },
+            async move { client.send(chat, text, request_upload).await },
             move |ui, result| {
                 ui.sending.set(false);
                 match result {
                     Ok(message) => {
+                        if ui.uploads.borrow().get(&chat) == upload.as_ref() {
+                            ui.uploads.borrow_mut().remove(&chat);
+                        }
                         if ui.selection.get() == Some(chat) {
                             if ui.input.text() == original {
                                 ui.input.set_text("");

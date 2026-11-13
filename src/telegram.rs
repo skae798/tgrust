@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::media::{Downloadable, Media};
-use grammers_client::message::Message as TelegramMessage;
+use grammers_client::message::{InputMessage, Message as TelegramMessage};
 use grammers_client::peer::Peer;
 use grammers_client::sender::{SenderPool, SenderPoolHandle, UpdatesConfiguration};
 use grammers_client::tl::enums;
@@ -15,7 +15,7 @@ use grammers_client::{Client, InvocationError, SignInError};
 use grammers_session::{Session, storages::SqliteSession, types::PeerRef};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
-use crate::model::{Chat, Message, UpdateStatus};
+use crate::model::{Chat, Message, UpdateStatus, Upload, UploadKind};
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
@@ -340,8 +340,37 @@ impl Telegram {
         Ok((result, has_older, marked))
     }
 
-    pub async fn send(&self, id: i64, text: String) -> Result<Message> {
-        let message = self.client.send_message(self.peer(id).await?, text).await?;
+    pub async fn send(&self, id: i64, text: String, upload: Option<Upload>) -> Result<Message> {
+        let peer = self.peer(id).await?;
+        let mut message = InputMessage::new().text(text);
+        if let Some(upload) = upload {
+            let metadata = tokio::fs::metadata(&upload.path)
+                .await
+                .context("Не удалось прочитать выбранный файл")?;
+            ensure!(metadata.is_file(), "Выберите обычный файл");
+            let file = tokio::fs::File::open(&upload.path).await?;
+            let metadata = file.metadata().await?;
+            ensure!(metadata.is_file(), "Выберите обычный файл");
+            ensure!(metadata.len() <= 4 * 1024_u64.pow(3), "Файл больше 4 ГиБ");
+            let size = usize::try_from(metadata.len()).context("Файл слишком большой")?;
+            ensure!(size > 0, "Нельзя отправить пустой файл");
+            use tokio::io::AsyncReadExt;
+            let mut stream = file.take(metadata.len());
+            let uploaded = self
+                .client
+                .upload_stream(&mut stream, size, upload.name)
+                .await
+                .context("Не удалось загрузить файл в Telegram")?;
+            ensure!(
+                stream.limit() == 0,
+                "Размер файла изменился во время отправки"
+            );
+            message = match upload.kind {
+                UploadKind::File => message.file(uploaded),
+                UploadKind::Photo => message.photo(uploaded),
+            };
+        }
+        let message = self.client.send_message(peer, message).await?;
         Ok(message_view(&message))
     }
 
