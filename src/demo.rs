@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{AttachmentThumbnail, Avatar, Chat, Message};
+use crate::model::{AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatKind, Message};
 
 pub const OWN_NAME: &str = "Алексей";
 pub const OWN_AVATAR: Avatar = Avatar {
@@ -37,8 +37,23 @@ pub fn chats() -> Vec<Chat> {
             dc: 0,
         }),
         archived: id == 3,
+        kind: match id {
+            1 => ChatKind::Group,
+            3 => ChatKind::Broadcast,
+            _ => ChatKind::User,
+        },
+        muted: false,
     })
     .collect()
+}
+
+pub fn folders() -> Vec<ChatFolder> {
+    vec![ChatFolder {
+        id: 2,
+        title: "Команда".into(),
+        kinds: vec![ChatKind::Group],
+        ..ChatFolder::default()
+    }]
 }
 
 pub fn history(chat: i64) -> Vec<Message> {
