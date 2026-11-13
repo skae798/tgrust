@@ -8,6 +8,7 @@ pub struct Chat {
     pub preview: String,
     pub unread: i32,
     pub broadcast: bool,
+    pub saved_messages: bool,
 }
 
 pub struct SearchHit {
