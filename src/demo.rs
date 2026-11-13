@@ -22,6 +22,7 @@ pub fn chats() -> Vec<Chat> {
         preview: preview.to_owned(),
         unread,
         broadcast,
+        saved_messages: id == 2,
     })
     .collect()
 }
@@ -50,7 +51,10 @@ pub fn history(chat: i64) -> Vec<Message> {
             ),
             ("Анна", "Пробный кадр", false, None),
         ],
-        2 => vec![("Вы", "Проверить сборку на ноутбуке", true, None)],
+        2 => vec![
+            ("Вы", "Проверить сборку на ноутбуке", true, None),
+            ("Анна", "Сохранённая заметка", false, None),
+        ],
         _ => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
     };
     samples
@@ -67,7 +71,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             reply_to: None,
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
-            can_delete: outgoing,
+            can_delete: outgoing || chat == 2,
             can_forward: true,
             forwarded: false,
             pinned: false,

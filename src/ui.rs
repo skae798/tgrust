@@ -1138,33 +1138,14 @@ impl Ui {
                 text.set_max_width_chars(64);
                 bubble.append(&text);
             }
-            if let Some(name) = &message.attachment
-                && let Some(chat) = self.selection.get()
-            {
+            if let Some(name) = &message.attachment {
                 let file_name = label(name, "");
                 file_name.set_max_width_chars(32);
                 file_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-                let id = message.id;
-                if self.is_demo.get() && !demo::has_sample_attachment(chat, id) {
-                    bubble.append(&file_name);
-                } else {
-                    let action = gtk::Button::new();
-                    action.add_css_class("flat");
-                    action.set_tooltip_text(Some("Сохранить вложение"));
-                    let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-                    file.append(&gtk::Image::from_icon_name("document-save-symbolic"));
-                    file.append(&file_name);
-                    action.set_child(Some(&file));
-                    let name = name.clone();
-                    action.connect_clicked(glib::clone!(
-                        #[weak(rename_to = ui)]
-                        self,
-                        move |_| {
-                            ui.save_file(chat, id, name.clone());
-                        }
-                    ));
-                    bubble.append(&action);
-                }
+                let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                file.append(&gtk::Image::from_icon_name("mail-attachment-symbolic"));
+                file.append(&file_name);
+                bubble.append(&file);
             }
             if message.photo_preview
                 && let Some(chat) = self.selection.get()
@@ -1187,140 +1168,31 @@ impl Ui {
             }
             let time = label(&time, "message-time");
             time.add_css_class("dim-label");
-            let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let footer = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             footer.set_halign(gtk::Align::End);
-            if message.can_reply
-                && let Some(chat) = self.selection.get()
-            {
-                let actions = gtk::FlowBox::builder()
+            if !message.reactions.is_empty() {
+                let reactions = gtk::FlowBox::builder()
                     .selection_mode(gtk::SelectionMode::None)
-                    .column_spacing(4)
-                    .row_spacing(3)
+                    .column_spacing(6)
                     .build();
-                let choices = gtk::FlowBox::builder()
-                    .selection_mode(gtk::SelectionMode::None)
-                    .column_spacing(4)
-                    .row_spacing(3)
-                    .margin_top(6)
-                    .margin_bottom(6)
-                    .margin_start(6)
-                    .margin_end(6)
-                    .build();
-                let popover = gtk::Popover::new();
-                popover.set_child(Some(&choices));
-                let picker = gtk::MenuButton::builder()
-                    .icon_name("face-smile-symbolic")
-                    .tooltip_text("Добавить реакцию")
-                    .popover(&popover)
-                    .build();
-                picker.add_css_class("flat");
-                for &emoji in COMMON_REACTIONS {
-                    let button = self.reaction_button(chat, message.id, emoji, emoji, false);
-                    button.connect_clicked(glib::clone!(
-                        #[weak]
-                        popover,
-                        move |_| popover.popdown()
-                    ));
-                    choices.insert(&button, -1);
-                }
                 for reaction in &message.reactions {
                     let text = format!("{} {}", reaction.emoji, reaction.count);
-                    let button = self.reaction_button(
-                        chat,
-                        message.id,
-                        &reaction.emoji,
+                    let count = label(
                         &text,
-                        reaction.chosen,
+                        if reaction.chosen {
+                            "accent"
+                        } else {
+                            "dim-label"
+                        },
                     );
-                    actions.insert(&button, -1);
+                    reactions.insert(&count, -1);
                 }
-                actions.insert(&picker, -1);
-                bubble.append(&actions);
+                bubble.append(&reactions);
             }
-            if message.can_reply
-                && let Some(chat) = self.selection.get()
+            if let Some(chat) = self.selection.get()
+                && let Some(menu) = self.message_menu(&bubble, chat, message)
             {
-                let title = if message.pinned {
-                    "Открепить"
-                } else {
-                    "Закрепить"
-                };
-                let button = icon_button("view-pin-symbolic", title);
-                button.add_css_class("flat");
-                if message.pinned {
-                    button.add_css_class("accent");
-                }
-                let id = message.id;
-                let pinned = !message.pinned;
-                button.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| ui.set_message_pinned(chat, id, pinned)
-                ));
-                footer.append(&button);
-            }
-            if message.can_forward
-                && let Some(chat) = self.selection.get()
-            {
-                let button = icon_button("mail-forward-symbolic", "Переслать");
-                button.add_css_class("flat");
-                let message = message.clone();
-                button.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| ui.forward_message(chat, message.clone())
-                ));
-                footer.append(&button);
-            }
-            if message.can_delete
-                && let Some(chat) = self.selection.get()
-            {
-                let button = icon_button("user-trash-symbolic", "Удалить");
-                button.add_css_class("flat");
-                let id = message.id;
-                button.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| ui.delete_message(chat, id)
-                ));
-                footer.append(&button);
-            }
-            if message.can_edit
-                && let Some(chat) = self.selection.get()
-            {
-                let button = icon_button("document-edit-symbolic", "Редактировать");
-                button.add_css_class("flat");
-                let id = message.id;
-                let text = message.text.clone();
-                button.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| ui.edit_message(chat, id, &text, false)
-                ));
-                footer.append(&button);
-            }
-            if message.can_reply
-                && self.input.is_sensitive()
-                && let Some(chat) = self.selection.get()
-            {
-                let button = icon_button("mail-reply-sender-symbolic", "Ответить");
-                button.add_css_class("flat");
-                let reply = Reply {
-                    id: message.id,
-                    summary: message.reply_summary(),
-                };
-                button.connect_clicked(glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move |_| {
-                        if ui.selection.get() == Some(chat) {
-                            ui.replies.borrow_mut().insert(chat, reply.clone());
-                            ui.update_send_button();
-                            ui.input.grab_focus();
-                        }
-                    }
-                ));
-                footer.append(&button);
+                footer.append(&menu);
             }
             footer.append(&time);
             bubble.append(&footer);
@@ -1366,6 +1238,188 @@ impl Ui {
                 ),
             );
         }
+    }
+
+    fn message_menu(
+        self: &Rc<Self>,
+        bubble: &gtk::Box,
+        chat: i64,
+        message: &Message,
+    ) -> Option<gtk::MenuButton> {
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let id = message.id;
+        if message.can_reply {
+            if self.input.is_sensitive() {
+                let reply = Reply {
+                    id,
+                    summary: message.reply_summary(),
+                };
+                add_menu_button(
+                    &menu,
+                    "Ответить",
+                    glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        move || {
+                            if ui.selection.get() == Some(chat) {
+                                ui.replies.borrow_mut().insert(chat, reply.clone());
+                                ui.update_send_button();
+                                ui.input.grab_focus();
+                            }
+                        }
+                    ),
+                );
+            }
+            let title = if message.pinned {
+                "Открепить"
+            } else {
+                "Закрепить"
+            };
+            let pinned = !message.pinned;
+            add_menu_button(
+                &menu,
+                title,
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.set_message_pinned(chat, id, pinned)
+                ),
+            );
+            let reactions = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            for emoji in COMMON_REACTIONS.iter().copied().chain(
+                message
+                    .reactions
+                    .iter()
+                    .map(|reaction| reaction.emoji.as_str())
+                    .filter(|emoji| !COMMON_REACTIONS.contains(emoji)),
+            ) {
+                let title = if message
+                    .reactions
+                    .iter()
+                    .any(|item| item.emoji == emoji && item.chosen)
+                {
+                    format!("Убрать {emoji}")
+                } else {
+                    emoji.to_owned()
+                };
+                add_menu_button(
+                    &reactions,
+                    &title,
+                    glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        #[strong(rename_to = emoji)]
+                        emoji.to_owned(),
+                        move || ui.toggle_reaction(chat, id, emoji.clone())
+                    ),
+                );
+            }
+            let reaction_menu = gtk::Expander::builder()
+                .label("Реакция")
+                .child(&reactions)
+                .build();
+            menu.append(&reaction_menu);
+        }
+        if message.can_forward {
+            add_menu_button(
+                &menu,
+                "Переслать",
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    #[strong(rename_to = message)]
+                    message.clone(),
+                    move || ui.forward_message(chat, message.clone())
+                ),
+            );
+        }
+        if message.can_edit {
+            add_menu_button(
+                &menu,
+                "Редактировать",
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    #[strong(rename_to = text)]
+                    message.text.clone(),
+                    move || ui.edit_message(chat, id, &text, false)
+                ),
+            );
+        }
+        if message.photo_preview {
+            add_menu_button(
+                &menu,
+                "Открыть фото",
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.open_photo_preview(chat, id)
+                ),
+            );
+        }
+        if let Some(name) = &message.attachment
+            && (!self.is_demo.get() || demo::has_sample_attachment(chat, id))
+        {
+            add_menu_button(
+                &menu,
+                "Сохранить вложение",
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    #[strong(rename_to = name)]
+                    name.clone(),
+                    move || ui.save_file(chat, id, name.clone())
+                ),
+            );
+        }
+        if message.can_delete {
+            add_menu_button(
+                &menu,
+                "Удалить",
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.delete_message(chat, id)
+                ),
+            );
+        }
+        menu.first_child()?;
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&menu));
+        let button = gtk::MenuButton::builder()
+            .icon_name("view-more-symbolic")
+            .tooltip_text("Действия с сообщением")
+            .popover(&popover)
+            .build();
+        button.add_css_class("flat");
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(glib::clone!(
+            #[weak]
+            bubble,
+            #[weak]
+            button,
+            #[weak]
+            popover,
+            move |gesture, _, x, y| {
+                if let Some(point) =
+                    bubble.compute_point(&button, &gtk::graphene::Point::new(x as f32, y as f32))
+                {
+                    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                        point.x() as i32,
+                        point.y() as i32,
+                        1,
+                        1,
+                    )));
+                }
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                button.popup();
+            }
+        ));
+        popover.connect_closed(|popover| popover.set_pointing_to(None));
+        bubble.add_controller(click);
+        Some(button)
     }
 
     fn update_send_button(&self) {
@@ -1765,14 +1819,35 @@ impl Ui {
         let Some(window) = self.window.upgrade() else {
             return;
         };
+        let saved_messages = self
+            .chats
+            .borrow()
+            .iter()
+            .any(|item| item.id == chat && item.saved_messages)
+            || self
+                .search_chat
+                .borrow()
+                .as_ref()
+                .is_some_and(|item| item.id == chat && item.saved_messages);
         let dialog = adw::AlertDialog::builder()
             .heading("Удалить сообщение?")
-            .body("Сообщение будет удалено для всех участников чата.")
+            .body(if saved_messages {
+                "Сохранённая копия будет удалена из «Избранного»."
+            } else {
+                "Сообщение будет удалено для всех участников чата."
+            })
             .close_response("cancel")
             .default_response("cancel")
             .build();
         dialog.add_response("cancel", "Отмена");
-        dialog.add_response("delete", "Удалить для всех");
+        dialog.add_response(
+            "delete",
+            if saved_messages {
+                "Удалить"
+            } else {
+                "Удалить для всех"
+            },
+        );
         dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
@@ -1872,38 +1947,6 @@ impl Ui {
             message.pinned = pinned;
         }
         self.render_history(false);
-    }
-
-    fn reaction_button(
-        self: &Rc<Self>,
-        chat: i64,
-        id: i32,
-        emoji: &str,
-        text: &str,
-        chosen: bool,
-    ) -> gtk::Button {
-        let button = gtk::Button::with_label(text);
-        if chosen {
-            button.add_css_class("suggested-action");
-        } else {
-            button.add_css_class("flat");
-        }
-        button.set_tooltip_text(Some(&format!(
-            "{} {emoji}",
-            if chosen {
-                "Убрать реакцию"
-            } else {
-                "Поставить реакцию"
-            }
-        )));
-        button.connect_clicked(glib::clone!(
-            #[weak(rename_to = ui)]
-            self,
-            #[strong(rename_to = emoji)]
-            emoji.to_owned(),
-            move |_| ui.toggle_reaction(chat, id, emoji.clone())
-        ));
-        button
     }
 
     fn toggle_reaction(self: &Rc<Self>, chat: i64, id: i32, emoji: String) {
@@ -2086,6 +2129,22 @@ impl Ui {
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
+}
+
+fn add_menu_button(menu: &gtk::Box, title: &str, activate: impl Fn() + 'static) {
+    let button = gtk::Button::new();
+    button.add_css_class("flat");
+    button.set_child(Some(&label(title, "")));
+    button.connect_clicked(move |button| {
+        if let Some(popover) = button
+            .ancestor(gtk::Popover::static_type())
+            .and_downcast::<gtk::Popover>()
+        {
+            popover.popdown();
+        }
+        activate();
+    });
+    menu.append(&button);
 }
 
 fn label(text: &str, class: &str) -> gtk::Label {
