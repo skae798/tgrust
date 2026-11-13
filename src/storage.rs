@@ -4,6 +4,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 pub fn open_session_file(api_id: i32) -> Result<(PathBuf, File)> {
     let base = env::var_os("XDG_DATA_HOME")
@@ -77,6 +78,58 @@ pub fn attachment_name(name: &str, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_owned())
 }
 
+pub struct PendingSave {
+    output: tokio::fs::File,
+    temporary: tempfile::NamedTempFile,
+    destination: PathBuf,
+}
+
+impl PendingSave {
+    pub fn new(destination: PathBuf) -> Result<Self> {
+        match fs::symlink_metadata(&destination) {
+            Ok(_) => anyhow::bail!("Файл с таким именем уже существует"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Не удалось проверить путь сохранения"),
+        }
+        let directory = destination.parent().context("У файла нет каталога")?;
+        let temporary = tempfile::Builder::new()
+            .prefix(".tgrust-")
+            .tempfile_in(directory)?;
+        let output = tokio::fs::File::from_std(temporary.reopen()?);
+        Ok(Self {
+            output,
+            temporary,
+            destination,
+        })
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.output.write_all(bytes).await?;
+        Ok(())
+    }
+
+    pub async fn restart(&mut self) -> Result<()> {
+        self.output.flush().await?;
+        self.output.set_len(0).await?;
+        self.output.rewind().await?;
+        Ok(())
+    }
+
+    pub async fn finish(mut self, expected: Option<usize>) -> Result<()> {
+        self.output.flush().await?;
+        if let Some(expected) = expected {
+            ensure!(
+                self.output.metadata().await?.len() == expected as u64,
+                "Вложение загружено не полностью"
+            );
+        }
+        self.output.sync_all().await?;
+        drop(self.output);
+        self.temporary.persist_noclobber(self.destination)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +200,47 @@ mod tests {
             let session = SqliteSession::open(&path).await.unwrap();
             assert_eq!(session.updates_state().await.unwrap().pts, 42);
         });
+    }
+
+    #[test]
+    fn restarted_save_replaces_partial_data_with_a_complete_large_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.bin");
+        let chunk = vec![7; 512 * 1024];
+        let mut expected = Vec::new();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut save = PendingSave::new(path.clone()).unwrap();
+            save.write(&[1; 200]).await.unwrap();
+            save.restart().await.unwrap();
+            for index in 0..25 {
+                save.write(&[index]).await.unwrap();
+                save.write(&chunk).await.unwrap();
+                expected.push(index);
+                expected.extend_from_slice(&chunk);
+            }
+            save.finish(Some(expected.len())).await.unwrap();
+        });
+        assert_eq!(fs::read(path).unwrap(), expected);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn incomplete_and_colliding_saves_remove_the_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("target.bin");
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut incomplete = PendingSave::new(path.clone()).unwrap();
+            incomplete.write(b"partial").await.unwrap();
+            assert!(incomplete.finish(Some(100)).await.is_err());
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+
+            let mut colliding = PendingSave::new(path.clone()).unwrap();
+            colliding.write(b"new").await.unwrap();
+            fs::write(&path, b"existing").unwrap();
+            assert!(colliding.finish(Some(3)).await.is_err());
+            assert!(PendingSave::new(path.clone()).is_err());
+        });
+        assert_eq!(fs::read(path).unwrap(), b"existing");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

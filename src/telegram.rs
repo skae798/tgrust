@@ -13,11 +13,10 @@ use grammers_client::tl::enums;
 use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError, SignInError};
 use grammers_session::{Session, storages::SqliteSession, types::PeerRef};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 use crate::model::{Chat, Message, UpdateStatus};
-use crate::storage::{attachment_name, open_session_file};
+use crate::storage::{PendingSave, attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
 
@@ -347,36 +346,62 @@ impl Telegram {
     }
 
     pub async fn save(&self, chat: i64, id: i32, destination: PathBuf) -> Result<()> {
-        ensure!(!destination.exists(), "Файл с таким именем уже существует");
+        let mut output = PendingSave::new(destination)?;
+        let peer = self.peer(chat).await?;
+        let mut media = self.attachment_media(peer, id).await?;
+        let identity = attachment_id(&media);
+        let mut retried = false;
+        let mut download = self.client.iter_download(&media);
+        loop {
+            match download.next().await {
+                Ok(Some(chunk)) => output.write(&chunk).await?,
+                Ok(None) => return output.finish(media.size()).await,
+                Err(error) if !retried && expired_file_reference(&error) => {
+                    media = self.attachment_media(peer, id).await?;
+                    ensure!(
+                        attachment_id(&media) == identity,
+                        "Вложение в сообщении изменилось"
+                    );
+                    output.restart().await?;
+                    download = self.client.iter_download(&media);
+                    retried = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    async fn attachment_media(&self, peer: PeerRef, id: i32) -> Result<Media> {
         let message = self
             .client
-            .get_messages_by_id(self.peer(chat).await?, &[id])
+            .get_messages_by_id(peer, &[id])
             .await?
             .into_iter()
             .next()
             .flatten()
             .context("Сообщение больше недоступно")?;
-        let (media, _) = attachment(&message).context("Вложение больше недоступно")?;
-        let directory = destination.parent().context("У файла нет каталога")?;
-        let temporary = tempfile::Builder::new()
-            .prefix(".tgrust-")
-            .tempfile_in(directory)?;
-        let mut output = tokio::fs::File::from_std(temporary.reopen()?);
-        let mut download = self.client.iter_download(&media);
-        let mut bytes = 0;
-        while let Some(chunk) = download.next().await? {
-            output.write_all(&chunk).await?;
-            bytes += chunk.len();
-        }
-        ensure!(
-            media.size().is_none_or(|expected| expected == bytes),
-            "Вложение загружено не полностью"
-        );
-        output.sync_all().await?;
-        drop(output);
-        temporary.persist_noclobber(destination)?;
-        Ok(())
+        attachment(&message)
+            .map(|(media, _)| media)
+            .context("Вложение больше недоступно")
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum AttachmentId {
+    Photo(i64),
+    Document(i64),
+}
+
+fn attachment_id(media: &Media) -> Option<AttachmentId> {
+    match media {
+        Media::Photo(photo) => Some(AttachmentId::Photo(photo.id())),
+        Media::Document(document) => Some(AttachmentId::Document(document.id())),
+        _ => None,
+    }
+}
+
+fn expired_file_reference(error: &InvocationError) -> bool {
+    error.is("FILE_REFERENCE_EXPIRED") || error.is("FILE_REFERENCE_INVALID")
 }
 
 fn retry_update_error(error: &InvocationError) -> bool {
@@ -458,6 +483,24 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn download_retries_only_errors_that_require_a_fresh_file_reference() {
+        for (name, should_retry) in [
+            ("FILE_REFERENCE_EXPIRED", true),
+            ("FILE_REFERENCE_INVALID", true),
+            ("LOCATION_INVALID", false),
+            ("CHANNEL_PRIVATE", false),
+        ] {
+            let error = InvocationError::Rpc(RpcError {
+                code: 400,
+                name: name.into(),
+                value: None,
+                caused_by: None,
+            });
+            assert_eq!(expired_file_reference(&error), should_retry);
+        }
+    }
 
     #[test]
     fn update_retry_respects_server_delay_and_stops_on_revoked_session() {
