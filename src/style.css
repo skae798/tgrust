@@ -71,3 +71,18 @@
   border-left-width: 0;
   border-right: 3px solid var(--accent-color);
 }
+
+.composer-field {
+  border-radius: 8px;
+  background: alpha(var(--view-fg-color), 0.06);
+}
+
+.composer-field textview,
+.composer-field textview text {
+  background: transparent;
+}
+
+.attachment-preview {
+  padding: 0;
+  border-radius: 8px;
+}

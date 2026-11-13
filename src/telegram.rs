@@ -1038,7 +1038,11 @@ fn message_view(
         }),
         sender_avatar: author_peer(message, profile).and_then(peer_avatar),
         timestamp: message.date().as_second(),
-        text: preview(message),
+        text: if attachment.is_some() {
+            message.text().to_owned()
+        } else {
+            preview(message)
+        },
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
