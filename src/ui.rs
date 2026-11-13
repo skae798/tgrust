@@ -42,6 +42,8 @@ struct Ui {
     toasts: adw::ToastOverlay,
     list: gtk::ListBox,
     filter: gtk::SearchEntry,
+    archive: gtk::ToggleButton,
+    archive_chat: gtk::Button,
     content: gtk::Stack,
     title: adw::WindowTitle,
     history: gtk::Box,
@@ -64,6 +66,7 @@ struct Ui {
     generation: Cell<u64>,
     chat_refresh: Cell<bool>,
     chat_refresh_pending: Cell<bool>,
+    moving_chats: RefCell<HashSet<i64>>,
     history_refresh: Cell<bool>,
     latest_history_pending: Cell<Option<bool>>,
     search_anchor: Cell<Option<i32>>,
@@ -159,6 +162,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let search_messages = icon_button("system-search-symbolic", "Поиск по сообщениям");
     side_header.pack_end(&refresh);
     side_header.pack_end(&search_messages);
+    let archive = gtk::ToggleButton::builder()
+        .icon_name("folder-symbolic")
+        .tooltip_text("Архив чатов")
+        .build();
+    side_header.pack_start(&archive);
     sidebar.add_top_bar(&side_header);
     let side_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let filter = gtk::SearchEntry::builder()
@@ -184,6 +192,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let pane_header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Чаты", "");
     pane_header.set_title_widget(Some(&title));
+    let archive_chat = icon_button("folder-symbolic", "Переместить в архив");
+    archive_chat.set_visible(false);
+    pane_header.pack_end(&archive_chat);
     pane.add_top_bar(&pane_header);
     let content = gtk::Stack::new();
     let empty = adw::StatusPage::builder()
@@ -270,6 +281,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         toasts,
         list,
         filter,
+        archive,
+        archive_chat,
         content,
         title,
         history,
@@ -292,6 +305,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         generation: Cell::new(0),
         chat_refresh: Cell::new(false),
         chat_refresh_pending: Cell::new(false),
+        moving_chats: RefCell::new(HashSet::new()),
         history_refresh: Cell::new(false),
         latest_history_pending: Cell::new(None),
         search_anchor: Cell::new(None),
@@ -342,6 +356,19 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
             ui.refresh_chats();
             ui.load_history(None, false);
         }
+    ));
+    ui.archive.connect_toggled(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            ui.render_chats();
+            ui.split.set_show_content(false);
+        }
+    ));
+    ui.archive_chat.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.move_selected_chat()
     ));
     search_messages.connect_clicked(glib::clone!(
         #[weak]
@@ -688,16 +715,14 @@ impl Ui {
     }
 
     fn render_chats(self: &Rc<Self>) {
+        self.update_archive_button();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
         let query = self.filter.text().trim().to_lowercase();
-        for chat in self
-            .chats
-            .borrow()
-            .iter()
-            .filter(|chat| chat.title.to_lowercase().contains(&query))
-        {
+        for chat in self.chats.borrow().iter().filter(|chat| {
+            chat.archived == self.archive.is_active() && chat.title.to_lowercase().contains(&query)
+        }) {
             let row = gtk::ListBoxRow::new();
             row.set_widget_name(&chat.id.to_string());
             let line = gtk::Box::new(gtk::Orientation::Horizontal, 10);
@@ -737,6 +762,91 @@ impl Ui {
 
     fn select_chat(self: &Rc<Self>, id: i64) {
         self.show_chat(id, None);
+    }
+
+    fn update_archive_button(&self) {
+        let chats = self.chats.borrow();
+        let chat = self.selection.get().and_then(|id| {
+            chats
+                .iter()
+                .find(|chat| chat.id == id && !chat.saved_messages)
+        });
+        self.archive_chat.set_visible(chat.is_some());
+        if let Some(chat) = chat {
+            let title = if chat.archived {
+                "Вернуть из архива"
+            } else {
+                "Переместить в архив"
+            };
+            self.archive_chat.set_tooltip_text(Some(title));
+            self.archive_chat
+                .update_property(&[gtk::accessible::Property::Label(title)]);
+            self.archive_chat
+                .set_sensitive(!self.moving_chats.borrow().contains(&chat.id));
+        }
+    }
+
+    fn move_selected_chat(self: &Rc<Self>) {
+        let Some(id) = self.selection.get() else {
+            return;
+        };
+        let Some(archived) = self
+            .chats
+            .borrow()
+            .iter()
+            .find(|chat| chat.id == id && !chat.saved_messages)
+            .map(|chat| !chat.archived)
+        else {
+            return;
+        };
+        if self.is_demo.get() {
+            self.apply_archive(id, archived);
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if !self.moving_chats.borrow_mut().insert(id) {
+            return;
+        }
+        self.update_archive_button();
+        self.job(
+            async move { client.set_archived(id, archived).await },
+            move |ui, result| {
+                ui.moving_chats.borrow_mut().remove(&id);
+                match result {
+                    Ok(()) => {
+                        ui.apply_archive(id, archived);
+                        ui.refresh_chats();
+                    }
+                    Err(error) => {
+                        ui.update_archive_button();
+                        ui.toast(&format!("Не удалось переместить чат. {error}"));
+                    }
+                }
+            },
+        );
+    }
+
+    fn apply_archive(self: &Rc<Self>, id: i64, archived: bool) {
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|chat| chat.id == id)
+        {
+            chat.archived = archived;
+        }
+        if self.selection.get() == Some(id) {
+            self.archive.set_active(archived);
+            self.split.set_show_content(true);
+        }
+        self.render_chats();
+        self.toast(if archived {
+            "Чат перемещён в архив"
+        } else {
+            "Чат возвращён из архива"
+        });
     }
 
     fn open_message_search(self: &Rc<Self>) {
@@ -917,6 +1027,9 @@ impl Ui {
         else {
             return;
         };
+        if self.chats.borrow().iter().any(|item| item.id == id) {
+            self.archive.set_active(chat.archived);
+        }
         self.split.set_show_content(true);
         if self.selection.get() == Some(id)
             && self.loaded.get()
@@ -931,6 +1044,7 @@ impl Ui {
                 .borrow_mut()
                 .insert(previous, self.input.text().to_string());
         }
+        self.update_archive_button();
         self.generation.set(self.generation.get().wrapping_add(1));
         self.search_anchor.set(anchor);
         self.scroll_to_search_result.set(anchor.is_some());
