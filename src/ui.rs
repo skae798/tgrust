@@ -12,8 +12,8 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::model::{Chat, Message, UpdateStatus};
-use crate::telegram::{LoginStep, PAGE_SIZE, Telegram};
+use crate::model::{Chat, Message, UpdateStatus, merge_latest_history};
+use crate::telegram::{LoginStep, Telegram};
 
 struct Ui {
     runtime: Handle,
@@ -44,7 +44,9 @@ struct Ui {
     selection: Cell<Option<i64>>,
     generation: Cell<u64>,
     chat_refresh: Cell<bool>,
+    chat_refresh_pending: Cell<bool>,
     history_refresh: Cell<bool>,
+    latest_history_pending: Cell<Option<bool>>,
     sending: Cell<bool>,
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
@@ -220,7 +222,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         selection: Cell::new(None),
         generation: Cell::new(0),
         chat_refresh: Cell::new(false),
+        chat_refresh_pending: Cell::new(false),
         history_refresh: Cell::new(false),
+        latest_history_pending: Cell::new(None),
         sending: Cell::new(false),
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
@@ -542,6 +546,7 @@ impl Ui {
             return;
         };
         if self.chat_refresh.replace(true) {
+            self.chat_refresh_pending.set(true);
             return;
         }
         self.job(async move { client.chats().await }, move |ui, result| {
@@ -552,6 +557,9 @@ impl Ui {
                     ui.render_chats();
                 }
                 Err(error) => ui.toast(&format!("Не удалось загрузить чаты. {error}")),
+            }
+            if ui.chat_refresh_pending.replace(false) {
+                ui.refresh_chats();
             }
         });
     }
@@ -619,6 +627,7 @@ impl Ui {
         }
         self.generation.set(self.generation.get().wrapping_add(1));
         self.history_refresh.set(false);
+        self.latest_history_pending.set(None);
         self.loaded.set(false);
         self.has_older.set(false);
         self.messages.borrow_mut().clear();
@@ -669,9 +678,15 @@ impl Ui {
             return;
         };
         if self.history_refresh.replace(true) {
+            if before.is_none() {
+                self.latest_history_pending.set(Some(
+                    mark_read || self.latest_history_pending.get() == Some(true),
+                ));
+            }
             return;
         }
         let generation = self.generation.get();
+        let requested_through = self.messages.borrow().last_key_value().map(|(&id, _)| id);
         self.older.set_sensitive(false);
         let has_unread = self
             .chats
@@ -687,25 +702,27 @@ impl Ui {
                 ui.history_refresh.set(false);
                 ui.older.set_sensitive(true);
                 match result {
-                    Ok((messages, marked)) => {
+                    Ok((messages, has_older, marked)) => {
                         let was_loaded = ui.loaded.replace(true);
                         let adjustment = ui.scroll.vadjustment();
                         let at_bottom =
                             adjustment.upper() - adjustment.page_size() - adjustment.value() < 36.0;
                         let mut current = ui.messages.borrow_mut();
-                        if !was_loaded || before.is_some() {
-                            ui.has_older.set(messages.len() == PAGE_SIZE);
-                        }
-                        if before.is_none() {
-                            if messages.len() < PAGE_SIZE {
-                                current.clear();
-                            } else if let (Some(first), Some(last)) =
-                                (messages.first(), messages.last())
-                            {
-                                current.retain(|&id, _| id < first.id || id > last.id);
+                        if before.is_some() {
+                            current
+                                .extend(messages.into_iter().map(|message| (message.id, message)));
+                            ui.has_older.set(has_older);
+                        } else {
+                            let older_loaded = merge_latest_history(
+                                &mut current,
+                                messages,
+                                has_older,
+                                requested_through,
+                            );
+                            if !older_loaded {
+                                ui.has_older.set(has_older);
                             }
                         }
-                        current.extend(messages.into_iter().map(|message| (message.id, message)));
                         drop(current);
                         ui.render_history(before.is_none() && (!was_loaded || at_bottom));
                         if marked && has_unread {
@@ -714,11 +731,21 @@ impl Ui {
                         if before.is_some() {
                             let old_height = adjustment.upper();
                             let old_position = adjustment.value();
-                            after_layout(&ui.history, move || {
-                                adjustment.set_value(
-                                    old_position + (adjustment.upper() - old_height).max(0.0),
-                                );
-                            });
+                            after_layout(
+                                &ui.history,
+                                glib::clone!(
+                                    #[weak]
+                                    ui,
+                                    move || {
+                                        if ui.generation.get() == generation {
+                                            adjustment.set_value(
+                                                old_position
+                                                    + (adjustment.upper() - old_height).max(0.0),
+                                            );
+                                        }
+                                    }
+                                ),
+                            );
                         }
                     }
                     Err(error) => {
@@ -732,6 +759,12 @@ impl Ui {
                         }
                         ui.toast(&format!("Не удалось загрузить историю. {error}"));
                     }
+                }
+                if let Some(mark_read) = ui.latest_history_pending.replace(None) {
+                    ui.load_history(
+                        None,
+                        mark_read && (!ui.split.is_collapsed() || ui.split.shows_content()),
+                    );
                 }
             },
         );
@@ -820,9 +853,19 @@ impl Ui {
         }
         if bottom {
             let adjustment = self.scroll.vadjustment();
-            after_layout(&self.history, move || {
-                adjustment.set_value(adjustment.upper())
-            });
+            let generation = self.generation.get();
+            after_layout(
+                &self.history,
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || {
+                        if ui.generation.get() == generation {
+                            adjustment.set_value(adjustment.upper());
+                        }
+                    }
+                ),
+            );
         }
     }
 
@@ -843,7 +886,6 @@ impl Ui {
         };
         let original = self.input.text().to_string();
         let text = original.trim().to_owned();
-        let generation = self.generation.get();
         if self.is_demo.get() {
             let id = self
                 .messages
@@ -888,7 +930,7 @@ impl Ui {
                 ui.sending.set(false);
                 match result {
                     Ok(message) => {
-                        if generation == ui.generation.get() {
+                        if ui.selection.get() == Some(chat) {
                             if ui.input.text() == original {
                                 ui.input.set_text("");
                             }
