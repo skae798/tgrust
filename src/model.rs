@@ -24,6 +24,7 @@ pub struct Message {
     pub can_delete: bool,
     pub can_forward: bool,
     pub forwarded: bool,
+    pub pinned: bool,
     pub edited: bool,
 }
 
@@ -109,6 +110,7 @@ mod tests {
                 can_delete: false,
                 can_forward: false,
                 forwarded: false,
+                pinned: false,
                 edited: false,
             })
             .collect()

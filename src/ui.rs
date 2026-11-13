@@ -892,6 +892,9 @@ impl Ui {
             if message.forwarded {
                 bubble.append(&label("Пересланное сообщение", "dim-label"));
             }
+            if message.pinned {
+                bubble.append(&label("Закреплено", "dim-label"));
+            }
             if let Some(id) = message.reply_to {
                 let summary = messages
                     .get(&id)
@@ -946,6 +949,28 @@ impl Ui {
             time.add_css_class("dim-label");
             let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             footer.set_halign(gtk::Align::End);
+            if message.can_reply
+                && let Some(chat) = self.selection.get()
+            {
+                let title = if message.pinned {
+                    "Открепить"
+                } else {
+                    "Закрепить"
+                };
+                let button = icon_button("view-pin-symbolic", title);
+                button.add_css_class("flat");
+                if message.pinned {
+                    button.add_css_class("accent");
+                }
+                let id = message.id;
+                let pinned = !message.pinned;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |_| ui.set_message_pinned(chat, id, pinned)
+                ));
+                footer.append(&button);
+            }
             if message.can_forward
                 && let Some(chat) = self.selection.get()
             {
@@ -1129,6 +1154,7 @@ impl Ui {
                 can_delete: true,
                 can_forward: true,
                 forwarded: false,
+                pinned: false,
                 edited: false,
             };
             self.input.set_text("");
@@ -1350,6 +1376,7 @@ impl Ui {
                         can_edit: false,
                         can_delete: true,
                         forwarded: true,
+                        pinned: false,
                         edited: false,
                         ..message
                     },
@@ -1487,6 +1514,44 @@ impl Ui {
             self.update_send_button();
             self.render_history(false);
         }
+    }
+
+    fn set_message_pinned(self: &Rc<Self>, chat: i64, id: i32, pinned: bool) {
+        if self.is_demo.get() {
+            if let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
+                && let Some(message) = messages.iter_mut().find(|message| message.id == id)
+            {
+                message.pinned = pinned;
+            }
+            self.apply_message_pin(chat, id, pinned);
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        self.job(
+            async move { client.set_message_pinned(chat, id, pinned).await },
+            move |ui, result| match result {
+                Ok(()) => {
+                    ui.apply_message_pin(chat, id, pinned);
+                    ui.refresh_chats();
+                    if ui.selection.get() == Some(chat) {
+                        ui.load_history(None, false);
+                    }
+                }
+                Err(error) => ui.toast(&format!("Не удалось изменить закрепление. {error}")),
+            },
+        );
+    }
+
+    fn apply_message_pin(self: &Rc<Self>, chat: i64, id: i32, pinned: bool) {
+        if self.selection.get() != Some(chat) {
+            return;
+        }
+        if let Some(message) = self.messages.borrow_mut().get_mut(&id) {
+            message.pinned = pinned;
+        }
+        self.render_history(false);
     }
 
     fn save_file(self: &Rc<Self>, chat: i64, id: i32, name: String) {
