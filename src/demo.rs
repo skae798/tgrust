@@ -11,13 +11,7 @@ pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
 
 pub fn chats() -> Vec<Chat> {
     [
-        (
-            1,
-            "Дизайн-команда",
-            "Отправила заметки по встрече",
-            2,
-            false,
-        ),
+        (1, "Дизайн-команда", "Пробный кадр", 3, false),
         (2, "Избранное", "Проверить сборку на ноутбуке", 0, false),
         (3, "Новости проекта", "Опубликован план на неделю", 0, true),
     ]
@@ -54,6 +48,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 false,
                 Some(FILE_NAME),
             ),
+            ("Анна", "Пробный кадр", false, None),
         ],
         2 => vec![("Вы", "Проверить сборку на ноутбуке", true, None)],
         _ => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
@@ -68,6 +63,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             text: text.to_owned(),
             outgoing,
             attachment: attachment.map(str::to_owned),
+            photo_preview: chat == 1 && index == 3,
             reply_to: None,
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
@@ -79,6 +75,25 @@ pub fn history(chat: i64) -> Vec<Message> {
             edited: false,
         })
         .collect()
+}
+
+pub fn preview_pixels() -> Vec<u8> {
+    let mut pixels = Vec::with_capacity(480 * 300 * 3);
+    for y in 0..300 {
+        for x in 0..480 {
+            let rgb = if (x - 350_i32).pow(2) + (y - 85_i32).pow(2) < 31_i32.pow(2) {
+                [255, 207, 140]
+            } else if y > 165 + (x - 300_i32).abs() / 4 {
+                [41, 72, 89]
+            } else if y > 125 + (x - 115_i32).abs() / 3 {
+                [67, 112, 129]
+            } else {
+                [105, 160, 182]
+            };
+            pixels.extend_from_slice(&rgb);
+        }
+    }
+    pixels
 }
 
 pub fn now() -> i64 {

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::client::{LoginToken, PasswordToken};
-use grammers_client::media::{Downloadable, Media};
+use grammers_client::media::{Downloadable, Media, PhotoSize};
 use grammers_client::message::{InputMessage, Message as TelegramMessage};
 use grammers_client::peer::Peer;
 use grammers_client::sender::{SenderPool, SenderPoolHandle, UpdatesConfiguration};
@@ -471,6 +471,68 @@ impl Telegram {
         }
     }
 
+    pub async fn photo_preview(&self, chat: i64, id: i32) -> Result<Vec<u8>> {
+        let peer = self.peer(chat).await?;
+        let mut previous = None;
+        for attempt in 0..2 {
+            let message = self
+                .message_by_id(peer, id)
+                .await?
+                .context("Сообщение больше недоступно")?;
+            let Some((Media::Photo(photo), _)) = attachment(&message) else {
+                bail!("Фотография больше недоступна");
+            };
+            let identity = photo.id();
+            ensure!(
+                previous.is_none_or(|previous| previous == identity),
+                "Фотография в сообщении изменилась"
+            );
+            previous = Some(identity);
+            let thumbnail = photo
+                .thumbs()
+                .into_iter()
+                .filter(|thumb| match thumb {
+                    PhotoSize::Size(size) => {
+                        (1..=1600).contains(&size.width) && (1..=1600).contains(&size.height)
+                    }
+                    PhotoSize::Progressive(size) => {
+                        (1..=1600).contains(&size.width) && (1..=1600).contains(&size.height)
+                    }
+                    PhotoSize::Cached(size) => {
+                        (1..=1600).contains(&size.width) && (1..=1600).contains(&size.height)
+                    }
+                    _ => false,
+                })
+                .filter(|thumb| (1..=4 * 1024 * 1024).contains(&thumb.size()))
+                .max_by_key(PhotoSize::size)
+                .context("Нет доступного размера для предпросмотра")?;
+            let expected = thumbnail.size();
+            let mut download = self.client.iter_download(&PhotoPreview {
+                thumbnail,
+                dc: photo.dc_id(),
+            });
+            let mut bytes = Vec::with_capacity(expected);
+            loop {
+                match download.next().await {
+                    Ok(Some(chunk)) => {
+                        ensure!(
+                            bytes.len() + chunk.len() <= expected,
+                            "Не удалось проверить размер фотографии"
+                        );
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => {
+                        ensure!(bytes.len() == expected, "Фотография загружена не полностью");
+                        return Ok(bytes);
+                    }
+                    Err(error) if attempt == 0 && expired_file_reference(&error) => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        unreachable!("the second download either succeeds or returns an error")
+    }
+
     pub async fn edit_text(&self, chat: i64, id: i32, text: String) -> Result<()> {
         let peer = self.peer(chat).await?;
         let message = self
@@ -597,6 +659,29 @@ impl Telegram {
     }
 }
 
+struct PhotoPreview {
+    thumbnail: PhotoSize,
+    dc: Option<i32>,
+}
+
+impl Downloadable for PhotoPreview {
+    fn to_raw_input_location(&self) -> Option<enums::InputFileLocation> {
+        self.thumbnail.to_raw_input_location()
+    }
+
+    fn to_data(&self) -> Option<Vec<u8>> {
+        self.thumbnail.to_data()
+    }
+
+    fn size(&self) -> Option<usize> {
+        Some(self.thumbnail.size())
+    }
+
+    fn dc_id(&self) -> Option<i32> {
+        self.dc
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum AttachmentId {
     Photo(i64),
@@ -637,6 +722,8 @@ fn update_retry_delay(error: &InvocationError, backoff: Duration) -> Duration {
 
 fn message_view(message: &TelegramMessage) -> Message {
     let outgoing = message.outgoing();
+    let attachment = attachment(message);
+    let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
     Message {
         id: message.id(),
         sender: if outgoing {
@@ -651,7 +738,8 @@ fn message_view(message: &TelegramMessage) -> Message {
         timestamp: message.date().as_second(),
         text: preview(message),
         outgoing,
-        attachment: attachment(message).map(|(_, name)| name),
+        attachment: attachment.map(|(_, name)| name),
+        photo_preview,
         reply_to: match &message.raw {
             enums::Message::Message(raw)
                 if matches!(
