@@ -70,6 +70,8 @@ pub fn history(chat: i64) -> Vec<Message> {
             attachment: attachment.map(str::to_owned),
             reply_to: None,
             can_reply: true,
+            can_edit: outgoing && attachment.is_none(),
+            edited: false,
         })
         .collect()
 }

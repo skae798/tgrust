@@ -20,6 +20,8 @@ pub struct Message {
     pub attachment: Option<String>,
     pub reply_to: Option<i32>,
     pub can_reply: bool,
+    pub can_edit: bool,
+    pub edited: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -100,6 +102,8 @@ mod tests {
                 attachment: None,
                 reply_to: None,
                 can_reply: true,
+                can_edit: false,
+                edited: false,
             })
             .collect()
     }
