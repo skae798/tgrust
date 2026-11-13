@@ -9,6 +9,7 @@ pub struct Chat {
     pub unread: i32,
     pub broadcast: bool,
     pub saved_messages: bool,
+    pub archived: bool,
     pub avatar: Option<Avatar>,
 }
 

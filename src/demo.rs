@@ -28,6 +28,7 @@ pub fn chats() -> Vec<Chat> {
             photo: id,
             dc: 0,
         }),
+        archived: id == 3,
     })
     .collect()
 }

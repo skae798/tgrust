@@ -216,6 +216,7 @@ impl Telegram {
                             | enums::Update::PinnedMessages(_)
                             | enums::Update::PinnedChannelMessages(_)
                             | enums::Update::MessageReactions(_)
+                            | enums::Update::FolderPeers(_)
                     ) {
                         self.invalidate_views();
                     }
@@ -312,6 +313,7 @@ impl Telegram {
                 broadcast: matches!(peer, Peer::Channel(_)),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
                 avatar: peer_avatar(peer),
+                archived: raw.folder_id == Some(1),
             });
             peers.insert(id, dialog.peer_ref());
         }
@@ -326,6 +328,22 @@ impl Telegram {
             .get(&id)
             .copied()
             .context("Чат не найден")
+    }
+
+    pub async fn set_archived(&self, chat: i64, archived: bool) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        self.client
+            .invoke(&grammers_client::tl::functions::folders::EditPeerFolders {
+                folder_peers: vec![
+                    types::InputFolderPeer {
+                        peer: peer.into(),
+                        folder_id: i32::from(archived),
+                    }
+                    .into(),
+                ],
+            })
+            .await?;
+        Ok(())
     }
 
     async fn self_id(&self) -> Result<Option<PeerId>> {
@@ -371,6 +389,7 @@ impl Telegram {
                     saved_messages: Some(peer_ref.id) == self_id
                         || matches!(peer, Peer::User(user) if user.is_self()),
                     avatar: peer_avatar(peer),
+                    archived: false,
                 },
                 message: message_view(&message, self_id),
             });
