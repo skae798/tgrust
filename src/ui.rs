@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::demo;
 use crate::model::{
-    COMMON_REACTIONS, Chat, Message, Reaction, Reply, UpdateStatus, Upload, UploadKind,
+    COMMON_REACTIONS, Chat, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload, UploadKind,
     merge_latest_history,
 };
 use crate::storage::{PendingSave, attachment_name};
@@ -39,6 +39,7 @@ struct Ui {
     history: gtk::Box,
     scroll: gtk::ScrolledWindow,
     older: gtk::Button,
+    latest: gtk::Button,
     input: gtk::Entry,
     send: gtk::Button,
     attach: gtk::MenuButton,
@@ -50,12 +51,15 @@ struct Ui {
     login_step: Cell<LoginStep>,
     is_demo: Cell<bool>,
     chats: RefCell<Vec<Chat>>,
+    search_chat: RefCell<Option<Chat>>,
     selection: Cell<Option<i64>>,
     generation: Cell<u64>,
     chat_refresh: Cell<bool>,
     chat_refresh_pending: Cell<bool>,
     history_refresh: Cell<bool>,
     latest_history_pending: Cell<Option<bool>>,
+    search_anchor: Cell<Option<i32>>,
+    scroll_to_search_result: Cell<bool>,
     sending: Cell<bool>,
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
@@ -142,7 +146,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let side_header = adw::HeaderBar::new();
     side_header.set_title_widget(Some(&adw::WindowTitle::new("tgrust", "")));
     let refresh = icon_button("view-refresh-symbolic", "Обновить чаты");
+    let search_messages = icon_button("system-search-symbolic", "Поиск по сообщениям");
     side_header.pack_end(&refresh);
+    side_header.pack_end(&search_messages);
     sidebar.add_top_bar(&side_header);
     let side_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let filter = gtk::SearchEntry::builder()
@@ -176,6 +182,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .build();
     content.add_named(&empty, Some("empty"));
     let conversation = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let latest = gtk::Button::with_label("К последним сообщениям");
+    latest.add_css_class("flat");
+    latest.set_visible(false);
+    conversation.append(&latest);
     let history = gtk::Box::new(gtk::Orientation::Vertical, 9);
     history.set_valign(gtk::Align::End);
     history.add_css_class("conversation");
@@ -255,6 +265,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         history,
         scroll,
         older,
+        latest,
         input,
         send,
         attach,
@@ -266,12 +277,15 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         login_step: Cell::new(LoginStep::Phone),
         is_demo: Cell::new(false),
         chats: RefCell::new(Vec::new()),
+        search_chat: RefCell::new(None),
         selection: Cell::new(None),
         generation: Cell::new(0),
         chat_refresh: Cell::new(false),
         chat_refresh_pending: Cell::new(false),
         history_refresh: Cell::new(false),
         latest_history_pending: Cell::new(None),
+        search_anchor: Cell::new(None),
+        scroll_to_search_result: Cell::new(false),
         sending: Cell::new(false),
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
@@ -315,6 +329,20 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         move |_| {
             ui.refresh_chats();
             ui.load_history(None, false);
+        }
+    ));
+    search_messages.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.open_message_search()
+    ));
+    ui.latest.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(chat) = ui.selection.get() {
+                ui.show_chat(chat, None);
+            }
         }
     ));
     ui.filter.connect_search_changed(glib::clone!(
@@ -689,17 +717,193 @@ impl Ui {
     }
 
     fn select_chat(self: &Rc<Self>, id: i64) {
+        self.show_chat(id, None);
+    }
+
+    fn open_message_search(self: &Rc<Self>) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = adw::Dialog::builder()
+            .title("Поиск по сообщениям")
+            .content_width(520)
+            .content_height(480)
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_start(14);
+        content.set_margin_end(14);
+        content.set_margin_top(8);
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Текст сообщения")
+            .hexpand(true)
+            .build();
+        let submit = gtk::Button::with_label("Найти");
+        submit.add_css_class("suggested-action");
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        bar.append(&search);
+        bar.append(&submit);
+        content.append(&bar);
+        let status = label("", "dim-label");
+        status.set_wrap(true);
+        content.append(&status);
+        let results = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let scroll = gtk::ScrolledWindow::builder()
+            .child(&results)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        content.append(&scroll);
+        toolbar.set_content(Some(&content));
+        dialog.set_child(Some(&toolbar));
+        dialog.set_focus(Some(&search));
+        let generation = Rc::new(Cell::new(0_u64));
+        submit.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[weak]
+            dialog,
+            #[weak]
+            search,
+            #[weak]
+            status,
+            #[weak]
+            results,
+            #[strong]
+            generation,
+            move |_| {
+                let query = search.text().trim().to_owned();
+                if query.is_empty() {
+                    return;
+                }
+                let request = generation.get().wrapping_add(1);
+                generation.set(request);
+                while let Some(child) = results.first_child() {
+                    results.remove(&child);
+                }
+                status.set_text("Поиск…");
+                if ui.is_demo.get() {
+                    let query = query.to_lowercase();
+                    let history = ui.demo_messages.borrow();
+                    let hits = ui
+                        .chats
+                        .borrow()
+                        .iter()
+                        .flat_map(|chat| {
+                            history
+                                .get(&chat.id)
+                                .cloned()
+                                .unwrap_or_else(|| demo::history(chat.id))
+                                .into_iter()
+                                .map(move |message| SearchHit {
+                                    chat: chat.clone(),
+                                    message,
+                                })
+                        })
+                        .filter(|hit| hit.message.text.to_lowercase().contains(&query))
+                        .take(50)
+                        .collect();
+                    ui.show_search_results(&dialog, &results, &status, hits);
+                } else if let Some(client) = ui.client.borrow().clone() {
+                    ui.job(
+                        async move { client.search(&query).await },
+                        glib::clone!(
+                            #[weak]
+                            dialog,
+                            #[weak]
+                            status,
+                            #[weak]
+                            results,
+                            #[strong]
+                            generation,
+                            move |ui, result| {
+                                if generation.get() == request {
+                                    match result {
+                                        Ok(hits) => {
+                                            ui.show_search_results(&dialog, &results, &status, hits)
+                                        }
+                                        Err(error) => status.set_text(&format!(
+                                            "Не удалось выполнить поиск. {error}"
+                                        )),
+                                    }
+                                }
+                            }
+                        ),
+                    );
+                }
+            }
+        ));
+        search.connect_activate(glib::clone!(
+            #[weak]
+            submit,
+            move |_| submit.emit_clicked()
+        ));
+        dialog.present(Some(&window));
+    }
+
+    fn show_search_results(
+        self: &Rc<Self>,
+        dialog: &adw::Dialog,
+        results: &gtk::Box,
+        status: &gtk::Label,
+        hits: Vec<SearchHit>,
+    ) {
+        status.set_text(if hits.is_empty() {
+            "Сообщения не найдены"
+        } else {
+            ""
+        });
+        for hit in hits {
+            let button = gtk::Button::new();
+            button.add_css_class("flat");
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            let title = label(&hit.chat.title, "heading");
+            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let excerpt = label(&hit.message.reply_summary(), "dim-label");
+            excerpt.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            body.append(&title);
+            body.append(&excerpt);
+            button.set_child(Some(&body));
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                #[weak]
+                dialog,
+                move |_| {
+                    let chat = hit.chat.id;
+                    ui.search_chat.replace(Some(hit.chat.clone()));
+                    dialog.close();
+                    ui.show_chat(chat, Some(hit.message.id));
+                }
+            ));
+            results.append(&button);
+        }
+    }
+
+    fn show_chat(self: &Rc<Self>, id: i64, anchor: Option<i32>) {
         let Some(chat) = self
             .chats
             .borrow()
             .iter()
             .find(|chat| chat.id == id)
             .cloned()
+            .or_else(|| {
+                self.search_chat
+                    .borrow()
+                    .as_ref()
+                    .filter(|chat| chat.id == id)
+                    .cloned()
+            })
         else {
             return;
         };
         self.split.set_show_content(true);
-        if self.selection.get() == Some(id) && self.loaded.get() {
+        if self.selection.get() == Some(id)
+            && self.loaded.get()
+            && anchor.is_none()
+            && self.search_anchor.get().is_none()
+        {
             self.load_history(None, true);
             return;
         }
@@ -709,6 +913,9 @@ impl Ui {
                 .insert(previous, self.input.text().to_string());
         }
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.search_anchor.set(anchor);
+        self.scroll_to_search_result.set(anchor.is_some());
+        self.latest.set_visible(anchor.is_some());
         self.history_refresh.set(false);
         self.latest_history_pending.set(None);
         self.loaded.set(false);
@@ -747,7 +954,7 @@ impl Ui {
             }
             self.loaded.set(true);
             self.render_chats();
-            self.render_history(true);
+            self.render_history(anchor.is_none());
         } else {
             self.load_history(None, true);
         }
@@ -769,6 +976,7 @@ impl Ui {
             return;
         }
         let generation = self.generation.get();
+        let anchor = self.search_anchor.get();
         let requested_through = self.messages.borrow().last_key_value().map(|(&id, _)| id);
         self.older.set_sensitive(false);
         let has_unread = self
@@ -777,7 +985,16 @@ impl Ui {
             .iter()
             .any(|chat| chat.id == id && chat.unread > 0);
         self.job(
-            async move { client.history(id, before, mark_read).await },
+            async move {
+                if before.is_none()
+                    && let Some(anchor) = anchor
+                {
+                    let (messages, older) = client.history_around(id, anchor).await?;
+                    Ok((messages, older, false))
+                } else {
+                    client.history(id, before, mark_read).await
+                }
+            },
             move |ui, result| {
                 if generation != ui.generation.get() {
                     return;
@@ -807,7 +1024,9 @@ impl Ui {
                             }
                         }
                         drop(current);
-                        ui.render_history(before.is_none() && (!was_loaded || at_bottom));
+                        ui.render_history(
+                            anchor.is_none() && before.is_none() && (!was_loaded || at_bottom),
+                        );
                         if marked && has_unread {
                             ui.refresh_chats();
                         }
@@ -883,6 +1102,9 @@ impl Ui {
             }
             let bubble = gtk::Box::new(gtk::Orientation::Vertical, 4);
             bubble.add_css_class("message-bubble");
+            if self.search_anchor.get() == Some(message.id) {
+                bubble.add_css_class("search-result");
+            }
             if message.outgoing {
                 bubble.add_css_class("outgoing");
             }
@@ -1090,6 +1312,30 @@ impl Ui {
             footer.append(&time);
             bubble.append(&footer);
             self.history.append(&bubble);
+            if self.search_anchor.get() == Some(message.id)
+                && self.scroll_to_search_result.replace(false)
+            {
+                let weak = bubble.downgrade();
+                let generation = self.generation.get();
+                after_layout(
+                    &self.history,
+                    glib::clone!(
+                        #[weak(rename_to = ui)]
+                        self,
+                        move || {
+                            if ui.generation.get() == generation
+                                && let Some(bubble) = weak.upgrade()
+                                && let Some(bounds) = bubble.compute_bounds(&ui.history)
+                            {
+                                let adjustment = ui.scroll.vadjustment();
+                                adjustment.set_value(
+                                    f64::from(bounds.y()) - adjustment.page_size() / 3.0,
+                                );
+                            }
+                        }
+                    ),
+                );
+            }
         }
         if bottom {
             let adjustment = self.scroll.vadjustment();
@@ -1243,8 +1489,12 @@ impl Ui {
                             if ui.input.text() == original {
                                 ui.input.set_text("");
                             }
-                            ui.messages.borrow_mut().insert(message.id, message);
-                            ui.render_history(true);
+                            if ui.search_anchor.get().is_some() {
+                                ui.show_chat(chat, None);
+                            } else {
+                                ui.messages.borrow_mut().insert(message.id, message);
+                                ui.render_history(true);
+                            }
                         } else if ui.drafts.borrow().get(&chat) == Some(&original) {
                             ui.drafts.borrow_mut().remove(&chat);
                         }
@@ -1451,7 +1701,8 @@ impl Ui {
                     ui.update_send_button();
                     match result {
                         Ok(message) => {
-                            if ui.selection.get() == Some(chat) {
+                            if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none()
+                            {
                                 ui.messages.borrow_mut().insert(message.id, message);
                                 ui.render_history(true);
                             }

@@ -10,6 +10,11 @@ pub struct Chat {
     pub broadcast: bool,
 }
 
+pub struct SearchHit {
+    pub chat: Chat,
+    pub message: Message,
+}
+
 #[derive(Clone)]
 pub struct Message {
     pub id: i32,
