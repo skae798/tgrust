@@ -15,7 +15,7 @@ use grammers_client::{Client, InvocationError, SignInError};
 use grammers_session::{Session, storages::SqliteSession, types::PeerRef};
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
-use crate::model::{Chat, Message, Reaction, UpdateStatus, Upload, UploadKind};
+use crate::model::{Chat, Message, Reaction, SearchHit, UpdateStatus, Upload, UploadKind};
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
 pub const PAGE_SIZE: usize = 40;
@@ -312,6 +312,45 @@ impl Telegram {
             .context("Чат не найден")
     }
 
+    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
+        let mut messages = self.client.search_all_messages().query(query).limit(50);
+        let mut hits = Vec::new();
+        let mut peers = HashMap::new();
+        while let Some(message) = messages.next().await? {
+            let Some(id) = message.peer_id().bot_api_dialog_id() else {
+                continue;
+            };
+            let Some(peer) = message.peer() else { continue };
+            let Some(peer_ref) = message
+                .peer_ref()
+                .await
+                .map_err(anyhow::Error::from_boxed)?
+            else {
+                continue;
+            };
+            peers.insert(id, peer_ref);
+            hits.push(SearchHit {
+                chat: Chat {
+                    id,
+                    title: match peer {
+                        Peer::User(user) if user.is_self() => "Избранное",
+                        _ => peer
+                            .name()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("Без названия"),
+                    }
+                    .to_owned(),
+                    preview: String::new(),
+                    unread: 0,
+                    broadcast: matches!(peer, Peer::Channel(_)),
+                },
+                message: message_view(&message),
+            });
+        }
+        self.peers.write().await.extend(peers);
+        Ok(hits)
+    }
+
     pub async fn history(
         &self,
         id: i64,
@@ -342,6 +381,28 @@ impl Telegram {
         };
         result.reverse();
         Ok((result, has_older, marked))
+    }
+
+    pub async fn history_around(&self, chat: i64, anchor: i32) -> Result<(Vec<Message>, bool)> {
+        let peer = self.peer(chat).await?;
+        let original = self
+            .message_by_id(peer, anchor)
+            .await?
+            .context("Сообщение больше недоступно")?;
+        let (mut messages, older, _) = self.history(chat, Some(anchor), false).await?;
+        messages.push(message_view(&original));
+        let mut newer = self
+            .client
+            .iter_messages(peer)
+            .offset_id(anchor)
+            .reverse(true)
+            .limit(PAGE_SIZE / 2);
+        while let Some(message) = newer.next().await? {
+            if message.id() > anchor {
+                messages.push(message_view(&message));
+            }
+        }
+        Ok((messages, older))
     }
 
     pub async fn send(
