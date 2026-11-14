@@ -12,7 +12,7 @@ pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
-    chat == 1 && message == 3
+    chat == 1 && message == 83
 }
 
 pub fn chats() -> Vec<Chat> {
@@ -26,7 +26,11 @@ pub fn chats() -> Vec<Chat> {
         id,
         title: title.to_owned(),
         preview: preview.to_owned(),
-        preview_sender: (id == 1).then(|| "@anna_demo".to_owned()),
+        preview_sender: match id {
+            1 => Some("Анна".to_owned()),
+            3 => Some(title.to_owned()),
+            _ => None,
+        },
         group: id == 1,
         unread,
         broadcast,
@@ -86,11 +90,11 @@ pub fn history(chat: i64) -> Vec<Message> {
         ],
         _ => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
     };
-    samples
+    let mut messages: Vec<_> = samples
         .into_iter()
         .enumerate()
         .map(|(index, (sender, text, outgoing, attachment))| Message {
-            id: index as i32 + 1,
+            id: index as i32 + if chat == 1 { 81 } else { 1 },
             sender: sender.to_owned(),
             sender_avatar: if outgoing {
                 Some(OWN_AVATAR)
@@ -107,7 +111,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             attachment: attachment.map(str::to_owned),
             photo_preview: chat == 1 && index == 3,
             thumbnail: (chat == 1 && index == 3).then_some(AttachmentThumbnail::Photo(1)),
-            reply_to: (chat == 1 && index == 1).then_some(1),
+            reply_to: (chat == 1 && index == 1).then_some(81),
             reply_preview: None,
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
@@ -117,8 +121,21 @@ pub fn history(chat: i64) -> Vec<Message> {
             pinned: false,
             reactions: Vec::new(),
             edited: false,
+            ephemeral: false,
         })
-        .collect()
+        .collect();
+    if chat == 1 {
+        let sample = messages[0].clone();
+        let day = 24 * 60 * 60;
+        let older = (1..=80).map(|id| Message {
+            id,
+            timestamp: today - 2 * day + i64::from(id) * 60,
+            text: format!("Заметка о проекте № {id}"),
+            ..sample.clone()
+        });
+        messages.splice(..0, older);
+    }
+    messages
 }
 
 pub fn preview_pixels() -> Vec<u8> {

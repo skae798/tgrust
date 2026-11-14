@@ -1,5 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+pub const HISTORY_PAGE_SIZE: usize = 40;
+const CACHED_CHATS: usize = 150;
+const CACHED_MESSAGES: usize = 400;
+const CACHE_RETENTION: Duration = Duration::from_hours(6);
+const CACHE_FRESHNESS: Duration = Duration::from_mins(15);
 
 #[derive(Clone)]
 pub struct Chat {
@@ -103,6 +110,7 @@ pub struct Message {
     pub pinned: bool,
     pub reactions: Vec<Reaction>,
     pub edited: bool,
+    pub ephemeral: bool,
 }
 
 #[derive(Clone)]
@@ -152,6 +160,87 @@ pub struct UpdateStatus {
     pub revision: u64,
     pub folders_revision: u64,
     pub reconnecting: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryRevision {
+    pub all: u64,
+    pub chat: u64,
+    pub rewritten: u64,
+}
+
+impl HistoryRevision {
+    pub fn is_fresh(self, refreshed: Instant, current: Self, now: Instant) -> bool {
+        self == current && now.duration_since(refreshed) < CACHE_FRESHNESS
+    }
+
+    pub fn can_keep_older(self, previous: Self) -> bool {
+        self.all == previous.all && self.rewritten == previous.rewritten
+    }
+}
+
+#[derive(Default)]
+pub struct HistoryCache {
+    chats: HashMap<i64, CachedHistory>,
+}
+
+pub struct CachedHistory {
+    pub messages: BTreeMap<i32, Message>,
+    pub has_older: bool,
+    pub revision: HistoryRevision,
+    pub refreshed: Instant,
+    used: Instant,
+}
+
+impl HistoryCache {
+    pub fn remove(&mut self, chat: i64) {
+        self.chats.remove(&chat);
+    }
+
+    pub fn restore(&mut self, chat: i64, now: Instant) -> Option<CachedHistory> {
+        self.expire(now);
+        self.chats.remove(&chat)
+    }
+
+    pub fn store(
+        &mut self,
+        chat: i64,
+        mut messages: BTreeMap<i32, Message>,
+        has_older: bool,
+        revision: HistoryRevision,
+        refreshed: Instant,
+        now: Instant,
+    ) {
+        self.expire(now);
+        // Keep a contiguous range. A page with a timer stays in the open chat only.
+        let uncached = messages.len().saturating_sub(CACHED_MESSAGES);
+        for _ in 0..uncached {
+            messages.pop_first();
+        }
+        if messages.values().any(|message| message.ephemeral) {
+            return;
+        }
+        if self.chats.len() == CACHED_CHATS
+            && let Some((&oldest, _)) = self.chats.iter().min_by_key(|(_, history)| history.used)
+        {
+            self.chats.remove(&oldest);
+        }
+        self.chats.insert(
+            chat,
+            CachedHistory {
+                messages,
+                has_older: has_older || uncached > 0,
+                revision,
+                refreshed,
+                used: now,
+            },
+        );
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.chats
+            .retain(|_, history| now.duration_since(history.used) < CACHE_RETENTION);
+    }
 }
 
 pub struct IncomingMessage {
@@ -256,12 +345,51 @@ mod tests {
                 pinned: false,
                 reactions: Vec::new(),
                 edited: false,
+                ephemeral: false,
             })
             .collect()
     }
 
     fn history(ids: &[i32]) -> BTreeMap<i32, Message> {
         messages(ids).into_iter().map(|msg| (msg.id, msg)).collect()
+    }
+
+    #[test]
+    fn cached_history_preserves_the_latest_contiguous_range_and_expires() {
+        let now = Instant::now();
+        let revision = HistoryRevision::default();
+        let mut cache = HistoryCache::default();
+        let ids: Vec<_> = (1..=450).collect();
+        cache.store(1, history(&ids), false, revision, now, now);
+        let cached = cache.restore(1, now + Duration::from_hours(5)).unwrap();
+        assert_eq!(cached.messages.len(), CACHED_MESSAGES);
+        assert_eq!(cached.messages.first_key_value().unwrap().0, &51);
+        assert!(cached.has_older);
+        assert!(!cached.revision.is_fresh(
+            cached.refreshed,
+            revision,
+            now + Duration::from_hours(1)
+        ));
+        cache.store(1, cached.messages, true, revision, now, now);
+        assert!(cache.restore(1, now + CACHE_RETENTION).is_none());
+    }
+
+    #[test]
+    fn cache_evicts_oldest_chat_and_excludes_timed_messages() {
+        let now = Instant::now();
+        let revision = HistoryRevision::default();
+        let mut cache = HistoryCache::default();
+        for chat in 0..=CACHED_CHATS {
+            let used = now + Duration::from_secs(chat as u64);
+            cache.store(chat as i64, history(&[1]), false, revision, now, used);
+        }
+        let now = now + Duration::from_mins(5);
+        assert!(cache.restore(0, now).is_none());
+        assert!(cache.restore(1, now).is_some());
+        let mut timed = history(&[1, 2, 3]);
+        timed.get_mut(&2).unwrap().ephemeral = true;
+        cache.store(1, timed, false, revision, now, now);
+        assert!(cache.restore(1, now).is_none());
     }
 
     #[test]

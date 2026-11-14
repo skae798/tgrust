@@ -13,8 +13,9 @@ use tokio::sync::watch;
 
 use crate::demo;
 use crate::model::{
-    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, IncomingMessage, Message, Reaction, Reply,
-    SearchHit, UpdateStatus, Upload, UploadKind, merge_latest_history,
+    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, HISTORY_PAGE_SIZE, HistoryCache,
+    HistoryRevision, IncomingMessage, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload,
+    UploadKind, merge_latest_history,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -52,6 +53,7 @@ struct Ui {
     menu_message: Cell<Option<i32>>,
     scroll: gtk::ScrolledWindow,
     older: gtk::Button,
+    adjusting_history: Cell<bool>,
     latest: gtk::Button,
     input: gtk::TextView,
     input_placeholder: gtk::Label,
@@ -84,6 +86,9 @@ struct Ui {
     sending: Cell<bool>,
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
+    history_cache: RefCell<HistoryCache>,
+    history_revision: Cell<HistoryRevision>,
+    history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<i64, String>>,
@@ -92,6 +97,7 @@ struct Ui {
     reacting: RefCell<HashSet<(i64, i32)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
+    photo_viewer: glib::WeakRef<adw::Window>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -337,6 +343,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         menu_message: Cell::new(None),
         scroll,
         older,
+        adjusting_history: Cell::new(false),
         latest,
         input,
         input_placeholder,
@@ -369,14 +376,18 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         sending: Cell::new(false),
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
+        history_cache: RefCell::new(HistoryCache::default()),
+        history_revision: Cell::new(HistoryRevision::default()),
+        history_refreshed: Cell::new(None),
         demo_messages: RefCell::new(HashMap::new()),
-        demo_next_message: Cell::new(100),
+        demo_next_message: Cell::new(200),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
         reacting: RefCell::new(HashSet::new()),
         images: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
+        photo_viewer: glib::WeakRef::new(),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -472,6 +483,20 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
             let before = ui.messages.borrow().first_key_value().map(|(&id, _)| id);
             if before.is_some() {
                 ui.load_history(before, false);
+            }
+        }
+    ));
+    ui.scroll.vadjustment().connect_value_changed(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.load_older_near_top()
+    ));
+    ui.scroll.connect_edge_overshot(glib::clone!(
+        #[weak]
+        ui,
+        move |_, edge| {
+            if edge == gtk::PositionType::Top {
+                ui.load_older_near_top();
             }
         }
     ));
@@ -598,6 +623,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
                 for id in ui.notified_messages.borrow().keys() {
                     app.withdraw_notification(&notification_id(*id));
                 }
+            }
+            if let Some(viewer) = ui.photo_viewer.upgrade() {
+                viewer.close();
             }
             ui.window.set(None);
             glib::Propagation::Proceed
@@ -798,11 +826,12 @@ impl Ui {
             }
         });
         let (allowed, mut desktop_messages) = tokio::sync::mpsc::channel(32);
+        let notification_client = client.clone();
         self.runtime.spawn(async move {
             while let Some(message) = messages.recv().await {
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
-                    client.notification_enabled(message.chat, message.kind),
+                    notification_client.notification_enabled(message.chat, message.kind),
                 )
                 .await;
                 if matches!(result, Ok(Ok(true))) && allowed.send(message).await.is_err() {
@@ -846,7 +875,12 @@ impl Ui {
                 }
                 if status.revision != previous.revision {
                     ui.refresh_chats();
-                    if !ui.split.is_collapsed() || ui.split.shows_content() {
+                    if (!ui.split.is_collapsed() || ui.split.shows_content())
+                        && ui.selection.get().is_some_and(|chat| {
+                            !ui.loaded.get()
+                                || ui.history_revision.get() != client.history_revision(chat)
+                        })
+                    {
                         ui.load_history(None, true);
                     }
                 }
@@ -1335,19 +1369,48 @@ impl Ui {
             }
         }
         self.split.set_show_content(true);
+        let client = self.client.borrow().clone();
+        let revision = client
+            .as_ref()
+            .map_or_else(HistoryRevision::default, |client| {
+                client.history_revision(id)
+            });
+        let now = Instant::now();
         if self.selection.get() == Some(id)
             && self.loaded.get()
             && anchor.is_none()
             && self.search_anchor.get().is_none()
         {
             self.focus_composer();
-            self.load_history(None, true);
+            if self.is_demo.get()
+                || self.history_refreshed.get().is_some_and(|refreshed| {
+                    self.history_revision
+                        .get()
+                        .is_fresh(refreshed, revision, now)
+                })
+            {
+                self.mark_cached_read(&chat);
+            } else {
+                self.load_history(None, true);
+            }
             return;
         }
         if let Some(previous) = self.selection.replace(Some(id)) {
             self.drafts
                 .borrow_mut()
                 .insert(previous, self.composer_text().to_string());
+            if self.search_anchor.get().is_none()
+                && let Some(refreshed) = self.history_refreshed.get()
+            {
+                self.history_cache.borrow_mut().store(
+                    previous,
+                    self.messages.take(),
+                    self.has_older.get(),
+                    self.history_revision.get(),
+                    refreshed,
+                    now,
+                );
+            }
         }
         self.update_archive_button();
         self.message_menu.popdown();
@@ -1360,6 +1423,7 @@ impl Ui {
         self.loaded.set(false);
         self.has_older.set(false);
         self.messages.borrow_mut().clear();
+        self.history_refreshed.set(None);
         self.title.set_title(&chat.title);
         self.title
             .set_subtitle(if chat.broadcast { "Канал" } else { "" });
@@ -1374,16 +1438,29 @@ impl Ui {
             "Сообщение"
         });
         self.update_send_button();
-        self.render_history(true);
-        if self.is_demo.get() {
-            let mut history = self.demo_messages.borrow_mut();
-            let messages = history.entry(id).or_insert_with(|| demo::history(id));
-            self.messages.borrow_mut().extend(
-                messages
-                    .iter()
-                    .cloned()
-                    .map(|message| (message.id, message)),
-            );
+        let cached = if anchor.is_none() {
+            self.history_cache.borrow_mut().restore(id, now)
+        } else {
+            None
+        };
+        if let Some(cached) = cached {
+            let fresh = cached.revision.is_fresh(cached.refreshed, revision, now);
+            self.history_revision.set(cached.revision);
+            self.history_refreshed.set(Some(cached.refreshed));
+            self.has_older.set(cached.has_older);
+            self.messages.replace(cached.messages);
+            self.loaded.set(true);
+            self.render_history(true);
+            if fresh {
+                self.mark_cached_read(&chat);
+            } else {
+                self.load_history(None, true);
+            }
+        } else if self.is_demo.get() {
+            let (messages, has_older, _) = self.demo_history(id, None, anchor);
+            self.messages
+                .borrow_mut()
+                .extend(messages.into_iter().map(|message| (message.id, message)));
             if let Some(chat) = self
                 .chats
                 .borrow_mut()
@@ -1393,13 +1470,74 @@ impl Ui {
                 chat.unread = 0;
             }
             self.loaded.set(true);
+            self.has_older.set(has_older);
+            self.history_revision.set(revision);
+            self.history_refreshed.set(Some(now));
             self.render_chats();
             self.render_history(anchor.is_none());
         } else {
+            self.render_history(true);
             self.load_history(None, true);
         }
         if anchor.is_none() {
             self.focus_composer();
+        }
+    }
+
+    fn mark_cached_read(self: &Rc<Self>, chat: &Chat) {
+        if chat.unread == 0 {
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let Some((&max_id, _)) = self.messages.borrow().last_key_value() else {
+            return;
+        };
+        let id = chat.id;
+        self.job(
+            async move { client.mark_read_through(id, max_id).await },
+            |ui, result| {
+                if result.is_ok() {
+                    ui.refresh_chats();
+                }
+            },
+        );
+    }
+
+    fn demo_history(
+        &self,
+        chat: i64,
+        before: Option<i32>,
+        anchor: Option<i32>,
+    ) -> (Vec<Message>, bool, bool) {
+        let mut history = self.demo_messages.borrow_mut();
+        let messages = history.entry(chat).or_insert_with(|| demo::history(chat));
+        let end = if let Some(before) = before {
+            messages.partition_point(|message| message.id < before)
+        } else if let Some(anchor) = anchor {
+            (messages.partition_point(|message| message.id <= anchor) + HISTORY_PAGE_SIZE / 2)
+                .min(messages.len())
+        } else {
+            messages.len()
+        };
+        let start = end.saturating_sub(HISTORY_PAGE_SIZE);
+        (messages[start..end].to_vec(), start > 0, false)
+    }
+
+    fn load_older_near_top(self: &Rc<Self>) {
+        if self.adjusting_history.get()
+            || self.history_refresh.get()
+            || !self.has_older.get()
+            || !self.scroll.is_mapped()
+        {
+            return;
+        }
+        let adjustment = self.scroll.vadjustment();
+        if adjustment.value() - adjustment.lower() <= 180.0
+            && let Some(before) = self.messages.borrow().first_key_value().map(|(&id, _)| id)
+        {
+            self.load_history(Some(before), false);
         }
     }
 
@@ -1428,9 +1566,11 @@ impl Ui {
         let Some(id) = self.selection.get() else {
             return;
         };
-        let Some(client) = self.client.borrow().clone() else {
+        let client = self.client.borrow().clone();
+        let demo = self.is_demo.get();
+        if client.is_none() && !demo {
             return;
-        };
+        }
         if self.history_refresh.replace(true) {
             if before.is_none() {
                 self.latest_history_pending.set(Some(
@@ -1441,6 +1581,12 @@ impl Ui {
         }
         let generation = self.generation.get();
         let anchor = self.search_anchor.get();
+        let revision = client
+            .as_ref()
+            .map_or_else(HistoryRevision::default, |client| {
+                client.history_revision(id)
+            });
+        let demo_page = demo.then(|| self.demo_history(id, before, anchor));
         let requested_through = self.messages.borrow().last_key_value().map(|(&id, _)| id);
         self.older.set_sensitive(false);
         let has_unread = self
@@ -1450,6 +1596,10 @@ impl Ui {
             .any(|chat| chat.id == id && chat.unread > 0);
         self.job(
             async move {
+                if let Some(page) = demo_page {
+                    return Ok(page);
+                }
+                let client = client.expect("Telegram history requires a client");
                 if before.is_none()
                     && let Some(anchor) = anchor
                 {
@@ -1471,16 +1621,22 @@ impl Ui {
                         let adjustment = ui.scroll.vadjustment();
                         let at_bottom =
                             adjustment.upper() - adjustment.page_size() - adjustment.value() < 36.0;
+                        let previous_position =
+                            before.map(|_| (adjustment.upper(), adjustment.value()));
                         let mut current = ui.messages.borrow_mut();
                         if before.is_some() {
                             current
                                 .extend(messages.into_iter().map(|message| (message.id, message)));
                             ui.has_older.set(has_older);
                         } else {
+                            let previous = ui.history_revision.replace(revision);
+                            if anchor.is_none() {
+                                ui.history_refreshed.set(Some(Instant::now()));
+                            }
                             let older_loaded = merge_latest_history(
                                 &mut current,
                                 messages,
-                                has_older,
+                                has_older && revision.can_keep_older(previous),
                                 requested_through,
                             );
                             if !older_loaded {
@@ -1488,30 +1644,12 @@ impl Ui {
                             }
                         }
                         drop(current);
-                        ui.render_history(
+                        ui.render_history_position(
                             anchor.is_none() && before.is_none() && (!was_loaded || at_bottom),
+                            previous_position,
                         );
                         if marked && has_unread {
                             ui.refresh_chats();
-                        }
-                        if before.is_some() {
-                            let old_height = adjustment.upper();
-                            let old_position = adjustment.value();
-                            after_layout(
-                                &ui.history,
-                                glib::clone!(
-                                    #[weak]
-                                    ui,
-                                    move || {
-                                        if ui.generation.get() == generation {
-                                            adjustment.set_value(
-                                                old_position
-                                                    + (adjustment.upper() - old_height).max(0.0),
-                                            );
-                                        }
-                                    }
-                                ),
-                            );
                         }
                     }
                     Err(error) => {
@@ -1537,6 +1675,15 @@ impl Ui {
     }
 
     fn render_history(self: &Rc<Self>, bottom: bool) {
+        self.render_history_position(bottom, None);
+    }
+
+    fn render_history_position(
+        self: &Rc<Self>,
+        bottom: bool,
+        previous_position: Option<(f64, f64)>,
+    ) {
+        self.adjusting_history.set(true);
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
         }
@@ -1694,22 +1841,28 @@ impl Ui {
                 );
             }
         }
-        if bottom {
-            let adjustment = self.scroll.vadjustment();
-            let generation = self.generation.get();
-            after_layout(
-                &self.history,
-                glib::clone!(
-                    #[weak(rename_to = ui)]
-                    self,
-                    move || {
-                        if ui.generation.get() == generation {
+        let adjustment = self.scroll.vadjustment();
+        let generation = self.generation.get();
+        after_layout(
+            &self.history,
+            glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move || {
+                    if ui.generation.get() == generation {
+                        if bottom {
                             adjustment.set_value(adjustment.upper());
+                        } else if let Some((old_height, old_position)) = previous_position {
+                            adjustment.set_value(old_position + adjustment.upper() - old_height);
+                        }
+                        ui.adjusting_history.set(false);
+                        if adjustment.upper() - adjustment.page_size() <= adjustment.lower() {
+                            ui.load_older_near_top();
                         }
                     }
-                ),
-            );
-        }
+                }
+            ),
+        );
     }
 
     fn message_bubble(&self, id: i32) -> Option<gtk::Widget> {
@@ -2234,6 +2387,7 @@ impl Ui {
                 pinned: false,
                 reactions: Vec::new(),
                 edited: false,
+                ephemeral: false,
             };
             self.input.buffer().set_text("");
             self.uploads.borrow_mut().remove(&chat);
@@ -2383,6 +2537,7 @@ impl Ui {
     }
 
     fn add_demo_message(self: &Rc<Self>, chat: i64, message: Message) {
+        self.history_cache.borrow_mut().remove(chat);
         self.demo_messages
             .borrow_mut()
             .entry(chat)
@@ -2779,35 +2934,85 @@ impl Ui {
     }
 
     fn open_photo_preview(self: &Rc<Self>, chat: i64, id: i32) {
+        if self.is_demo.get() {
+            self.present_photo(self.demo_image.get_or_init(demo_texture).upcast_ref());
+        } else if let Some(client) = self.client.borrow().clone() {
+            let progress = adw::Toast::new("Загрузка фотографии…");
+            self.toasts.add_toast(progress.clone());
+            self.job(
+                async move { client.photo_preview(chat, id).await },
+                move |ui, result| {
+                    progress.dismiss();
+                    let texture = result.and_then(|bytes| {
+                        gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
+                            .map_err(anyhow::Error::from)
+                    });
+                    match texture {
+                        Ok(texture) => ui.present_photo(&texture),
+                        Err(error) => ui.toast(&format!("Не удалось открыть фотографию. {error}")),
+                    }
+                },
+            );
+        }
+    }
+
+    fn present_photo(&self, texture: &gtk::gdk::Texture) {
         let Some(window) = self.window.upgrade() else {
             return;
         };
+        let display = gtk::prelude::WidgetExt::display(&window);
+        let monitor = window
+            .surface()
+            .and_then(|surface| display.monitor_at_surface(&surface))
+            .or_else(|| {
+                display
+                    .monitors()
+                    .item(0)
+                    .and_downcast::<gtk::gdk::Monitor>()
+            });
+        let (screen_width, screen_height) = monitor.map_or((640, 480), |monitor| {
+            let bounds = monitor.geometry();
+            (bounds.width(), bounds.height())
+        });
+
+        // GNOME centers a modal toplevel without a transient parent on the current monitor.
         let viewer = adw::Window::builder()
             .title("Фотография")
-            .default_width(720)
-            .default_height(540)
-            .transient_for(&window)
-            .destroy_with_parent(true)
+            .modal(true)
+            .resizable(false)
             .build();
+        viewer.set_display(&display);
+        if let Some(previous) = self.photo_viewer.upgrade() {
+            previous.close();
+        }
+        self.photo_viewer.set(Some(&viewer));
         let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let header = adw::HeaderBar::builder()
+            .show_title(false)
+            .decoration_layout(":close")
+            .build();
+        toolbar.add_top_bar(&header);
+        viewer.set_content(Some(&toolbar));
         let picture = gtk::Picture::builder()
             .content_fit(gtk::ContentFit::Contain)
             .can_shrink(true)
             .alternative_text("Предпросмотр фотографии")
+            .paintable(texture)
             .build();
         picture.update_property(&[gtk::accessible::Property::Label("Предпросмотр фотографии")]);
-        let status = label("Загрузка фотографии…", "dim-label");
-        status.set_wrap(true);
-        status.set_halign(gtk::Align::Center);
-        status.set_valign(gtk::Align::Center);
-        status.set_margin_start(12);
-        status.set_margin_end(12);
-        let content = gtk::Stack::new();
-        content.add_child(&status);
-        content.add_child(&picture);
+        let (header_width, _, _, _) = header.measure(gtk::Orientation::Horizontal, -1);
+        let (header_height, _, _, _) = header.measure(gtk::Orientation::Vertical, -1);
+        let (width, height) = photo_viewport(
+            (texture.width(), texture.height()),
+            (screen_width, screen_height),
+            (header_width, header_height),
+        );
+        let content = gtk::Overlay::new();
+        content.set_size_request(width, height);
+        content.add_overlay(&picture);
         toolbar.set_content(Some(&content));
-        viewer.set_content(Some(&toolbar));
+        viewer.set_default_size(width.max(header_width), height + header_height);
+
         let close = gtk::EventControllerKey::new();
         close.connect_key_pressed(glib::clone!(
             #[weak]
@@ -2825,37 +3030,6 @@ impl Ui {
         ));
         viewer.add_controller(close);
         viewer.present();
-        if self.is_demo.get() {
-            picture.set_paintable(Some(self.demo_image.get_or_init(demo_texture)));
-            content.set_visible_child(&picture);
-        } else if let Some(client) = self.client.borrow().clone() {
-            self.job(
-                async move { client.photo_preview(chat, id).await },
-                glib::clone!(
-                    #[weak]
-                    content,
-                    #[weak]
-                    picture,
-                    #[weak]
-                    status,
-                    move |_, result| {
-                        let texture = result.and_then(|bytes| {
-                            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
-                                .map_err(anyhow::Error::from)
-                        });
-                        match texture {
-                            Ok(texture) => {
-                                picture.set_paintable(Some(&texture));
-                                content.set_visible_child(&picture);
-                            }
-                            Err(error) => {
-                                status.set_text(&format!("Не удалось открыть фотографию. {error}"))
-                            }
-                        }
-                    }
-                ),
-            );
-        }
     }
 
     fn toast(&self, message: &str) {
@@ -2875,6 +3049,29 @@ fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {
         quote.append(line);
     }
     (quote, author, excerpt)
+}
+
+fn photo_viewport(
+    (width, height): (i32, i32),
+    (screen_width, screen_height): (i32, i32),
+    (header_width, header_height): (i32, i32),
+) -> (i32, i32) {
+    let (width, height) = (f64::from(width), f64::from(height));
+    let (screen_width, screen_height) = (f64::from(screen_width), f64::from(screen_height));
+    let (header_width, header_height) = (f64::from(header_width.max(1)), f64::from(header_height));
+    let area = screen_width * screen_height / 4.0;
+    // Solve (width * scale) * (height * scale + header_height) <= area.
+    let scale = (2.0 * area
+        / ((width * header_height).hypot((4.0 * width * height * area).sqrt())
+            + width * header_height))
+        .min((area / header_width - header_height) / height)
+        .min(screen_width / width)
+        .min((screen_height - header_height) / height)
+        .clamp(0.0, 1.0);
+    (
+        (width * scale).floor().max(1.0) as i32,
+        (height * scale).floor().max(1.0) as i32,
+    )
 }
 
 fn scaled_thumbnail(texture: &gtk::gdk::Texture) -> Option<gtk::gdk::Texture> {
@@ -2952,4 +3149,23 @@ fn after_layout(widget: &impl IsA<gtk::Widget>, action: impl FnOnce() + 'static)
             glib::ControlFlow::Continue
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::photo_viewport;
+
+    #[test]
+    fn photo_window_includes_its_header_in_the_quarter_screen_limit() {
+        for screen @ (screen_width, screen_height) in [(1280, 800), (800, 1280), (640, 480)] {
+            for (width, height) in [(480, 300), (1600, 1200), (900, 1600), (15, 1600), (1600, 9)] {
+                let (fitted_width, fitted_height) =
+                    photo_viewport((width, height), screen, (44, 47));
+                let area = fitted_width.max(44) * (fitted_height + 47);
+                assert!(4 * area <= screen_width * screen_height);
+                assert!(fitted_width <= width && fitted_height <= height);
+                assert!((fitted_width * height - fitted_height * width).abs() <= width.max(height));
+            }
+        }
+    }
 }
