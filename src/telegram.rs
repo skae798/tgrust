@@ -381,26 +381,22 @@ impl Telegram {
                     .filter(|name| !name.is_empty())
                     .unwrap_or("Без названия"),
             };
+            let group = matches!(peer, Peer::Group(_) | Peer::Community(_));
+            let last = dialog.last_message.as_ref();
             chats.push(Chat {
                 id,
                 title: title.to_owned(),
-                preview: dialog
-                    .last_message
-                    .as_ref()
-                    .map(preview)
-                    .unwrap_or_default(),
-                preview_sender: matches!(
-                    peer,
-                    Peer::Group(_) | Peer::Community(_) | Peer::Channel(_)
-                )
-                .then(|| {
-                    dialog
-                        .last_message
-                        .as_ref()
-                        .and_then(|message| preview_sender(message, profile))
-                })
-                .flatten(),
-                group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
+                preview: last.map(preview).unwrap_or_default(),
+                preview_sender: if group {
+                    last.and_then(|message| preview_sender(message, profile))
+                } else {
+                    None
+                },
+                preview_image: last.and_then(|message| {
+                    let (media, _) = attachment(message)?;
+                    thumbnail(&media).map(|media| ChatImage::attachment(id, message.id(), media))
+                }),
+                group,
                 unread: raw.unread_count.max(i32::from(raw.unread_mark)),
                 broadcast: matches!(peer, Peer::Channel(_)),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
@@ -539,6 +535,7 @@ impl Telegram {
                     .to_owned(),
                     preview: String::new(),
                     preview_sender: None,
+                    preview_image: None,
                     group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
                     unread: 0,
                     broadcast: matches!(peer, Peer::Channel(_)),
@@ -1254,19 +1251,7 @@ fn message_view(
     let outgoing = message.outgoing();
     let attachment = attachment(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
-    let thumbnail = match attachment.as_ref() {
-        Some((Media::Photo(photo), _))
-            if !photo.is_spoiler() && pick_thumbnail(photo.thumbs()).is_some() =>
-        {
-            Some(AttachmentThumbnail::Photo(photo.id()))
-        }
-        Some((Media::Document(document), _))
-            if !document.is_spoiler() && pick_thumbnail(document.thumbs()).is_some() =>
-        {
-            Some(AttachmentThumbnail::Document(document.id()))
-        }
-        _ => None,
-    };
+    let thumbnail = attachment.as_ref().and_then(|(media, _)| thumbnail(media));
     let (reply_to, reply_preview) = match &message.raw {
         enums::Message::Message(raw) => match &raw.reply_to {
             Some(enums::MessageReplyHeader::Header(header)) if !header.reply_to_ephemeral => {
@@ -1420,6 +1405,20 @@ fn can_edit_text(message: &TelegramMessage) -> bool {
             raw.media,
             None | Some(enums::MessageMedia::Empty | enums::MessageMedia::WebPage(_))
         )
+}
+
+fn thumbnail(media: &Media) -> Option<AttachmentThumbnail> {
+    match media {
+        Media::Photo(photo) if !photo.is_spoiler() && pick_thumbnail(photo.thumbs()).is_some() => {
+            Some(AttachmentThumbnail::Photo(photo.id()))
+        }
+        Media::Document(document)
+            if !document.is_spoiler() && pick_thumbnail(document.thumbs()).is_some() =>
+        {
+            Some(AttachmentThumbnail::Document(document.id()))
+        }
+        _ => None,
+    }
 }
 
 fn preview(message: &TelegramMessage) -> String {
