@@ -20,8 +20,8 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Message, Reaction,
-    ReplyPreview, SearchHit, UpdateStatus, Upload, UploadKind,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, IncomingMessage, Message,
+    Reaction, ReplyPreview, SearchHit, UpdateStatus, Upload, UploadKind,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -190,7 +190,11 @@ impl Telegram {
         self.changes.subscribe()
     }
 
-    pub async fn listen(self: Arc<Self>, mut stop: watch::Receiver<bool>) -> Result<()> {
+    pub async fn listen(
+        self: Arc<Self>,
+        mut stop: watch::Receiver<bool>,
+        incoming: mpsc::Sender<IncomingMessage>,
+    ) -> Result<()> {
         let Some(receiver) = self.updates.lock().await.take() else {
             return Ok(());
         };
@@ -200,6 +204,7 @@ impl Telegram {
             .await
             .map_err(anyhow::Error::from_boxed)?;
         let mut retry_delay = Duration::from_secs(1);
+        let started = SystemTime::now();
         let result = 'listen: loop {
             let result = tokio::select! {
                 _ = stop.changed() => break Ok(()),
@@ -208,6 +213,11 @@ impl Telegram {
             match result {
                 Ok(update) => {
                     retry_delay = Duration::from_secs(1);
+                    if let Update::NewMessage(message) = &update
+                        && let Some(notification) = notification_for(message, started)
+                    {
+                        let _ = incoming.try_send(notification);
+                    }
                     if matches!(
                         update,
                         Update::NewMessage(_)
@@ -300,10 +310,7 @@ impl Telegram {
 
     pub async fn chats(&self) -> Result<Vec<Chat>> {
         let profile = self.profile().await;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = SystemTime::now();
         let mut chats = Vec::new();
         let mut peers = HashMap::new();
         let mut dialogs = self.client.iter_dialogs().limit(150);
@@ -348,7 +355,7 @@ impl Telegram {
                 muted: match &raw.notify_settings {
                     enums::PeerNotifySettings::Settings(settings) => settings
                         .mute_until
-                        .is_some_and(|until| i64::from(until) > now as i64),
+                        .is_some_and(|until| is_muted(until, now)),
                 },
             });
             peers.insert(id, dialog.peer_ref());
@@ -364,6 +371,37 @@ impl Telegram {
             .get(&id)
             .copied()
             .context("Чат не найден")
+    }
+
+    pub async fn notification_enabled(&self, chat: i64, kind: ChatKind) -> Result<bool> {
+        use grammers_client::tl::functions::account::GetNotifySettings;
+
+        let id = PeerId::from_bot_api_dialog_id(chat).context("Чат не найден")?;
+        let peer = self.session.peer_ref(id).await?.context("Чат не найден")?;
+        let enums::PeerNotifySettings::Settings(settings) = self
+            .client
+            .invoke(&GetNotifySettings {
+                peer: types::InputNotifyPeer { peer: peer.into() }.into(),
+            })
+            .await?;
+        let mute_until = match settings.mute_until {
+            Some(until) => until,
+            None => {
+                let category = match kind {
+                    ChatKind::Group => enums::InputNotifyPeer::InputNotifyChats,
+                    ChatKind::Broadcast => enums::InputNotifyPeer::InputNotifyBroadcasts,
+                    ChatKind::Contact | ChatKind::User | ChatKind::Bot => {
+                        enums::InputNotifyPeer::InputNotifyUsers
+                    }
+                };
+                let enums::PeerNotifySettings::Settings(defaults) = self
+                    .client
+                    .invoke(&GetNotifySettings { peer: category })
+                    .await?;
+                defaults.mute_until.unwrap_or_default()
+            }
+        };
+        Ok(!is_muted(mute_until, SystemTime::now()))
     }
 
     pub async fn folders(&self) -> Result<Vec<ChatFolder>> {
@@ -1277,6 +1315,41 @@ fn preview(message: &TelegramMessage) -> String {
     }
 }
 
+fn is_muted(until: i32, now: SystemTime) -> bool {
+    u64::try_from(until)
+        .is_ok_and(|until| until > now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+}
+
+fn notification_for(message: &TelegramMessage, started: SystemTime) -> Option<IncomingMessage> {
+    let enums::Message::Message(raw) = &message.raw else {
+        return None;
+    };
+    let timestamp = UNIX_EPOCH + Duration::from_secs(u64::try_from(raw.date).ok()?);
+    if raw.out
+        || raw.silent
+        || raw.ttl_period.is_some()
+        || matches!(&raw.media, Some(enums::MessageMedia::Photo(photo)) if photo.ttl_seconds.is_some())
+        || matches!(&raw.media, Some(enums::MessageMedia::Document(document)) if document.ttl_seconds.is_some())
+        || timestamp.duration_since(UNIX_EPOCH).ok()?.as_secs()
+            < started.duration_since(UNIX_EPOCH).ok()?.as_secs()
+        || SystemTime::now()
+            .duration_since(timestamp)
+            .is_ok_and(|age| age > Duration::from_secs(60))
+    {
+        return None;
+    }
+    let peer = message.peer()?;
+    if matches!(peer, Peer::User(user) if user.is_self()) {
+        return None;
+    }
+    Some(IncomingMessage {
+        chat: message.peer_id().bot_api_dialog_id()?,
+        message: message.id(),
+        title: peer.name().unwrap_or("Telegram").to_owned(),
+        kind: chat_kind(peer),
+    })
+}
+
 fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
     let enums::Message::Message(raw) = &message.raw else {
         return None;
@@ -1304,6 +1377,15 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn notification_mute_expires_at_the_configured_second() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        assert!(is_muted(1_001, now));
+        assert!(!is_muted(1_000, now));
+        assert!(!is_muted(0, now));
+        assert!(!is_muted(-1, now));
+    }
 
     #[test]
     fn attachment_thumbnail_uses_a_supported_size_under_the_limit() {

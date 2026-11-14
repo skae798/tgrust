@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use adw::prelude::*;
 use anyhow::{Context, Result, ensure};
+use gtk::glib;
 
 const APP_ID: &str = "io.github.skae798.tgrust";
 
@@ -50,6 +51,18 @@ fn main() -> ExitCode {
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
+    let open_chat = gtk::gio::SimpleAction::new("open-chat", Some(glib::VariantTy::INT64));
+    open_chat.connect_activate({
+        let app = app.downgrade();
+        move |_, target| {
+            let Some(app) = app.upgrade() else { return };
+            app.activate();
+            if let Some(window) = app.active_window() {
+                let _ = gtk::prelude::WidgetExt::activate_action(&window, "win.open-chat", target);
+            }
+        }
+    });
+    app.add_action(&open_chat);
     app.connect_activate({
         let handle = runtime.handle().clone();
         move |app| {

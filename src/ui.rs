@@ -13,8 +13,8 @@ use tokio::sync::watch;
 
 use crate::demo;
 use crate::model::{
-    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Message, Reaction, Reply, SearchHit,
-    UpdateStatus, Upload, UploadKind, merge_latest_history,
+    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, IncomingMessage, Message, Reaction, Reply,
+    SearchHit, UpdateStatus, Upload, UploadKind, merge_latest_history,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -71,6 +71,8 @@ struct Ui {
     updating_folders: Cell<bool>,
     search_chat: RefCell<Option<Chat>>,
     selection: Cell<Option<i64>>,
+    notification_chat: Cell<Option<i64>>,
+    notified_messages: RefCell<HashMap<i64, i32>>,
     generation: Cell<u64>,
     chat_refresh: Cell<bool>,
     chat_refresh_pending: Cell<bool>,
@@ -354,6 +356,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         updating_folders: Cell::new(false),
         search_chat: RefCell::new(None),
         selection: Cell::new(None),
+        notification_chat: Cell::new(None),
+        notified_messages: RefCell::new(HashMap::new()),
         generation: Cell::new(0),
         chat_refresh: Cell::new(false),
         chat_refresh_pending: Cell::new(false),
@@ -563,10 +567,38 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         }
     ));
     ui.message_menu.add_controller(menu_keys);
+    window.connect_is_active_notify(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(id) = ui.selection.get()
+                && ui.chat_in_foreground(id)
+            {
+                ui.withdraw_chat_notification(id);
+            }
+        }
+    ));
+
+    let open_chat = gtk::gio::SimpleAction::new("open-chat", Some(glib::VariantTy::INT64));
+    open_chat.connect_activate(glib::clone!(
+        #[weak]
+        ui,
+        move |_, target| {
+            if let Some(id) = target.and_then(glib::Variant::get::<i64>) {
+                ui.open_notified_chat(id);
+            }
+        }
+    ));
+    window.add_action(&open_chat);
 
     window.connect_close_request({
         let ui = Rc::clone(&ui);
         move |_| {
+            if let Some(app) = ui.window.upgrade().and_then(|window| window.application()) {
+                for id in ui.notified_messages.borrow().keys() {
+                    app.withdraw_notification(&notification_id(*id));
+                }
+            }
             ui.window.set(None);
             glib::Propagation::Proceed
         }
@@ -757,11 +789,34 @@ impl Ui {
         };
         let mut changes = client.changes();
         let stop = self.stop.clone();
-        self.job(client.listen(stop), |ui, result| {
+        let (incoming, mut messages) = tokio::sync::mpsc::channel(32);
+        self.job(client.clone().listen(stop, incoming), |ui, result| {
             if result.is_err() {
                 ui.toast(
                     "Обновления Telegram остановлены. Перезапустите клиент, чтобы проверить сессию.",
                 );
+            }
+        });
+        let (allowed, mut desktop_messages) = tokio::sync::mpsc::channel(32);
+        self.runtime.spawn(async move {
+            while let Some(message) = messages.recv().await {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.notification_enabled(message.chat, message.kind),
+                )
+                .await;
+                if matches!(result, Ok(Ok(true))) && allowed.send(message).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            while let Some(message) = desktop_messages.recv().await {
+                let Some(ui) = weak.upgrade() else { break };
+                if !ui.chat_in_foreground(message.chat) {
+                    ui.notify_message(&message);
+                }
             }
         });
 
@@ -803,6 +858,59 @@ impl Ui {
         });
     }
 
+    fn chat_in_foreground(&self, id: i64) -> bool {
+        self.window
+            .upgrade()
+            .is_some_and(|window| window.is_active())
+            && self.selection.get() == Some(id)
+            && (!self.split.is_collapsed() || self.split.shows_content())
+    }
+
+    fn notify_message(&self, message: &IncomingMessage) {
+        let Some(app) = self
+            .window
+            .upgrade()
+            .and_then(|window| window.application())
+        else {
+            return;
+        };
+        let notification = gtk::gio::Notification::new(&message.title);
+        notification.set_body(Some("Новое сообщение"));
+        notification
+            .set_default_action_and_target_value("app.open-chat", Some(&message.chat.to_variant()));
+        let mut notified = self.notified_messages.borrow_mut();
+        if notified
+            .get(&message.chat)
+            .is_some_and(|id| *id >= message.message)
+        {
+            return;
+        }
+        notified.insert(message.chat, message.message);
+        app.send_notification(Some(&notification_id(message.chat)), &notification);
+    }
+
+    fn withdraw_chat_notification(&self, chat: i64) {
+        if self.notified_messages.borrow().contains_key(&chat)
+            && let Some(app) = self
+                .window
+                .upgrade()
+                .and_then(|window| window.application())
+        {
+            app.withdraw_notification(&notification_id(chat));
+        }
+    }
+
+    fn open_notified_chat(self: &Rc<Self>, id: i64) {
+        if self.chats.borrow().iter().any(|chat| chat.id == id) {
+            self.show_chat(id, None);
+        } else {
+            self.notification_chat.set(Some(id));
+            if self.login_step.get() == LoginStep::Authorized {
+                self.refresh_chats();
+            }
+        }
+    }
+
     fn refresh_chats(self: &Rc<Self>) {
         let Some(client) = self.client.borrow().clone() else {
             return;
@@ -815,8 +923,20 @@ impl Ui {
             ui.chat_refresh.set(false);
             match result {
                 Ok(chats) => {
+                    for chat in chats.iter().filter(|chat| chat.unread == 0 || chat.muted) {
+                        ui.withdraw_chat_notification(chat.id);
+                    }
                     ui.chats.replace(chats);
                     ui.render_chats();
+                    if let Some(id) = ui.notification_chat.take() {
+                        if ui.chats.borrow().iter().any(|chat| chat.id == id) {
+                            ui.show_chat(id, None);
+                        } else if ui.chat_refresh_pending.get() {
+                            ui.notification_chat.set(Some(id));
+                        } else {
+                            ui.toast("Чат из уведомления недоступен");
+                        }
+                    }
                 }
                 Err(error) => ui.toast(&format!("Не удалось загрузить чаты. {error}")),
             }
@@ -1203,6 +1323,7 @@ impl Ui {
         else {
             return;
         };
+        self.withdraw_chat_notification(id);
         if self.chats.borrow().iter().any(|item| item.id == id) {
             let in_folder = !self.archive.is_active()
                 && self
@@ -2776,6 +2897,10 @@ fn scaled_thumbnail(texture: &gtk::gdk::Texture) -> Option<gtk::gdk::Texture> {
     );
     let thumbnail = pixbuf.scale_simple(width, height, gtk::gdk_pixbuf::InterpType::Bilinear)?;
     Some(gtk::gdk::Texture::for_pixbuf(&thumbnail))
+}
+
+fn notification_id(chat: i64) -> String {
+    format!("chat-{chat}")
 }
 
 fn demo_texture() -> gtk::gdk::MemoryTexture {
