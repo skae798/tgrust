@@ -1,5 +1,7 @@
 # tgrust
 
+Русский · [English](README.en.md)
+
 Неофициальный настольный клиент Telegram для GNOME. tgrust использует Telegram API через [grammers](https://codeberg.org/Lonami/grammers). Приложение написано на Rust с GTK 4 и Libadwaita и распространяется по GPL-3.0. Исходный код Telegram Desktop в проекте не используется.
 
 ## Возможности первой версии
