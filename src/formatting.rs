@@ -1,9 +1,9 @@
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 
-use crate::model::{FormattedText, TextSpan, TextStyle};
+use crate::model::{FormattedText, SPOILER_PLACEHOLDER, TextSpan, TextStyle, spoiler_ranges};
 
-const STYLES: [(TextStyle, &str, &str, gdk::Key); 5] = [
+const STYLES: [(TextStyle, &str, &str, gdk::Key); 6] = [
     (TextStyle::Bold, "bold", "Полужирный", gdk::Key::b),
     (TextStyle::Italic, "italic", "Курсив", gdk::Key::i),
     (
@@ -14,6 +14,7 @@ const STYLES: [(TextStyle, &str, &str, gdk::Key); 5] = [
     ),
     (TextStyle::Strike, "strike", "Зачёркнутый", gdk::Key::x),
     (TextStyle::Code, "code", "Моноширинный", gdk::Key::m),
+    (TextStyle::Spoiler, "spoiler", "Спойлер", gdk::Key::p),
 ];
 
 pub fn setup_editor(editor: &gtk::TextView) {
@@ -30,6 +31,7 @@ pub fn setup_editor(editor: &gtk::TextView) {
             TextStyle::Underline => builder.underline(pango::Underline::Single),
             TextStyle::Strike => builder.strikethrough(true),
             TextStyle::Code => builder.family("monospace"),
+            TextStyle::Spoiler => builder.underline(pango::Underline::Low),
         }
         .build();
         buffer.tag_table().add(&tag);
@@ -65,7 +67,7 @@ pub fn setup_editor(editor: &gtk::TextView) {
         actions.add_action(&action);
         let detailed_name = format!("format.{name}");
         menu.append(Some(label), Some(&detailed_name));
-        let modifiers = if style == TextStyle::Strike {
+        let modifiers = if matches!(style, TextStyle::Strike | TextStyle::Spoiler) {
             gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
         } else {
             gdk::ModifierType::CONTROL_MASK
@@ -141,10 +143,42 @@ pub fn message_attributes(spans: &[TextSpan]) -> pango::AttrList {
             TextStyle::Underline => pango::AttrInt::new_underline(pango::Underline::Single).into(),
             TextStyle::Strike => pango::AttrInt::new_strikethrough(true).into(),
             TextStyle::Code => pango::AttrString::new_family("monospace").into(),
+            TextStyle::Spoiler => continue,
         };
         attribute.set_start_index(span.range.start as u32);
         attribute.set_end_index(span.range.end as u32);
         attributes.insert(attribute);
     }
     attributes
+}
+
+pub fn concealed_message(label: &gtk::Label, message: &FormattedText) {
+    let mut markup = String::new();
+    let mut spans = Vec::new();
+    let mut original = 0;
+    let mut visible = 0;
+    for range in spoiler_ranges(&message.spans)
+        .into_iter()
+        .chain(std::iter::once(message.text.len()..message.text.len()))
+    {
+        let chunk = &message.text[original..range.start];
+        markup.push_str(&glib::markup_escape_text(chunk));
+        spans.extend(message.spans.iter().filter_map(|span| {
+            let start = span.range.start.max(original);
+            let end = span.range.end.min(range.start);
+            (start < end).then(|| TextSpan {
+                range: visible + start - original..visible + end - original,
+                style: span.style,
+            })
+        }));
+        if !range.is_empty() {
+            markup.push_str("<a href=\"tgrust-spoiler\" title=\"Показать спойлер\">");
+            markup.push_str(SPOILER_PLACEHOLDER);
+            markup.push_str("</a>");
+            visible += chunk.len() + SPOILER_PLACEHOLDER.len();
+        }
+        original = range.end;
+    }
+    label.set_markup(&markup);
+    label.set_attributes(Some(&message_attributes(&spans)));
 }
