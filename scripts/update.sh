@@ -38,7 +38,7 @@ if command -v gh >/dev/null; then
 fi
 
 if ! GIT_TERMINAL_PROMPT=0 git "${git_options[@]}" fetch --quiet --depth=1 "$repo_url" refs/heads/main; then
-    printf '%s\n' 'Не удалось загрузить приватный репозиторий. Проверьте доступ через gh auth login или настройки Git.' >&2
+    printf '%s\n' 'Не удалось загрузить репозиторий. Проверьте подключение к сети и доступ к GitHub.' >&2
     exit 1
 fi
 revision=$(git "${git_options[@]}" rev-parse 'FETCH_HEAD^{commit}')
