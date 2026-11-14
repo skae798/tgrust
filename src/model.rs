@@ -15,6 +15,7 @@ pub struct Chat {
     pub title: String,
     pub preview: String,
     pub preview_sender: Option<String>,
+    pub preview_image: Option<ChatImage>,
     pub group: bool,
     pub unread: i32,
     pub broadcast: bool,
@@ -83,6 +84,16 @@ pub enum ChatImage {
         message: i32,
         media: AttachmentThumbnail,
     },
+}
+
+impl ChatImage {
+    pub fn attachment(chat: i64, message: i32, media: AttachmentThumbnail) -> Self {
+        Self::Attachment {
+            chat,
+            message,
+            media,
+        }
+    }
 }
 
 pub struct SearchHit {
@@ -313,6 +324,7 @@ mod tests {
             title: "Тест".into(),
             preview: String::new(),
             preview_sender: None,
+            preview_image: None,
             group: true,
             unread: 0,
             broadcast: false,

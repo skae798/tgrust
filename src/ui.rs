@@ -1075,7 +1075,37 @@ impl Ui {
             preview.set_single_line_mode(true);
             preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
             description.append(&title);
-            description.append(&preview);
+            let preview_line = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+            if let Some(image) = chat.preview_image {
+                let thumbnail = gtk::Overlay::new();
+                thumbnail.set_size_request(18, 18);
+                thumbnail.set_valign(gtk::Align::Center);
+                thumbnail.set_overflow(gtk::Overflow::Hidden);
+                thumbnail.set_visible(false);
+                let picture = gtk::Picture::builder()
+                    .content_fit(gtk::ContentFit::Cover)
+                    .can_shrink(true)
+                    .alternative_text("Миниатюра вложения")
+                    .build();
+                picture.update_property(&[gtk::accessible::Property::Label("Миниатюра вложения")]);
+                thumbnail.add_overlay(&picture);
+                self.load_chat_image(
+                    image,
+                    glib::clone!(
+                        #[weak]
+                        thumbnail,
+                        #[weak]
+                        picture,
+                        move |texture: &gtk::gdk::Texture| {
+                            picture.set_paintable(Some(texture));
+                            thumbnail.set_visible(true);
+                        }
+                    ),
+                );
+                preview_line.append(&thumbnail);
+            }
+            preview_line.append(&preview);
+            description.append(&preview_line);
             line.append(&description);
             if chat.unread > 0 {
                 let unread = label(&chat.unread.to_string(), "unread-count");
@@ -1985,11 +2015,7 @@ impl Ui {
         if let Some(media) = message.thumbnail {
             let message_photo = message.photo_preview;
             self.load_chat_image(
-                ChatImage::Attachment {
-                    chat,
-                    message: id,
-                    media,
-                },
+                ChatImage::attachment(chat, id, media),
                 glib::clone!(
                     #[weak]
                     picture,
@@ -2689,6 +2715,9 @@ impl Ui {
                 .map(|message| message.text.clone())
                 .unwrap_or_else(|| "Вложение".into());
             chat.preview_sender = chat.group.then(|| last.sender.clone());
+            chat.preview_image = last
+                .thumbnail
+                .map(|media| ChatImage::attachment(chat.id, last.id, media));
         }
         self.demo_messages
             .borrow_mut()
@@ -2912,6 +2941,11 @@ impl Ui {
                 chat.preview_sender = last
                     .filter(|_| chat.group)
                     .map(|message| message.sender.clone());
+                chat.preview_image = last.and_then(|message| {
+                    message
+                        .thumbnail
+                        .map(|media| ChatImage::attachment(chat.id, message.id, media))
+                });
             }
             self.render_chats();
         }

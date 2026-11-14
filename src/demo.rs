@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatKind, Message};
+use crate::model::{AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Message};
 
 pub const OWN_NAME: &str = "Алексей";
 pub const OWN_AVATAR: Avatar = Avatar {
@@ -26,11 +26,12 @@ pub fn chats() -> Vec<Chat> {
         id,
         title: title.to_owned(),
         preview: preview.to_owned(),
-        preview_sender: match id {
-            1 => Some("Анна".to_owned()),
-            3 => Some(title.to_owned()),
-            _ => None,
-        },
+        preview_sender: (id == 1).then(|| "Анна".to_owned()),
+        preview_image: history(id).last().and_then(|message| {
+            message
+                .thumbnail
+                .map(|media| ChatImage::attachment(id, message.id, media))
+        }),
         group: id == 1,
         unread,
         broadcast,
@@ -109,8 +110,9 @@ pub fn history(chat: i64) -> Vec<Message> {
             text: text.to_owned(),
             outgoing,
             attachment: attachment.map(str::to_owned),
-            photo_preview: chat == 1 && index == 3,
-            thumbnail: (chat == 1 && index == 3).then_some(AttachmentThumbnail::Photo(1)),
+            photo_preview: (chat == 1 && index == 3) || chat == 3,
+            thumbnail: ((chat == 1 && index == 3) || chat == 3)
+                .then_some(AttachmentThumbnail::Photo(chat)),
             reply_to: (chat == 1 && index == 1).then_some(81),
             reply_preview: None,
             can_reply: true,
