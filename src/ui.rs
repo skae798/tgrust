@@ -14,8 +14,8 @@ use tokio::sync::watch;
 use crate::demo;
 use crate::model::{
     COMMON_REACTIONS, Chat, ChatFolder, ChatImage, HISTORY_PAGE_SIZE, HistoryCache,
-    HistoryRevision, IncomingMessage, Message, Reaction, Reply, SearchHit, UpdateStatus, Upload,
-    UploadKind, merge_latest_history,
+    HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply, SearchHit,
+    UpdateStatus, Upload, UploadKind, merge_latest_history,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -92,7 +92,7 @@ struct Ui {
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<i64, String>>,
-    uploads: RefCell<HashMap<i64, Upload>>,
+    uploads: RefCell<HashMap<i64, Vec<Upload>>>,
     replies: RefCell<HashMap<i64, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
@@ -255,8 +255,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .tooltip_text("Добавить вложение")
         .build();
     let attach_menu = gtk::gio::Menu::new();
-    attach_menu.append(Some("Файл"), Some("win.attach-file"));
-    attach_menu.append(Some("Фотография"), Some("win.attach-photo"));
+    attach_menu.append(Some("Файлы"), Some("win.attach-file"));
+    attach_menu.append(Some("Фотографии"), Some("win.attach-photo"));
     attach.set_menu_model(Some(&attach_menu));
     let upload_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     upload_bar.add_css_class("composer");
@@ -264,7 +264,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let upload_name = label("", "");
     upload_name.set_hexpand(true);
     upload_name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    let remove_upload = icon_button("edit-clear-symbolic", "Убрать вложение");
+    let remove_upload = icon_button("edit-clear-symbolic", "Убрать вложения");
     upload_bar.append(&upload_name);
     upload_bar.append(&remove_upload);
     let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1702,7 +1702,17 @@ impl Ui {
             self.history.append(&status);
         }
         let mut previous_day = None;
-        for message in messages.values() {
+        let mut remaining = messages.values().peekable();
+        while let Some(message) = remaining.next() {
+            let mut group = vec![message];
+            if let Some(album) = message.album {
+                while let Some(item) = remaining.next_if(|item| item.album == Some(album)) {
+                    group.push(item);
+                }
+            }
+            let selected = group
+                .iter()
+                .any(|item| self.search_anchor.get() == Some(item.id));
             let timestamp = glib::DateTime::from_unix_local(message.timestamp).ok();
             let day = timestamp.as_ref().and_then(|time| time.format("%x").ok());
             if day != previous_day {
@@ -1714,7 +1724,7 @@ impl Ui {
             let bubble = gtk::Box::new(gtk::Orientation::Vertical, 4);
             bubble.add_css_class("message-bubble");
             bubble.set_widget_name(&format!("message-{}", message.id));
-            if self.search_anchor.get() == Some(message.id) {
+            if selected {
                 bubble.add_css_class("search-result");
             }
             if message.outgoing {
@@ -1738,7 +1748,7 @@ impl Ui {
             if message.forwarded {
                 bubble.append(&label("Пересланное сообщение", "dim-label"));
             }
-            if message.pinned {
+            if group.iter().any(|item| item.pinned) {
                 bubble.append(&label("Закреплено", "dim-label"));
             }
             if let Some(id) = message.reply_to {
@@ -1771,15 +1781,36 @@ impl Ui {
                 excerpt.set_text(&preview.text);
                 bubble.append(&quote);
             }
+            let is_album = group.len() > 1;
+            let photo_album = is_album && group.iter().all(|item| item.photo_preview);
             if let Some(chat) = self.selection.get() {
-                self.render_attachment_image(&bubble, chat, message);
-            }
-            if !message.text.is_empty() {
-                let text = label(&message.text, "");
-                text.set_wrap(true);
-                text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-                text.set_max_width_chars(64);
-                bubble.append(&text);
+                if photo_album {
+                    let grid = gtk::FlowBox::builder()
+                        .selection_mode(gtk::SelectionMode::None)
+                        .max_children_per_line(2)
+                        .row_spacing(4)
+                        .column_spacing(4)
+                        .build();
+                    for item in &group {
+                        if let Some(widget) = self.attachment_widget(chat, item, true) {
+                            grid.insert(&widget, -1);
+                        }
+                    }
+                    bubble.append(&grid);
+                    let mut captions = group.iter().filter(|item| !item.text.is_empty());
+                    if let Some(item) = captions.next()
+                        && captions.next().is_none()
+                    {
+                        append_message_text(&bubble, &item.text);
+                    }
+                } else {
+                    for item in &group {
+                        if let Some(widget) = self.attachment_widget(chat, item, is_album) {
+                            bubble.append(&widget);
+                        }
+                        append_message_text(&bubble, &item.text);
+                    }
+                }
             }
             let mut time = timestamp
                 .and_then(|time| time.format("%H:%M").ok())
@@ -1791,22 +1822,23 @@ impl Ui {
             time.add_css_class("dim-label");
             let footer = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             footer.set_halign(gtk::Align::End);
-            if !message.reactions.is_empty() {
+            let mut reaction_counts = BTreeMap::<&str, (i32, bool)>::new();
+            for reaction in group.iter().flat_map(|item| &item.reactions) {
+                let (count, chosen) = reaction_counts.entry(&reaction.emoji).or_default();
+                *count += reaction.count;
+                *chosen |= reaction.chosen;
+            }
+            if !reaction_counts.is_empty() {
                 let reactions = gtk::FlowBox::builder()
                     .selection_mode(gtk::SelectionMode::None)
                     .column_spacing(6)
                     .build();
-                for reaction in &message.reactions {
-                    let text = format!("{} {}", reaction.emoji, reaction.count);
-                    let count = label(
-                        &text,
-                        if reaction.chosen {
-                            "accent"
-                        } else {
-                            "dim-label"
-                        },
+                for (emoji, (count, chosen)) in reaction_counts {
+                    let text = format!("{emoji} {count}");
+                    reactions.insert(
+                        &label(&text, if chosen { "accent" } else { "dim-label" }),
+                        -1,
                     );
-                    reactions.insert(&count, -1);
                 }
                 bubble.append(&reactions);
             }
@@ -1816,9 +1848,7 @@ impl Ui {
             footer.append(&time);
             bubble.append(&footer);
             self.history.append(&bubble);
-            if self.search_anchor.get() == Some(message.id)
-                && self.scroll_to_search_result.replace(false)
-            {
+            if selected && self.scroll_to_search_result.replace(false) {
                 let weak = bubble.downgrade();
                 let generation = self.generation.get();
                 after_layout(
@@ -1866,7 +1896,19 @@ impl Ui {
     }
 
     fn message_bubble(&self, id: i32) -> Option<gtk::Widget> {
-        let name = format!("message-{id}");
+        let messages = self.messages.borrow();
+        let first = messages
+            .get(&id)
+            .and_then(|message| message.album)
+            .map_or(id, |album| {
+                messages
+                    .range(..id)
+                    .rev()
+                    .take_while(|(_, item)| item.album == Some(album))
+                    .last()
+                    .map_or(id, |(&id, _)| id)
+            });
+        let name = format!("message-{first}");
         let mut child = self.history.first_child();
         while let Some(candidate) = child {
             if candidate.widget_name() == name {
@@ -1904,10 +1946,12 @@ impl Ui {
         }
     }
 
-    fn render_attachment_image(self: &Rc<Self>, bubble: &gtk::Box, chat: i64, message: &Message) {
-        if !message.photo_preview && message.thumbnail.is_none() && message.attachment.is_none() {
-            return;
-        }
+    fn attachment_widget(
+        self: &Rc<Self>,
+        chat: i64,
+        message: &Message,
+        in_album: bool,
+    ) -> Option<gtk::Widget> {
         let id = message.id;
         let preview = gtk::Stack::new();
         let picture = gtk::Picture::builder()
@@ -1918,7 +1962,8 @@ impl Ui {
         let fallback = if message.photo_preview {
             let icon = gtk::Image::from_icon_name("image-x-generic-symbolic");
             icon.set_pixel_size(48);
-            icon.set_size_request(260, 128);
+            let (width, height) = if in_album { (120, 92) } else { (260, 128) };
+            icon.set_size_request(width, height);
             icon.upcast::<gtk::Widget>()
         } else if let Some(name) = &message.attachment {
             let file = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1929,14 +1974,16 @@ impl Ui {
             file.append(&name);
             file.upcast()
         } else {
-            return;
+            return None;
         };
+        let item_name = format!("attachment-{id}");
         preview.set_hhomogeneous(false);
         preview.set_vhomogeneous(false);
         preview.add_child(&fallback);
         preview.add_child(&picture);
         preview.set_visible_child(&fallback);
         if let Some(media) = message.thumbnail {
+            let message_photo = message.photo_preview;
             self.load_chat_image(
                 ChatImage::Attachment {
                     chat,
@@ -1949,7 +1996,11 @@ impl Ui {
                     #[weak]
                     preview,
                     move |texture: &gtk::gdk::Texture| {
-                        picture.set_size_request(texture.width(), texture.height());
+                        let scale = if in_album && message_photo { 2 } else { 1 };
+                        picture.set_size_request(
+                            (texture.width() / scale).max(1),
+                            (texture.height() / scale).max(1),
+                        );
                         picture.set_paintable(Some(texture));
                         preview.set_visible_child(&picture);
                     }
@@ -1966,9 +2017,12 @@ impl Ui {
                 self,
                 move |_| ui.open_photo_preview(chat, id)
             ));
-            bubble.append(&button);
+            button.set_widget_name(&item_name);
+            Some(button.upcast())
         } else {
-            bubble.append(&preview);
+            preview.set_widget_name(&item_name);
+            preview.set_focusable(in_album);
+            Some(preview.upcast())
         }
     }
 
@@ -2065,7 +2119,10 @@ impl Ui {
             self,
             #[weak]
             bubble,
-            move |_, _, x, y| ui.open_message_menu(&bubble, chat, id, x, y)
+            move |_, _, x, y| {
+                let item = attachment_message_id(bubble.pick(x, y, gtk::PickFlags::DEFAULT));
+                ui.open_message_menu(&bubble, chat, item.unwrap_or(id), x, y);
+            }
         ));
         bubble.add_controller(click);
 
@@ -2082,13 +2139,23 @@ impl Ui {
                     || (key == gtk::gdk::Key::F10
                         && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK))
                 {
-                    ui.open_message_menu(
-                        &bubble,
-                        chat,
-                        id,
-                        f64::from(bubble.width()) / 2.0,
-                        f64::from(bubble.height()) / 2.0,
-                    );
+                    let focused = bubble
+                        .root()
+                        .and_then(|root| gtk::prelude::RootExt::focus(&root));
+                    let item = attachment_message_id(focused.clone());
+                    let (x, y) = focused
+                        .and_then(|widget| widget.compute_bounds(&bubble))
+                        .map(|bounds| {
+                            (
+                                f64::from(bounds.x() + bounds.width() / 2.0),
+                                f64::from(bounds.y() + bounds.height() / 2.0),
+                            )
+                        })
+                        .unwrap_or((
+                            f64::from(bubble.width()) / 2.0,
+                            f64::from(bubble.height()) / 2.0,
+                        ));
+                    ui.open_message_menu(&bubble, chat, item.unwrap_or(id), x, y);
                     glib::Propagation::Stop
                 } else {
                     glib::Propagation::Proceed
@@ -2281,10 +2348,16 @@ impl Ui {
         let text = self.composer_text();
         self.input_placeholder.set_visible(text.is_empty());
         let uploads = self.uploads.borrow();
-        let upload = self.selection.get().and_then(|chat| uploads.get(&chat));
-        self.upload_bar.set_visible(upload.is_some());
-        if let Some(upload) = upload {
-            self.upload_name.set_text(&upload.name);
+        let pending = self.selection.get().and_then(|chat| uploads.get(&chat));
+        self.upload_bar.set_visible(pending.is_some());
+        if let Some(pending) = pending {
+            self.upload_name.set_text(
+                &pending
+                    .iter()
+                    .map(|upload| upload.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
         let replies = self.replies.borrow();
         let reply = self.selection.get().and_then(|chat| replies.get(&chat));
@@ -2303,7 +2376,7 @@ impl Ui {
             .set_sensitive(self.input.is_sensitive() && !self.sending.get());
         self.send.set_sensitive(
             self.input.is_sensitive()
-                && (!text.trim().is_empty() || upload.is_some())
+                && (!text.trim().is_empty() || pending.is_some())
                 && text.trim().chars().count() <= 4096
                 && !self.sending.get(),
         );
@@ -2318,8 +2391,8 @@ impl Ui {
         };
         let dialog = gtk::FileDialog::builder()
             .title(match kind {
-                UploadKind::File => "Выберите файл",
-                UploadKind::Photo => "Выберите фотографию",
+                UploadKind::File => "Выберите файлы",
+                UploadKind::Photo => "Выберите фотографии",
             })
             .build();
         if kind == UploadKind::Photo {
@@ -2332,24 +2405,36 @@ impl Ui {
         }
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            let result = dialog.open_future(Some(&window)).await;
-            let (Some(ui), Ok(file)) = (weak.upgrade(), result) else {
+            let result = dialog.open_multiple_future(Some(&window)).await;
+            let (Some(ui), Ok(files)) = (weak.upgrade(), result) else {
                 return;
             };
             if ui.window.upgrade().is_none() {
                 return;
             }
-            let Some(path) = file.path() else {
-                ui.toast("Выберите локальный файл");
+            if files.n_items() as usize > MAX_ALBUM_ITEMS {
+                ui.toast("Выберите до 10 вложений для одного сообщения");
                 return;
-            };
-            let name = attachment_name(
-                &path.file_name().unwrap_or_default().to_string_lossy(),
-                "Вложение",
-            );
-            ui.uploads
-                .borrow_mut()
-                .insert(chat, Upload { path, name, kind });
+            }
+            let mut selected = Vec::new();
+            for index in 0..files.n_items() {
+                let Some(path) = files
+                    .item(index)
+                    .and_downcast::<gtk::gio::File>()
+                    .and_then(|file| file.path())
+                else {
+                    ui.toast("Выберите локальные файлы");
+                    return;
+                };
+                let name = attachment_name(
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    "Вложение",
+                );
+                selected.push(Upload { path, name, kind });
+            }
+            if !selected.is_empty() {
+                ui.uploads.borrow_mut().insert(chat, selected);
+            }
             ui.update_send_button();
         });
     }
@@ -2363,24 +2448,30 @@ impl Ui {
         };
         let original = self.composer_text().to_string();
         let text = original.trim().to_owned();
-        let upload = self.uploads.borrow().get(&chat).cloned();
+        let uploads = self
+            .uploads
+            .borrow()
+            .get(&chat)
+            .cloned()
+            .unwrap_or_default();
         let reply = self.replies.borrow().get(&chat).cloned();
         let reply_to = reply.as_ref().map(|reply| reply.id);
         if self.is_demo.get() {
+            let id = self.next_demo_message();
             let message = Message {
-                id: self.next_demo_message(),
+                id,
                 text,
                 sender: demo::OWN_NAME.into(),
                 sender_avatar: Some(demo::OWN_AVATAR),
                 outgoing: true,
                 timestamp: demo::now(),
-                attachment: upload.as_ref().map(|upload| upload.name.clone()),
+                attachment: None,
                 photo_preview: false,
                 thumbnail: None,
                 reply_to,
                 reply_preview: reply.map(|reply| reply.preview),
                 can_reply: true,
-                can_edit: upload.is_none(),
+                can_edit: uploads.is_empty(),
                 can_delete: true,
                 can_forward: true,
                 forwarded: false,
@@ -2388,12 +2479,45 @@ impl Ui {
                 reactions: Vec::new(),
                 edited: false,
                 ephemeral: false,
+                album: (uploads.len() > 1).then_some(i64::from(id)),
             };
             self.input.buffer().set_text("");
             self.uploads.borrow_mut().remove(&chat);
             self.replies.borrow_mut().remove(&chat);
             self.update_send_button();
-            self.add_demo_message(chat, message);
+            let messages = if uploads.is_empty() {
+                vec![message]
+            } else {
+                uploads
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, upload)| {
+                        let first = index == 0;
+                        let id = if first {
+                            message.id
+                        } else {
+                            self.next_demo_message()
+                        };
+                        let photo = upload.kind == UploadKind::Photo;
+                        Message {
+                            id,
+                            photo_preview: photo,
+                            thumbnail: photo
+                                .then_some(crate::model::AttachmentThumbnail::Photo(i64::from(id))),
+                            text: if first {
+                                message.text.clone()
+                            } else {
+                                String::new()
+                            },
+                            attachment: Some(upload.name),
+                            reply_to: message.reply_to.filter(|_| first),
+                            reply_preview: message.reply_preview.clone().filter(|_| first),
+                            ..message.clone()
+                        }
+                    })
+                    .collect()
+            };
+            self.add_demo_messages(chat, messages);
             return;
         }
         let Some(client) = self.client.borrow().clone() else {
@@ -2401,21 +2525,23 @@ impl Ui {
         };
         self.sending.set(true);
         self.update_send_button();
-        if upload.is_some() {
-            self.toast("Отправляем вложение…");
+        if !uploads.is_empty() {
+            self.toast("Отправляем вложения…");
         }
-        let request_upload = upload.clone();
+        let request_uploads = uploads.clone();
         self.job(
-            async move { client.send(chat, text, request_upload, reply_to).await },
+            async move { client.send(chat, text, request_uploads, reply_to).await },
             move |ui, result| {
                 ui.sending.set(false);
                 match result {
-                    Ok(mut message) => {
-                        if message.reply_to == reply_to && message.reply_preview.is_none() {
-                            message.reply_preview =
-                                reply.as_ref().map(|reply| reply.preview.clone());
+                    Ok(mut messages) => {
+                        for message in &mut messages {
+                            if message.reply_to == reply_to && message.reply_preview.is_none() {
+                                message.reply_preview =
+                                    reply.as_ref().map(|reply| reply.preview.clone());
+                            }
                         }
-                        if ui.uploads.borrow().get(&chat) == upload.as_ref() {
+                        if ui.uploads.borrow().get(&chat) == Some(&uploads) {
                             ui.uploads.borrow_mut().remove(&chat);
                         }
                         if ui.replies.borrow().get(&chat) == reply.as_ref() {
@@ -2425,16 +2551,28 @@ impl Ui {
                             if ui.composer_text() == original {
                                 ui.input.buffer().set_text("");
                             }
-                            if ui.search_anchor.get().is_some() {
+                            if ui.search_anchor.get().is_some() || !ui.loaded.get() {
+                                ui.history_cache.borrow_mut().remove(chat);
                                 ui.show_chat(chat, None);
                             } else {
-                                ui.messages.borrow_mut().insert(message.id, message);
+                                ui.messages.borrow_mut().extend(
+                                    messages.into_iter().map(|message| (message.id, message)),
+                                );
                                 ui.render_history(true);
                             }
-                        } else if ui.drafts.borrow().get(&chat) == Some(&original) {
-                            ui.drafts.borrow_mut().remove(&chat);
+                        } else {
+                            ui.history_cache.borrow_mut().remove(chat);
+                            if ui.drafts.borrow().get(&chat) == Some(&original) {
+                                ui.drafts.borrow_mut().remove(&chat);
+                            }
                         }
                         ui.refresh_chats();
+                        if ui.selection.get() == Some(chat)
+                            && ui.search_anchor.get().is_none()
+                            && uploads.len() > 1
+                        {
+                            ui.load_history(None, false);
+                        }
                     }
                     Err(error) => ui.toast(&format!("Не удалось отправить сообщение. {error}")),
                 }
@@ -2536,28 +2674,31 @@ impl Ui {
         id
     }
 
-    fn add_demo_message(self: &Rc<Self>, chat: i64, message: Message) {
+    fn add_demo_messages(self: &Rc<Self>, chat: i64, messages: Vec<Message>) {
+        let Some(last) = messages.last() else { return };
         self.history_cache.borrow_mut().remove(chat);
-        self.demo_messages
-            .borrow_mut()
-            .entry(chat)
-            .or_insert_with(|| demo::history(chat))
-            .push(message.clone());
         if let Some(chat) = self
             .chats
             .borrow_mut()
             .iter_mut()
             .find(|item| item.id == chat)
         {
-            chat.preview = if message.text.is_empty() && message.attachment.is_some() {
-                "Вложение".into()
-            } else {
-                message.text.clone()
-            };
-            chat.preview_sender = chat.group.then(|| message.sender.clone());
+            chat.preview = messages
+                .iter()
+                .find(|message| !message.text.is_empty())
+                .map(|message| message.text.clone())
+                .unwrap_or_else(|| "Вложение".into());
+            chat.preview_sender = chat.group.then(|| last.sender.clone());
         }
+        self.demo_messages
+            .borrow_mut()
+            .entry(chat)
+            .or_insert_with(|| demo::history(chat))
+            .extend(messages.iter().cloned());
         if self.selection.get() == Some(chat) {
-            self.messages.borrow_mut().insert(message.id, message);
+            self.messages
+                .borrow_mut()
+                .extend(messages.into_iter().map(|message| (message.id, message)));
             self.render_history(true);
         }
         self.render_chats();
@@ -2611,9 +2752,9 @@ impl Ui {
                 return;
             };
             if ui.is_demo.get() {
-                ui.add_demo_message(
+                ui.add_demo_messages(
                     chat,
-                    Message {
+                    vec![Message {
                         id: ui.next_demo_message(),
                         timestamp: demo::now(),
                         sender: demo::OWN_NAME.into(),
@@ -2627,8 +2768,9 @@ impl Ui {
                         pinned: false,
                         reactions: Vec::new(),
                         edited: false,
+                        album: None,
                         ..message
-                    },
+                    }],
                 );
                 ui.toast("Сообщение переслано");
                 return;
@@ -3034,6 +3176,26 @@ impl Ui {
 
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
+    }
+}
+
+fn attachment_message_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
+    while let Some(item) = widget {
+        if let Some(id) = item.widget_name().strip_prefix("attachment-") {
+            return id.parse().ok();
+        }
+        widget = item.parent();
+    }
+    None
+}
+
+fn append_message_text(bubble: &gtk::Box, content: &str) {
+    if !content.is_empty() {
+        let text = label(content, "");
+        text.set_wrap(true);
+        text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        text.set_max_width_chars(64);
+        bubble.append(&text);
     }
 }
 

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+pub const MAX_ALBUM_ITEMS: usize = 10;
 pub const HISTORY_PAGE_SIZE: usize = 40;
 const CACHED_CHATS: usize = 150;
 const CACHED_MESSAGES: usize = 400;
@@ -111,6 +112,7 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     pub edited: bool,
     pub ephemeral: bool,
+    pub album: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -214,8 +216,17 @@ impl HistoryCache {
         self.expire(now);
         // Keep a contiguous range. A page with a timer stays in the open chat only.
         let uncached = messages.len().saturating_sub(CACHED_MESSAGES);
+        let mut boundary_album = None;
         for _ in 0..uncached {
-            messages.pop_first();
+            boundary_album = messages.pop_first().and_then(|(_, message)| message.album);
+        }
+        if let Some(album) = boundary_album {
+            while messages
+                .first_key_value()
+                .is_some_and(|(_, message)| message.album == Some(album))
+            {
+                messages.pop_first();
+            }
         }
         if messages.values().any(|message| message.ephemeral) {
             return;
@@ -346,6 +357,7 @@ mod tests {
                 reactions: Vec::new(),
                 edited: false,
                 ephemeral: false,
+                album: None,
             })
             .collect()
     }

@@ -122,6 +122,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             reactions: Vec::new(),
             edited: false,
             ephemeral: false,
+            album: None,
         })
         .collect();
     if chat == 1 {
