@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::client::{LoginToken, PasswordToken};
-use grammers_client::media::{Downloadable, Media, PhotoSize};
+use grammers_client::media::{Downloadable, InputMedia, Media, PhotoSize, Uploaded};
 use grammers_client::message::{InputMessage, Message as TelegramMessage};
 use grammers_client::peer::Peer;
 use grammers_client::sender::{SenderPool, SenderPoolHandle, UpdatesConfiguration};
@@ -21,8 +21,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, HISTORY_PAGE_SIZE,
-    HistoryRevision, IncomingMessage, Message, Reaction, ReplyPreview, SearchHit, UpdateStatus,
-    Upload, UploadKind,
+    HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, ReplyPreview, SearchHit,
+    UpdateStatus, Upload, UploadKind,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -565,7 +565,10 @@ impl Telegram {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
-        let mut iter = self.client.iter_messages(peer).limit(HISTORY_PAGE_SIZE + 1);
+        let mut iter = self
+            .client
+            .iter_messages(peer)
+            .limit(HISTORY_PAGE_SIZE + MAX_ALBUM_ITEMS);
         if let Some(before) = before {
             iter = iter.offset_id(before);
         }
@@ -574,13 +577,18 @@ impl Telegram {
         if let Some(message) = &newest {
             result.push(message_view(message, self_id, profile));
         }
-        while result.len() < HISTORY_PAGE_SIZE {
-            let Some(message) = iter.next().await? else {
+        let mut has_older = false;
+        while let Some(message) = iter.next().await? {
+            // Keep the album at the pagination boundary together.
+            if result.len() >= HISTORY_PAGE_SIZE
+                && (message.grouped_id().is_none()
+                    || result.last().and_then(|item| item.album) != message.grouped_id())
+            {
+                has_older = true;
                 break;
-            };
+            }
             result.push(message_view(&message, self_id, profile));
         }
-        let has_older = iter.next().await?.is_some();
         let marked = if mark_read && let Some(message) = newest {
             message.mark_as_read().await.is_ok()
         } else {
@@ -683,42 +691,79 @@ impl Telegram {
         &self,
         id: i64,
         text: String,
-        upload: Option<Upload>,
+        uploads: Vec<Upload>,
         reply_to: Option<i32>,
-    ) -> Result<Message> {
+    ) -> Result<Vec<Message>> {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
-        let mut message = InputMessage::new().text(text).reply_to(reply_to);
-        if let Some(upload) = upload {
-            let metadata = tokio::fs::metadata(&upload.path)
-                .await
-                .context("Не удалось прочитать выбранный файл")?;
-            ensure!(metadata.is_file(), "Выберите обычный файл");
-            let file = tokio::fs::File::open(&upload.path).await?;
-            let metadata = file.metadata().await?;
-            ensure!(metadata.is_file(), "Выберите обычный файл");
-            ensure!(metadata.len() <= 4 * 1024_u64.pow(3), "Файл больше 4 ГиБ");
-            let size = usize::try_from(metadata.len()).context("Файл слишком большой")?;
-            ensure!(size > 0, "Нельзя отправить пустой файл");
-            use tokio::io::AsyncReadExt;
-            let mut stream = file.take(metadata.len());
-            let uploaded = self
-                .client
-                .upload_stream(&mut stream, size, upload.name)
-                .await
-                .context("Не удалось загрузить файл в Telegram")?;
+        if uploads.len() > 1 {
             ensure!(
-                stream.limit() == 0,
-                "Размер файла изменился во время отправки"
+                uploads.len() <= MAX_ALBUM_ITEMS,
+                "В альбоме может быть до 10 вложений"
             );
-            message = match upload.kind {
+            let kind = uploads[0].kind;
+            ensure!(
+                uploads.iter().all(|upload| upload.kind == kind),
+                "Выберите фотографии или документы для одного альбома"
+            );
+            let mut album = Vec::with_capacity(uploads.len());
+            for (index, upload) in uploads.into_iter().enumerate() {
+                let uploaded = self.upload_file(upload).await?;
+                let mut media = InputMedia::new();
+                if index == 0 {
+                    media = media.caption(&text).reply_to(reply_to);
+                }
+                album.push(match kind {
+                    UploadKind::File => media.file(uploaded),
+                    UploadKind::Photo => media.photo(uploaded),
+                });
+            }
+            let messages = self.client.send_album(peer, album).await?;
+            return Ok(messages
+                .into_iter()
+                .flatten()
+                .map(|message| message_view(&message, self_id, profile))
+                .collect());
+        }
+
+        let mut message = InputMessage::new().text(text).reply_to(reply_to);
+        if let Some(upload) = uploads.into_iter().next() {
+            let kind = upload.kind;
+            let uploaded = self.upload_file(upload).await?;
+            message = match kind {
                 UploadKind::File => message.file(uploaded),
                 UploadKind::Photo => message.photo(uploaded),
             };
         }
         let message = self.client.send_message(peer, message).await?;
-        Ok(message_view(&message, self_id, profile))
+        Ok(vec![message_view(&message, self_id, profile)])
+    }
+
+    async fn upload_file(&self, upload: Upload) -> Result<Uploaded> {
+        use tokio::io::AsyncReadExt;
+
+        let metadata = tokio::fs::metadata(&upload.path)
+            .await
+            .context("Не удалось прочитать выбранный файл")?;
+        ensure!(metadata.is_file(), "Выберите обычный файл");
+        let file = tokio::fs::File::open(&upload.path).await?;
+        let metadata = file.metadata().await?;
+        ensure!(metadata.is_file(), "Выберите обычный файл");
+        ensure!(metadata.len() <= 4 * 1024_u64.pow(3), "Файл больше 4 ГиБ");
+        let size = usize::try_from(metadata.len()).context("Файл слишком большой")?;
+        ensure!(size > 0, "Нельзя отправить пустой файл");
+        let mut stream = file.take(metadata.len());
+        let uploaded = self
+            .client
+            .upload_stream(&mut stream, size, upload.name)
+            .await
+            .context("Не удалось загрузить файл в Telegram")?;
+        ensure!(
+            stream.limit() == 0,
+            "Размер файла изменился во время отправки"
+        );
+        Ok(uploaded)
     }
 
     pub async fn save(&self, chat: i64, id: i32, destination: PathBuf) -> Result<()> {
@@ -1274,6 +1319,7 @@ fn message_view(
         forwarded: matches!(&message.raw, enums::Message::Message(raw) if raw.fwd_from.is_some()),
         pinned: message.pinned(),
         reactions: message_reactions(message),
+        album: message.grouped_id(),
         edited: message.edit_date().is_some() && !message.edit_hide(),
         ephemeral: matches!(&message.raw, enums::Message::Message(raw) if raw.ttl_period.is_some())
             || match message.media() {
