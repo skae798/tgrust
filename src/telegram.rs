@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -15,17 +15,16 @@ use grammers_client::{Client, InvocationError, SignInError};
 use grammers_session::{
     Session,
     storages::SqliteSession,
-    types::{PeerId, PeerRef},
+    types::{PeerId, PeerKind, PeerRef},
 };
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, IncomingMessage, Message,
-    Reaction, ReplyPreview, SearchHit, UpdateStatus, Upload, UploadKind,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, HISTORY_PAGE_SIZE,
+    HistoryRevision, IncomingMessage, Message, Reaction, ReplyPreview, SearchHit, UpdateStatus,
+    Upload, UploadKind,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
-
-pub const PAGE_SIZE: usize = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginStep {
@@ -52,6 +51,7 @@ pub struct Telegram {
     state: Mutex<LoginState>,
     peers: RwLock<HashMap<i64, PeerRef>>,
     changes: watch::Sender<UpdateStatus>,
+    history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
     profile: OnceCell<Peer>,
 }
@@ -108,6 +108,7 @@ impl Telegram {
                 state: Mutex::new(state),
                 peers: RwLock::new(HashMap::new()),
                 changes,
+                history_changes: StdMutex::default(),
                 image_downloads: Semaphore::new(4),
                 profile: OnceCell::new(),
             }),
@@ -213,6 +214,7 @@ impl Telegram {
             match result {
                 Ok(update) => {
                     retry_delay = Duration::from_secs(1);
+                    self.record_history_change(&update);
                     if let Update::NewMessage(message) = &update
                         && let Some(notification) = notification_for(message, started)
                     {
@@ -282,6 +284,7 @@ impl Telegram {
             *retry_delay = (*retry_delay * 2).min(Duration::from_secs(30));
             match tokio::time::timeout(Duration::from_secs(15), self.client.is_authorized()).await {
                 Ok(Ok(true)) => {
+                    self.invalidate_history(None, true);
                     self.changes.send_modify(|status| {
                         status.reconnecting = false;
                         status.revision = status.revision.wrapping_add(1);
@@ -306,6 +309,55 @@ impl Telegram {
     fn invalidate_views(&self) {
         self.changes
             .send_modify(|status| status.revision = status.revision.wrapping_add(1));
+    }
+
+    pub fn history_revision(&self, chat: i64) -> HistoryRevision {
+        let (all, chats) = &*self.history_changes.lock().unwrap();
+        HistoryRevision {
+            all: *all,
+            ..chats.get(&chat).copied().unwrap_or_default()
+        }
+    }
+
+    fn record_history_change(&self, update: &Update) {
+        let chat = match update {
+            Update::NewMessage(message) | Update::MessageEdited(message) => {
+                message.peer_id().bot_api_dialog_id()
+            }
+            Update::MessageDeleted(deletion) => deletion
+                .channel_id()
+                .and_then(PeerId::channel)
+                .and_then(PeerId::bot_api_dialog_id),
+            _ => match update.raw() {
+                enums::Update::PinnedMessages(update) => {
+                    PeerId::from(update.peer.clone()).bot_api_dialog_id()
+                }
+                enums::Update::PinnedChannelMessages(update) => {
+                    PeerId::channel(update.channel_id).and_then(PeerId::bot_api_dialog_id)
+                }
+                enums::Update::MessageReactions(update) => {
+                    PeerId::from(update.peer.clone()).bot_api_dialog_id()
+                }
+                _ => return,
+            },
+        };
+        self.invalidate_history(chat, !matches!(update, Update::NewMessage(_)));
+    }
+
+    fn invalidate_history(&self, chat: Option<i64>, rewritten: bool) {
+        let (all, chats) = &mut *self.history_changes.lock().unwrap();
+        if let Some(chat) = chat
+            && (chats.len() < 512 || chats.contains_key(&chat))
+        {
+            let revision = chats.entry(chat).or_default();
+            revision.chat = revision.chat.wrapping_add(1);
+            if rewritten {
+                revision.rewritten = revision.chat;
+            }
+        } else {
+            *all = all.wrapping_add(1);
+            chats.clear();
+        }
     }
 
     pub async fn chats(&self) -> Result<Vec<Chat>> {
@@ -337,14 +389,17 @@ impl Telegram {
                     .as_ref()
                     .map(preview)
                     .unwrap_or_default(),
-                preview_sender: matches!(peer, Peer::Group(_) | Peer::Community(_))
-                    .then(|| {
-                        dialog
-                            .last_message
-                            .as_ref()
-                            .and_then(|message| preview_sender(message, profile))
-                    })
-                    .flatten(),
+                preview_sender: matches!(
+                    peer,
+                    Peer::Group(_) | Peer::Community(_) | Peer::Channel(_)
+                )
+                .then(|| {
+                    dialog
+                        .last_message
+                        .as_ref()
+                        .and_then(|message| preview_sender(message, profile))
+                })
+                .flatten(),
                 group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
                 unread: raw.unread_count.max(i32::from(raw.unread_mark)),
                 broadcast: matches!(peer, Peer::Channel(_)),
@@ -510,7 +565,7 @@ impl Telegram {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
-        let mut iter = self.client.iter_messages(peer).limit(PAGE_SIZE + 1);
+        let mut iter = self.client.iter_messages(peer).limit(HISTORY_PAGE_SIZE + 1);
         if let Some(before) = before {
             iter = iter.offset_id(before);
         }
@@ -519,7 +574,7 @@ impl Telegram {
         if let Some(message) = &newest {
             result.push(message_view(message, self_id, profile));
         }
-        while result.len() < PAGE_SIZE {
+        while result.len() < HISTORY_PAGE_SIZE {
             let Some(message) = iter.next().await? else {
                 break;
             };
@@ -537,6 +592,26 @@ impl Telegram {
         Ok((result, has_older, marked))
     }
 
+    pub async fn mark_read_through(&self, chat: i64, max_id: i32) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        if peer.id.kind() == PeerKind::Channel {
+            self.client
+                .invoke(&grammers_client::tl::functions::channels::ReadHistory {
+                    channel: peer.into(),
+                    max_id,
+                })
+                .await?;
+        } else {
+            self.client
+                .invoke(&grammers_client::tl::functions::messages::ReadHistory {
+                    peer: peer.into(),
+                    max_id,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn history_around(&self, chat: i64, anchor: i32) -> Result<(Vec<Message>, bool)> {
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
@@ -552,7 +627,7 @@ impl Telegram {
             .iter_messages(peer)
             .offset_id(anchor)
             .reverse(true)
-            .limit(PAGE_SIZE / 2);
+            .limit(HISTORY_PAGE_SIZE / 2);
         while let Some(message) = newer.next().await? {
             if message.id() > anchor {
                 messages.push(message_view(&message, self_id, profile));
@@ -1200,25 +1275,29 @@ fn message_view(
         pinned: message.pinned(),
         reactions: message_reactions(message),
         edited: message.edit_date().is_some() && !message.edit_hide(),
+        ephemeral: matches!(&message.raw, enums::Message::Message(raw) if raw.ttl_period.is_some())
+            || match message.media() {
+                Some(Media::Photo(photo)) => photo.raw.ttl_seconds.is_some(),
+                Some(Media::Document(document)) => document.raw.ttl_seconds.is_some(),
+                _ => false,
+            },
     }
 }
 
 fn author_peer<'a>(message: &'a TelegramMessage, profile: Option<&'a Peer>) -> Option<&'a Peer> {
     message.sender().or_else(|| {
-        if message.outgoing() {
+        let sender = message.sender_id();
+        if sender == Some(message.peer_id()) || (sender.is_none() && message.post()) {
+            message.peer()
+        } else if message.outgoing() && sender.is_none_or(|id| id.kind() == PeerKind::User) {
             profile
         } else {
-            message
-                .peer()
-                .filter(|peer| matches!(peer, Peer::Channel(_)))
+            None
         }
     })
 }
 
 fn author_name(message: &TelegramMessage, profile: Option<&Peer>) -> Option<String> {
-    if let Some(name) = message.post_author().filter(|name| !name.is_empty()) {
-        return Some(name.to_owned());
-    }
     match author_peer(message, profile)? {
         Peer::User(user) => Some(user.full_name()).filter(|name| !name.is_empty()),
         peer => peer
@@ -1232,13 +1311,7 @@ fn preview_sender(message: &TelegramMessage, profile: Option<&Peer>) -> Option<S
     if message.action().is_some() {
         return None;
     }
-    author_peer(message, profile)
-        .and_then(|peer| {
-            peer.username()
-                .or_else(|| peer.usernames().into_iter().next())
-        })
-        .map(|name| format!("@{name}"))
-        .or_else(|| author_name(message, profile))
+    author_name(message, profile)
 }
 
 fn can_delete(message: &TelegramMessage, self_id: Option<PeerId>) -> bool {
