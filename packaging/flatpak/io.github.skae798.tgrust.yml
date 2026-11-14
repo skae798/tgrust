@@ -1,0 +1,63 @@
+id: io.github.skae798.tgrust
+runtime: org.gnome.Platform
+runtime-version: '51'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.llvm22
+command: tgrust
+appstream-compose: false
+finish-args:
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+build-options:
+  append-path: /usr/lib/sdk/llvm22/bin
+  env:
+    LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+modules:
+  - name: tgrust
+    buildsystem: simple
+    build-commands:
+      - ./rustc-dist/install.sh --prefix="$PWD/.rust" --disable-ldconfig
+      - ./rust-std-dist/install.sh --prefix="$PWD/.rust" --disable-ldconfig
+      - ./cargo-dist/install.sh --prefix="$PWD/.rust" --disable-ldconfig
+      - PATH="$PWD/.rust/bin:$PATH" cargo build --frozen --release
+      - install -Dm755 target/release/tgrust /app/bin/tgrust
+      - install -Dm644 data/io.github.skae798.tgrust.desktop -t /app/share/applications
+      - install -Dm644 data/io.github.skae798.tgrust.metainfo.xml -t /app/share/metainfo
+      - install -Dm644 data/icons/hicolor/256x256/apps/io.github.skae798.tgrust.png -t /app/share/icons/hicolor/256x256/apps
+    sources:
+      - type: dir
+        path: source
+      - type: archive
+        url: https://static.rust-lang.org/dist/2026-11-12/rustc-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+        sha256: f1d0b1dec81dab6f523cd098507763487b0d4bd7fd2c87582f154128719be03b
+        dest: rustc-dist
+        only-arches: [x86_64]
+      - type: archive
+        url: https://static.rust-lang.org/dist/2026-11-12/rust-std-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+        sha256: 4591b6486594ded52ecd6135db95bf9355bbd3ca7a380888b141528bbcf9a5d4
+        dest: rust-std-dist
+        only-arches: [x86_64]
+      - type: archive
+        url: https://static.rust-lang.org/dist/2026-11-12/cargo-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+        sha256: 7e29ce07d7c6e92d1826870575ba27d57fff6cb3e754aa57d99099cb88fab35d
+        dest: cargo-dist
+        only-arches: [x86_64]
+      - type: archive
+        url: https://static.rust-lang.org/dist/2026-11-12/rustc-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+        sha256: fcbfa5b8a0cb28f0c4edfb6dda6910ee910993db31f05258613f5cd5b851263a
+        dest: rustc-dist
+        only-arches: [aarch64]
+      - type: archive
+        url: https://static.rust-lang.org/dist/2026-11-12/rust-std-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+        sha256: c73f62fbe5d837f9807ed9e0076575dd8d3475c79af2b30e3570d328e6713f8f
+        dest: rust-std-dist
+        only-arches: [aarch64]
+      - type: archive
+        url: https://static.rust-lang.org/dist/2026-11-12/cargo-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+        sha256: d07ee80eb6ba3c5845c554ac88086e1ff5d63f83d99c3c09cb32504cbedd6844
+        dest: cargo-dist
+        only-arches: [aarch64]

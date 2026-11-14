@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.skae798.tgrust</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>tgrust</name>
+  <summary>Unofficial Telegram client for GNOME</summary>
+  <summary xml:lang="ru">Неофициальный клиент Telegram для GNOME</summary>
+  <description>
+    <p>Read and send Telegram messages in a native GNOME interface. Search conversations, view photo albums, and save attachments through the system file chooser.</p>
+    <p xml:lang="ru">Читайте и отправляйте сообщения Telegram в интерфейсе GNOME. Ищите переписку, просматривайте фотоальбомы и сохраняйте вложения через системный диалог.</p>
+  </description>
+  <launchable type="desktop-id">io.github.skae798.tgrust.desktop</launchable>
+  <url type="homepage">https://github.com/skae798/tgrust</url>
+  <url type="bugtracker">https://github.com/skae798/tgrust/issues</url>
+  <developer id="io.github.skae798">
+    <name>skae798</name>
+  </developer>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-contacts">intense</content_attribute>
+  </content_rating>
+</component>

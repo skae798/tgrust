@@ -67,6 +67,33 @@ gh auth login --hostname github.com
 
 Ярлык tgrust появится в меню GNOME. Чтобы закрепить его в доке, выберите «Добавить в избранное». При запуске из меню или дока клиент использует сохранённую сессию.
 
+### Установка и обновление Flatpak
+
+На Fedora установите `flatpak`, `flatpak-builder`, Git и Cargo. Для сборки нужны GNOME SDK 51 и его расширение LLVM. Добавьте Flathub в пользовательскую установку и соберите пакет из коммита, который открыт в рабочей копии.
+
+```sh
+flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install --user flathub org.gnome.Platform//51 org.gnome.Sdk//51 org.freedesktop.Sdk.Extension.llvm22//26.08
+./scripts/build-flatpak.sh
+flatpak install --user ./tgrust.flatpak
+flatpak run io.github.skae798.tgrust --demo
+```
+
+Скрипт принимает путь к выходному пакету. Он берёт исходники из `HEAD` и скачивает зависимости по `Cargo.lock`. Компиляция выполняется без сети. Для обновления перейдите на новый коммит, пересоберите пакет и установите его командой `flatpak install --user --reinstall ./tgrust.flatpak`. Ярлык доступен в меню GNOME.
+
+При первом входе передайте ключи через `flatpak run --env-fd`, чтобы значения не попадали в аргументы процесса.
+
+```bash
+read -rp 'API ID: ' TGRUST_API_ID
+read -rsp 'API hash: ' TGRUST_API_HASH
+printf '\n'
+flatpak run --env-fd=3 io.github.skae798.tgrust \
+    3< <(printf 'TGRUST_API_ID=%s\0TGRUST_API_HASH=%s\0' "$TGRUST_API_ID" "$TGRUST_API_HASH")
+unset TGRUST_API_ID TGRUST_API_HASH
+```
+
+Flatpak хранит свою сессию в `~/.var/app/io.github.skae798.tgrust/data/tgrust`. Для загрузки и отправки файлов используются разрешения, выданные системным диалогом.
+
 ## Устройство проекта
 
 | Файл | Назначение |
@@ -126,7 +153,7 @@ cargo run --locked -- --demo
 
 1. Довести до стабильной работы вход, повторное подключение и синхронизацию истории. Добавить тестовую проверку больших файлов и истёкших ссылок.
 2. Добавить отправку и предпросмотр медиа, ответы, правки, реакции, уведомления и глобальный поиск.
-3. Добавить папки, несколько аккаунтов, настройки и сборку Flatpak.
+3. Развить управление папками, добавить несколько аккаунтов и настройки.
 4. Оценить поддержку звонков, историй, секретных чатов и других возможностей Telegram Desktop.
 
 Инструкции для разработчиков и агентов находятся в [AGENTS.md](AGENTS.md).
