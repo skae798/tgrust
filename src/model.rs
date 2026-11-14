@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -101,6 +102,52 @@ pub struct SearchHit {
     pub message: Message,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TextStyle {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Code,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextSpan {
+    // Byte offsets into the UTF-8 message text.
+    pub range: Range<usize>,
+    pub style: TextStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FormattedText {
+    pub text: String,
+    pub spans: Vec<TextSpan>,
+}
+
+impl FormattedText {
+    pub fn trimmed(&self) -> Self {
+        let text = self.text.trim();
+        let start = self.text.len() - self.text.trim_start().len();
+        let end = start + text.len();
+        let spans = self
+            .spans
+            .iter()
+            .filter_map(|span| {
+                let from = span.range.start.max(start);
+                let to = span.range.end.min(end);
+                (from < to).then(|| TextSpan {
+                    range: from - start..to - start,
+                    style: span.style,
+                })
+            })
+            .collect();
+        Self {
+            text: text.to_owned(),
+            spans,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Message {
     pub id: i32,
@@ -108,6 +155,7 @@ pub struct Message {
     pub sender_avatar: Option<Avatar>,
     pub timestamp: i64,
     pub text: String,
+    pub styles: Vec<TextSpan>,
     pub outgoing: bool,
     pub attachment: Option<String>,
     pub photo_preview: bool,
@@ -148,6 +196,13 @@ pub struct ReplyPreview {
 }
 
 impl Message {
+    pub fn formatted_text(&self) -> FormattedText {
+        FormattedText {
+            text: self.text.clone(),
+            spans: self.styles.clone(),
+        }
+    }
+
     pub fn reply_preview(&self) -> ReplyPreview {
         let text = self.text.lines().find(|line| !line.trim().is_empty());
         ReplyPreview {
@@ -354,6 +409,7 @@ mod tests {
                 sender_avatar: None,
                 timestamp: 0,
                 text: String::new(),
+                styles: Vec::new(),
                 outgoing: false,
                 attachment: None,
                 photo_preview: false,

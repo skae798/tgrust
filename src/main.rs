@@ -1,4 +1,5 @@
 mod demo;
+mod formatting;
 mod model;
 mod storage;
 mod telegram;

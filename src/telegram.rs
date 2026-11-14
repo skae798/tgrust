@@ -20,9 +20,9 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, HISTORY_PAGE_SIZE,
-    HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, ReplyPreview, SearchHit,
-    UpdateStatus, Upload, UploadKind,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, FormattedText,
+    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
+    ReplyPreview, SearchHit, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -687,13 +687,14 @@ impl Telegram {
     pub async fn send(
         &self,
         id: i64,
-        text: String,
+        text: FormattedText,
         uploads: Vec<Upload>,
         reply_to: Option<i32>,
     ) -> Result<Vec<Message>> {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let entities = outgoing_entities(&text);
         if uploads.len() > 1 {
             ensure!(
                 uploads.len() <= MAX_ALBUM_ITEMS,
@@ -709,7 +710,10 @@ impl Telegram {
                 let uploaded = self.upload_file(upload).await?;
                 let mut media = InputMedia::new();
                 if index == 0 {
-                    media = media.caption(&text).reply_to(reply_to);
+                    media = media
+                        .caption(&text.text)
+                        .fmt_entities(entities.iter().cloned())
+                        .reply_to(reply_to);
                 }
                 album.push(match kind {
                     UploadKind::File => media.file(uploaded),
@@ -724,7 +728,10 @@ impl Telegram {
                 .collect());
         }
 
-        let mut message = InputMessage::new().text(text).reply_to(reply_to);
+        let mut message = InputMessage::new()
+            .text(text.text)
+            .fmt_entities(entities)
+            .reply_to(reply_to);
         if let Some(upload) = uploads.into_iter().next() {
             let kind = upload.kind;
             let uploaded = self.upload_file(upload).await?;
@@ -933,7 +940,7 @@ impl Telegram {
         Ok(bytes)
     }
 
-    pub async fn edit_text(&self, chat: i64, id: i32, text: String) -> Result<()> {
+    pub async fn edit_text(&self, chat: i64, id: i32, text: FormattedText) -> Result<()> {
         let peer = self.peer(chat).await?;
         let message = self
             .message_by_id(peer, id)
@@ -941,14 +948,25 @@ impl Telegram {
             .context("Сообщение больше недоступно")?;
         ensure!(can_edit_text(&message), "Это сообщение нельзя изменить");
         let link_preview = matches!(message.media(), Some(Media::WebPage(_)));
-        let edit = self.client.edit_message(
-            peer,
+        let entities = outgoing_entities(&text);
+        // Include even an empty vector when removing the last style.
+        let edit = grammers_client::tl::functions::messages::EditMessage {
+            no_webpage: !link_preview,
+            invert_media: false,
+            peer: peer.into(),
             id,
-            InputMessage::new().text(text).link_preview(link_preview),
-        );
-        match edit.await {
+            message: Some(text.text),
+            media: None,
+            reply_markup: None,
+            entities: Some(entities),
+            schedule_date: None,
+            schedule_repeat_period: None,
+            quick_reply_shortcut_id: None,
+            rich_message: None,
+        };
+        match self.client.invoke(&edit).await {
             Err(error) if error.is("MESSAGE_NOT_MODIFIED") => Ok(()),
-            result => Ok(result?),
+            result => result.map(drop).map_err(Into::into),
         }
     }
 
@@ -1291,6 +1309,10 @@ fn message_view(
         } else {
             preview(message)
         },
+        styles: incoming_styles(
+            message.text(),
+            message.fmt_entities().map_or(&[], Vec::as_slice),
+        ),
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
@@ -1391,6 +1413,87 @@ fn can_forward(message: &TelegramMessage) -> bool {
         }
 }
 
+fn incoming_styles(text: &str, entities: &[enums::MessageEntity]) -> Vec<TextSpan> {
+    use enums::MessageEntity as Entity;
+
+    if entities.is_empty() {
+        return Vec::new();
+    }
+    let mut utf16 = 0;
+    let mut boundaries = HashMap::new();
+    for (byte, ch) in text.char_indices() {
+        boundaries.insert(utf16, byte);
+        utf16 += ch.len_utf16() as i32;
+    }
+    boundaries.insert(utf16, text.len());
+    let mut spans: Vec<_> = entities
+        .iter()
+        .filter_map(|entity| {
+            let style = match entity {
+                Entity::Bold(_) => TextStyle::Bold,
+                Entity::Italic(_) => TextStyle::Italic,
+                Entity::Underline(_) => TextStyle::Underline,
+                Entity::Strike(_) => TextStyle::Strike,
+                Entity::Code(_) | Entity::Pre(_) => TextStyle::Code,
+                _ => return None,
+            };
+            let start = *boundaries.get(&entity.offset())?;
+            let end = *boundaries.get(&entity.offset().checked_add(entity.length())?)?;
+            (start < end).then_some(TextSpan {
+                range: start..end,
+                style,
+            })
+        })
+        .collect();
+    spans.sort_by_key(|span| (span.range.start, span.range.end, span.style));
+    spans
+}
+
+fn outgoing_entities(formatted: &FormattedText) -> Vec<enums::MessageEntity> {
+    if formatted.spans.is_empty() {
+        return Vec::new();
+    }
+    let mut boundaries: Vec<_> = formatted
+        .spans
+        .iter()
+        .flat_map(|span| [span.range.start, span.range.end])
+        .collect();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut entities = Vec::new();
+    for pair in boundaries.windows(2) {
+        let [start, end] = [pair[0], pair[1]];
+        let styles: std::collections::BTreeSet<_> = formatted
+            .spans
+            .iter()
+            .filter(|span| span.range.start <= start && span.range.end >= end)
+            .map(|span| span.style)
+            .collect();
+        let part = formatted.text[start..end].trim_end();
+        if part.is_empty() {
+            continue;
+        }
+        let offset = formatted.text[..start].encode_utf16().count() as i32;
+        let length = part.encode_utf16().count() as i32;
+        // Code is exclusive. Splitting all other spans at style boundaries keeps
+        // partially overlapping selections valid as Telegram entities.
+        if styles.contains(&TextStyle::Code) {
+            entities.push(types::MessageEntityCode { offset, length }.into());
+            continue;
+        }
+        for style in styles {
+            entities.push(match style {
+                TextStyle::Bold => types::MessageEntityBold { offset, length }.into(),
+                TextStyle::Italic => types::MessageEntityItalic { offset, length }.into(),
+                TextStyle::Underline => types::MessageEntityUnderline { offset, length }.into(),
+                TextStyle::Strike => types::MessageEntityStrike { offset, length }.into(),
+                TextStyle::Code => unreachable!("code spans are exclusive"),
+            });
+        }
+    }
+    entities
+}
+
 fn can_edit_text(message: &TelegramMessage) -> bool {
     let enums::Message::Message(raw) = &message.raw else {
         return false;
@@ -1400,7 +1503,23 @@ fn can_edit_text(message: &TelegramMessage) -> bool {
         && raw.fwd_from.is_none()
         && raw.via_bot_id.is_none()
         && raw.ttl_period.is_none()
-        && (raw.entities.as_ref().is_none_or(Vec::is_empty))
+        && raw.entities.iter().flatten().all(|entity| {
+            matches!(
+                entity,
+                enums::MessageEntity::Bold(_)
+                    | enums::MessageEntity::Italic(_)
+                    | enums::MessageEntity::Underline(_)
+                    | enums::MessageEntity::Strike(_)
+                    | enums::MessageEntity::Code(_)
+                    | enums::MessageEntity::Url(_)
+                    | enums::MessageEntity::Email(_)
+                    | enums::MessageEntity::Mention(_)
+                    | enums::MessageEntity::Hashtag(_)
+                    | enums::MessageEntity::Cashtag(_)
+                    | enums::MessageEntity::BotCommand(_)
+                    | enums::MessageEntity::Phone(_)
+            )
+        })
         && matches!(
             raw.media,
             None | Some(enums::MessageMedia::Empty | enums::MessageMedia::WebPage(_))
@@ -1495,6 +1614,73 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn formatted_entities_use_utf16_and_keep_overlapping_styles() {
+        let formatted = FormattedText {
+            text: "  я😀ab  ".into(),
+            spans: vec![
+                TextSpan {
+                    range: 2..9,
+                    style: TextStyle::Bold,
+                },
+                TextSpan {
+                    range: 4..12,
+                    style: TextStyle::Italic,
+                },
+            ],
+        }
+        .trimmed();
+        assert_eq!(formatted.text, "я😀ab");
+        let entities = outgoing_entities(&formatted);
+        assert_eq!(
+            entities
+                .iter()
+                .map(|entity| (entity.offset(), entity.length()))
+                .collect::<Vec<_>>(),
+            [(0, 1), (1, 3), (1, 3), (4, 1)]
+        );
+        let decoded = incoming_styles(&formatted.text, &entities);
+        assert_eq!(decoded[1].range, 2..7);
+        assert_eq!(decoded[1].style, TextStyle::Bold);
+        assert_eq!(decoded[2].style, TextStyle::Italic);
+    }
+
+    #[test]
+    fn malformed_offsets_are_ignored_and_code_is_exclusive() {
+        let invalid = types::MessageEntityBold {
+            offset: 1,
+            length: 1,
+        };
+        assert!(incoming_styles("😀", &[invalid.into()]).is_empty());
+        let formatted = FormattedText {
+            text: "😀код".into(),
+            spans: vec![
+                TextSpan {
+                    range: 0..10,
+                    style: TextStyle::Bold,
+                },
+                TextSpan {
+                    range: 4..10,
+                    style: TextStyle::Code,
+                },
+            ],
+        };
+        let entities = outgoing_entities(&formatted);
+        assert!(matches!(
+            entities.as_slice(),
+            [
+                enums::MessageEntity::Bold(types::MessageEntityBold {
+                    offset: 0,
+                    length: 2
+                }),
+                enums::MessageEntity::Code(types::MessageEntityCode {
+                    offset: 2,
+                    length: 3
+                }),
+            ]
+        ));
+    }
 
     #[test]
     fn notification_mute_expires_at_the_configured_second() {

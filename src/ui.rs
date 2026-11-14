@@ -12,8 +12,9 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
+use crate::formatting::{editor_text, message_attributes, set_editor_text, setup_editor};
 use crate::model::{
-    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, HISTORY_PAGE_SIZE, HistoryCache,
+    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, FormattedText, HISTORY_PAGE_SIZE, HistoryCache,
     HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply, SearchHit,
     UpdateStatus, Upload, UploadKind, merge_latest_history,
 };
@@ -91,7 +92,7 @@ struct Ui {
     history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     demo_next_message: Cell<i32>,
-    drafts: RefCell<HashMap<i64, String>>,
+    drafts: RefCell<HashMap<i64, FormattedText>>,
     uploads: RefCell<HashMap<i64, Vec<Upload>>>,
     replies: RefCell<HashMap<i64, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
@@ -284,6 +285,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .right_margin(10)
         .build();
     input.update_property(&[gtk::accessible::Property::Label("Сообщение")]);
+    setup_editor(&input);
     let input_scroll = gtk::ScrolledWindow::builder()
         .child(&input)
         .min_content_height(36)
@@ -1428,7 +1430,7 @@ impl Ui {
         if let Some(previous) = self.selection.replace(Some(id)) {
             self.drafts
                 .borrow_mut()
-                .insert(previous, self.composer_text().to_string());
+                .insert(previous, editor_text(&self.input.buffer()));
             if self.search_anchor.get().is_none()
                 && let Some(refreshed) = self.history_refreshed.get()
             {
@@ -1459,7 +1461,11 @@ impl Ui {
             .set_subtitle(if chat.broadcast { "Канал" } else { "" });
         self.content.set_visible_child_name("conversation");
         let buffer = self.input.buffer();
-        buffer.set_text(self.drafts.borrow().get(&id).map_or("", String::as_str));
+        if let Some(draft) = self.drafts.borrow().get(&id) {
+            set_editor_text(&buffer, draft);
+        } else {
+            buffer.set_text("");
+        }
         buffer.place_cursor(&buffer.end_iter());
         self.input.set_sensitive(!chat.broadcast);
         self.input_placeholder.set_text(if chat.broadcast {
@@ -1831,14 +1837,14 @@ impl Ui {
                     if let Some(item) = captions.next()
                         && captions.next().is_none()
                     {
-                        append_message_text(&bubble, &item.text);
+                        append_message_text(&bubble, item);
                     }
                 } else {
                     for item in &group {
                         if let Some(widget) = self.attachment_widget(chat, item, is_album) {
                             bubble.append(&widget);
                         }
-                        append_message_text(&bubble, &item.text);
+                        append_message_text(&bubble, item);
                     }
                 }
             }
@@ -2319,8 +2325,8 @@ impl Ui {
                     #[weak(rename_to = ui)]
                     self,
                     #[strong(rename_to = text)]
-                    message.text.clone(),
-                    move || ui.edit_message(chat, id, &text, false)
+                    message.formatted_text(),
+                    move || ui.edit_message(chat, id, text.clone(), false)
                 ),
             );
         }
@@ -2472,8 +2478,8 @@ impl Ui {
         let Some(chat) = self.selection.get() else {
             return;
         };
-        let original = self.composer_text().to_string();
-        let text = original.trim().to_owned();
+        let original = editor_text(&self.input.buffer());
+        let text = original.trimmed();
         let uploads = self
             .uploads
             .borrow()
@@ -2486,7 +2492,8 @@ impl Ui {
             let id = self.next_demo_message();
             let message = Message {
                 id,
-                text,
+                text: text.text,
+                styles: text.spans,
                 sender: demo::OWN_NAME.into(),
                 sender_avatar: Some(demo::OWN_AVATAR),
                 outgoing: true,
@@ -2535,6 +2542,11 @@ impl Ui {
                             } else {
                                 String::new()
                             },
+                            styles: if first {
+                                message.styles.clone()
+                            } else {
+                                Vec::new()
+                            },
                             attachment: Some(upload.name),
                             reply_to: message.reply_to.filter(|_| first),
                             reply_preview: message.reply_preview.clone().filter(|_| first),
@@ -2574,7 +2586,7 @@ impl Ui {
                             ui.replies.borrow_mut().remove(&chat);
                         }
                         if ui.selection.get() == Some(chat) {
-                            if ui.composer_text() == original {
+                            if editor_text(&ui.input.buffer()) == original {
                                 ui.input.buffer().set_text("");
                             }
                             if ui.search_anchor.get().is_some() || !ui.loaded.get() {
@@ -2607,7 +2619,7 @@ impl Ui {
         );
     }
 
-    fn edit_message(self: &Rc<Self>, chat: i64, id: i32, initial: &str, retry: bool) {
+    fn edit_message(self: &Rc<Self>, chat: i64, id: i32, initial: FormattedText, retry: bool) {
         let Some(window) = self.window.upgrade() else {
             return;
         };
@@ -2628,8 +2640,9 @@ impl Ui {
             .right_margin(10)
             .build();
         editor.update_property(&[gtk::accessible::Property::Label("Текст сообщения")]);
+        setup_editor(&editor);
         let buffer = editor.buffer();
-        buffer.set_text(initial);
+        set_editor_text(&buffer, &initial);
         let scroll = gtk::ScrolledWindow::builder()
             .child(&editor)
             .min_content_height(96)
@@ -2641,30 +2654,39 @@ impl Ui {
         dialog.set_extra_child(Some(&scroll));
         dialog.set_focus(Some(&editor));
         dialog.set_response_enabled("save", retry);
-        buffer.connect_changed(glib::clone!(
+        let update_save = Rc::new(glib::clone!(
             #[weak]
             dialog,
-            #[strong(rename_to = initial)]
-            initial.to_owned(),
-            move |buffer| {
-                let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
-                let text = text.trim();
+            move |buffer: &gtk::TextBuffer| {
+                let text = editor_text(buffer).trimmed();
                 dialog.set_response_enabled(
                     "save",
-                    !text.is_empty() && (retry || text != initial) && text.chars().count() <= 4096,
+                    !text.text.is_empty()
+                        && (retry || text != initial)
+                        && text.text.chars().count() <= 4096,
                 );
             }
         ));
+        buffer.connect_changed({
+            let update_save = update_save.clone();
+            move |buffer| update_save(buffer)
+        });
+        for signal in ["apply-tag", "remove-tag"] {
+            let update_save = update_save.clone();
+            buffer.connect_local(signal, true, move |values| {
+                if let Ok(buffer) = values[0].get::<gtk::TextBuffer>() {
+                    update_save(&buffer);
+                }
+                None
+            });
+        }
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
             if dialog.choose_future(Some(&window)).await != "save" {
                 return;
             }
             let Some(ui) = weak.upgrade() else { return };
-            let text = buffer
-                .text(&buffer.start_iter(), &buffer.end_iter(), true)
-                .trim()
-                .to_owned();
+            let text = editor_text(&buffer).trimmed();
             if ui.is_demo.get() {
                 ui.apply_text_edit(chat, id, text);
                 return;
@@ -2685,7 +2707,7 @@ impl Ui {
                     }
                     Err(error) => {
                         if ui.selection.get() == Some(chat) {
-                            ui.edit_message(chat, id, &text, true);
+                            ui.edit_message(chat, id, text, true);
                         }
                         ui.toast(&format!("Не удалось сохранить правку. {error}"));
                     }
@@ -2831,13 +2853,15 @@ impl Ui {
         });
     }
 
-    fn apply_text_edit(self: &Rc<Self>, chat: i64, id: i32, text: String) {
+    fn apply_text_edit(self: &Rc<Self>, chat: i64, id: i32, text: FormattedText) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.is_demo.get() {
             let mut demo = self.demo_messages.borrow_mut();
             if let Some(messages) = demo.get_mut(&chat)
                 && let Some(message) = messages.iter_mut().find(|message| message.id == id)
             {
-                message.text.clone_from(&text);
+                message.text.clone_from(&text.text);
+                message.styles.clone_from(&text.spans);
                 message.edited = true;
                 if messages.last().is_some_and(|message| message.id == id)
                     && let Some(chat) = self
@@ -2846,7 +2870,7 @@ impl Ui {
                         .iter_mut()
                         .find(|item| item.id == chat)
                 {
-                    chat.preview.clone_from(&text);
+                    chat.preview.clone_from(&text.text);
                 }
                 self.render_chats();
             }
@@ -2854,7 +2878,8 @@ impl Ui {
         if self.selection.get() == Some(chat)
             && let Some(message) = self.messages.borrow_mut().get_mut(&id)
         {
-            message.text = text;
+            message.text = text.text;
+            message.styles = text.spans;
             message.edited = true;
         }
         if self.selection.get() == Some(chat) {
@@ -3223,9 +3248,12 @@ fn attachment_message_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
     None
 }
 
-fn append_message_text(bubble: &gtk::Box, content: &str) {
-    if !content.is_empty() {
-        let text = label(content, "");
+fn append_message_text(bubble: &gtk::Box, message: &Message) {
+    if !message.text.is_empty() {
+        let text = label(&message.text, "");
+        if !message.styles.is_empty() {
+            text.set_attributes(Some(&message_attributes(&message.styles)));
+        }
         text.set_wrap(true);
         text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         text.set_max_width_chars(64);
