@@ -108,6 +108,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             },
             timestamp: today - 60 * (5 - index as i64),
             text: text.to_owned(),
+            styles: Vec::new(),
             outgoing,
             attachment: attachment.map(str::to_owned),
             photo_preview: (chat == 1 && index == 3) || chat == 3,
