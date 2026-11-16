@@ -177,33 +177,6 @@ fn is_last_message_page(
     messages.is_empty() || (scoped && !reverse && messages[0].id() <= limit)
 }
 
-#[cfg(test)]
-mod pagination_tests {
-    use super::*;
-
-    #[test]
-    fn global_search_continues_after_a_short_page_with_low_chat_local_ids() {
-        let page = [tl::types::MessageEmpty {
-            id: 1,
-            peer_id: None,
-        }
-        .into()];
-        assert!(!is_last_message_page(&page, 100, false, false));
-        assert!(is_last_message_page(&[], 100, false, false));
-    }
-
-    #[test]
-    fn scoped_history_keeps_its_existing_end_condition() {
-        let page = [tl::types::MessageEmpty {
-            id: 1,
-            peer_id: None,
-        }
-        .into()];
-        assert!(is_last_message_page(&page, 100, false, true));
-        assert!(!is_last_message_page(&page, 100, true, true));
-    }
-}
-
 impl<R: tl::RemoteCall<Return = tl::enums::messages::Messages>> IterBuffer<R, Message> {
     /// Fetches the total unless cached.
     ///
@@ -1411,5 +1384,32 @@ impl Client {
             })
             .await?;
         Ok(Media::from_raw(media))
+    }
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn global_search_continues_after_a_short_page_with_low_chat_local_ids() {
+        let page = [tl::types::MessageEmpty {
+            id: 1,
+            peer_id: None,
+        }
+        .into()];
+        assert!(!is_last_message_page(&page, 100, false, false));
+        assert!(is_last_message_page(&[], 100, false, false));
+    }
+
+    #[test]
+    fn scoped_history_keeps_its_existing_end_condition() {
+        let page = [tl::types::MessageEmpty {
+            id: 1,
+            peer_id: None,
+        }
+        .into()];
+        assert!(is_last_message_page(&page, 100, false, true));
+        assert!(!is_last_message_page(&page, 100, true, true));
     }
 }

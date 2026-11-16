@@ -1,6 +1,6 @@
 --- a/src/client/messages.rs
 +++ b/src/client/messages.rs
-@@ -169,0 +170,37 @@
+@@ -169,0 +170,10 @@
 +fn is_last_message_page(
 +    messages: &[tl::enums::Message],
 +    limit: i32,
@@ -10,6 +10,19 @@
 +    // A low ID in one chat says nothing about older results in other chats.
 +    messages.is_empty() || (scoped && !reverse && messages[0].id() <= limit)
 +}
++
+@@ -219,2 +229 @@
+-                self.last_chunk =
+-                    m.messages.is_empty() || (!reverse && m.messages[0].id() <= limit);
++                self.last_chunk = is_last_message_page(&m.messages, limit, reverse, peer.is_some());
+@@ -227,2 +236 @@
+-                self.last_chunk =
+-                    m.messages.is_empty() || (!reverse && m.messages[0].id() <= limit);
++                self.last_chunk = is_last_message_page(&m.messages, limit, reverse, peer.is_some());
+@@ -554 +562 @@
+-            self.request.offset_rate = offset_rate.unwrap_or(0);
++            self.request.offset_rate = offset_rate.unwrap_or_else(|| last.date_timestamp());
+@@ -1380,0 +1389,27 @@
 +
 +#[cfg(test)]
 +mod pagination_tests {
@@ -37,15 +50,3 @@
 +        assert!(!is_last_message_page(&page, 100, true, true));
 +    }
 +}
-+
-@@ -219,2 +256 @@
--                self.last_chunk =
--                    m.messages.is_empty() || (!reverse && m.messages[0].id() <= limit);
-+                self.last_chunk = is_last_message_page(&m.messages, limit, reverse, peer.is_some());
-@@ -227,2 +263 @@
--                self.last_chunk =
--                    m.messages.is_empty() || (!reverse && m.messages[0].id() <= limit);
-+                self.last_chunk = is_last_message_page(&m.messages, limit, reverse, peer.is_some());
-@@ -554 +589 @@
--            self.request.offset_rate = offset_rate.unwrap_or(0);
-+            self.request.offset_rate = offset_rate.unwrap_or_else(|| last.date_timestamp());

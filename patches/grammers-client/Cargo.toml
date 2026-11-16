@@ -46,35 +46,7 @@ proxy = ["grammers-mtsender/proxy"]
 name = "grammers_client"
 path = "src/lib.rs"
 
-[[example]]
-name = "dialogs"
-path = "examples/dialogs.rs"
-required-features = ["grammers-session/sqlite-storage"]
-
-[[example]]
-name = "downloader"
-path = "examples/downloader.rs"
-required-features = ["grammers-session/sqlite-storage"]
-
-[[example]]
-name = "echo"
-path = "examples/echo.rs"
-required-features = ["grammers-session/sqlite-storage"]
-
-[[example]]
-name = "inline-pagination"
-path = "examples/inline-pagination.rs"
-required-features = ["grammers-session/sqlite-storage"]
-
-[[example]]
-name = "ping"
-path = "examples/ping.rs"
-required-features = ["grammers-session/sqlite-storage"]
-
-[[example]]
-name = "send_album"
-path = "examples/send_album.rs"
-required-features = ["grammers-session/sqlite-storage"]
+# Upstream examples require API credentials at compile time and are not workspace targets.
 
 [dependencies.futures-util]
 version = "0.3.34"
@@ -130,17 +102,3 @@ version = "0.1.44"
 [dependencies.url]
 version = "2.5.8"
 optional = true
-
-[dev-dependencies.tokio]
-version = "1.54.1"
-features = ["signal"]
-default-features = false
-
-[dev-dependencies.tracing-subscriber]
-version = "0.3.23"
-features = [
-    "ansi",
-    "fmt",
-    "std",
-]
-default-features = false
