@@ -48,6 +48,7 @@ struct Ui {
     filter: gtk::SearchEntry,
     archive: gtk::ToggleButton,
     archive_chat: gtk::Button,
+    mute_chat: gtk::Button,
     folder_picker: gtk::DropDown,
     content: gtk::Stack,
     title: adw::WindowTitle,
@@ -82,6 +83,8 @@ struct Ui {
     chat_refresh: Cell<bool>,
     chat_refresh_pending: Cell<bool>,
     moving_chats: RefCell<HashSet<i64>>,
+    muting_chats: RefCell<HashSet<i64>>,
+    chat_settings_revision: Cell<u64>,
     history_refresh: Cell<bool>,
     latest_history_pending: Cell<Option<bool>>,
     search_anchor: Cell<Option<i32>>,
@@ -221,6 +224,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let archive_chat = icon_button("folder-symbolic", "Переместить в архив");
     archive_chat.set_visible(false);
     pane_header.pack_end(&archive_chat);
+    let mute_chat = icon_button("notifications-symbolic", "Выключить уведомления");
+    mute_chat.set_visible(false);
+    pane_header.pack_end(&mute_chat);
     pane.add_top_bar(&pane_header);
     let content = gtk::Stack::new();
     let empty = adw::StatusPage::builder()
@@ -340,6 +346,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         filter,
         archive,
         archive_chat,
+        mute_chat,
         folder_picker,
         content,
         title,
@@ -374,6 +381,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         chat_refresh: Cell::new(false),
         chat_refresh_pending: Cell::new(false),
         moving_chats: RefCell::new(HashSet::new()),
+        muting_chats: RefCell::new(HashSet::new()),
+        chat_settings_revision: Cell::new(0),
         history_refresh: Cell::new(false),
         latest_history_pending: Cell::new(None),
         search_anchor: Cell::new(None),
@@ -453,6 +462,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         #[weak]
         ui,
         move |_| ui.move_selected_chat()
+    ));
+    ui.mute_chat.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.toggle_chat_notifications()
     ));
     search_messages.connect_clicked(glib::clone!(
         #[weak]
@@ -907,6 +921,15 @@ impl Ui {
     }
 
     fn notify_message(&self, message: &IncomingMessage) {
+        if self.muting_chats.borrow().contains(&message.chat)
+            || self
+                .chats
+                .borrow()
+                .iter()
+                .any(|chat| chat.id == message.chat && chat.muted)
+        {
+            return;
+        }
         let Some(app) = self
             .window
             .upgrade()
@@ -959,26 +982,31 @@ impl Ui {
             self.chat_refresh_pending.set(true);
             return;
         }
+        let revision = self.chat_settings_revision.get();
         self.job(async move { client.chats().await }, move |ui, result| {
             ui.chat_refresh.set(false);
-            match result {
-                Ok(chats) => {
-                    for chat in chats.iter().filter(|chat| chat.unread == 0 || chat.muted) {
-                        ui.withdraw_chat_notification(chat.id);
-                    }
-                    ui.chats.replace(chats);
-                    ui.render_chats();
-                    if let Some(id) = ui.notification_chat.take() {
-                        if ui.chats.borrow().iter().any(|chat| chat.id == id) {
-                            ui.show_chat(id, None);
-                        } else if ui.chat_refresh_pending.get() {
-                            ui.notification_chat.set(Some(id));
-                        } else {
-                            ui.toast("Чат из уведомления недоступен");
+            if revision != ui.chat_settings_revision.get() {
+                ui.chat_refresh_pending.set(true);
+            } else {
+                match result {
+                    Ok(chats) => {
+                        for chat in chats.iter().filter(|chat| chat.unread == 0 || chat.muted) {
+                            ui.withdraw_chat_notification(chat.id);
+                        }
+                        ui.chats.replace(chats);
+                        ui.render_chats();
+                        if let Some(id) = ui.notification_chat.take() {
+                            if ui.chats.borrow().iter().any(|chat| chat.id == id) {
+                                ui.show_chat(id, None);
+                            } else if ui.chat_refresh_pending.get() {
+                                ui.notification_chat.set(Some(id));
+                            } else {
+                                ui.toast("Чат из уведомления недоступен");
+                            }
                         }
                     }
+                    Err(error) => ui.toast(&format!("Не удалось загрузить чаты. {error}")),
                 }
-                Err(error) => ui.toast(&format!("Не удалось загрузить чаты. {error}")),
             }
             if ui.chat_refresh_pending.replace(false) {
                 ui.refresh_chats();
@@ -1029,6 +1057,7 @@ impl Ui {
 
     fn render_chats(self: &Rc<Self>) {
         self.update_archive_button();
+        self.update_mute_button();
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -1080,7 +1109,17 @@ impl Ui {
             preview.add_css_class("dim-label");
             preview.set_single_line_mode(true);
             preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            description.append(&title);
+            let title_line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            title.set_hexpand(true);
+            title_line.append(&title);
+            if chat.muted {
+                let muted = gtk::Image::from_icon_name("notifications-disabled-symbolic");
+                muted.set_pixel_size(12);
+                muted.add_css_class("dim-label");
+                muted.set_tooltip_text(Some("Уведомления выключены"));
+                title_line.append(&muted);
+            }
+            description.append(&title_line);
             let preview_line = gtk::Box::new(gtk::Orientation::Horizontal, 5);
             if let Some(image) = chat.preview_image {
                 let thumbnail = gtk::Overlay::new();
@@ -1195,6 +1234,8 @@ impl Ui {
     }
 
     fn apply_archive(self: &Rc<Self>, id: i64, archived: bool) {
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
         if let Some(chat) = self
             .chats
             .borrow_mut()
@@ -1212,6 +1253,93 @@ impl Ui {
             "Чат перемещён в архив"
         } else {
             "Чат возвращён из архива"
+        });
+    }
+
+    fn update_mute_button(&self) {
+        let chats = self.chats.borrow();
+        let chat = self.selection.get().and_then(|id| {
+            chats
+                .iter()
+                .find(|chat| chat.id == id && !chat.saved_messages)
+        });
+        self.mute_chat.set_visible(chat.is_some());
+        if let Some(chat) = chat {
+            let (icon, title) = if chat.muted {
+                ("notifications-disabled-symbolic", "Включить уведомления")
+            } else {
+                ("notifications-symbolic", "Выключить уведомления")
+            };
+            self.mute_chat.set_icon_name(icon);
+            self.mute_chat.set_tooltip_text(Some(title));
+            self.mute_chat
+                .update_property(&[gtk::accessible::Property::Label(title)]);
+            self.mute_chat
+                .set_sensitive(!self.muting_chats.borrow().contains(&chat.id));
+        }
+    }
+
+    fn toggle_chat_notifications(self: &Rc<Self>) {
+        let Some(id) = self.selection.get() else {
+            return;
+        };
+        let Some(muted) = self
+            .chats
+            .borrow()
+            .iter()
+            .find(|chat| chat.id == id && !chat.saved_messages)
+            .map(|chat| !chat.muted)
+        else {
+            return;
+        };
+        if self.is_demo.get() {
+            self.apply_muted(id, muted);
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if !self.muting_chats.borrow_mut().insert(id) {
+            return;
+        }
+        self.update_mute_button();
+        self.job(
+            async move { client.set_muted(id, muted).await },
+            move |ui, result| {
+                ui.muting_chats.borrow_mut().remove(&id);
+                match result {
+                    Ok(()) => {
+                        ui.apply_muted(id, muted);
+                        ui.refresh_chats();
+                    }
+                    Err(error) => {
+                        ui.update_mute_button();
+                        ui.toast(&format!("Не удалось изменить уведомления. {error}"));
+                    }
+                }
+            },
+        );
+    }
+
+    fn apply_muted(self: &Rc<Self>, id: i64, muted: bool) {
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|chat| chat.id == id)
+        {
+            chat.muted = muted;
+        }
+        if muted {
+            self.withdraw_chat_notification(id);
+        }
+        self.render_chats();
+        self.toast(if muted {
+            "Уведомления чата выключены"
+        } else {
+            "Уведомления чата включены"
         });
     }
 
@@ -1449,6 +1577,7 @@ impl Ui {
             }
         }
         self.update_archive_button();
+        self.update_mute_button();
         self.message_menu.popdown();
         self.generation.set(self.generation.get().wrapping_add(1));
         self.search_anchor.set(anchor);

@@ -53,12 +53,21 @@ pub fn chats() -> Vec<Chat> {
 }
 
 pub fn folders() -> Vec<ChatFolder> {
-    vec![ChatFolder {
-        id: 2,
-        title: "Команда".into(),
-        kinds: vec![ChatKind::Group],
-        ..ChatFolder::default()
-    }]
+    vec![
+        ChatFolder {
+            id: 2,
+            title: "Команда".into(),
+            kinds: vec![ChatKind::Group],
+            ..ChatFolder::default()
+        },
+        ChatFolder {
+            id: 3,
+            title: "С уведомлениями".into(),
+            kinds: vec![ChatKind::Group, ChatKind::User, ChatKind::Broadcast],
+            exclude_muted: true,
+            ..ChatFolder::default()
+        },
+    ]
 }
 
 pub fn history(chat: i64) -> Vec<Message> {

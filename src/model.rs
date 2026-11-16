@@ -28,7 +28,7 @@ pub struct Chat {
     pub avatar: Option<Avatar>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatKind {
     Contact,
     User,
