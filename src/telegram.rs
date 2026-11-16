@@ -366,6 +366,7 @@ impl Telegram {
         let now = SystemTime::now();
         let mut chats = Vec::new();
         let mut peers = HashMap::new();
+        let mut notify_defaults = HashMap::new();
         let mut dialogs = self.client.iter_dialogs().limit(150);
         while let Some(dialog) = dialogs.next().await? {
             let Some(id) = dialog.peer_id().bot_api_dialog_id() else {
@@ -384,6 +385,21 @@ impl Telegram {
             };
             let group = matches!(peer, Peer::Group(_) | Peer::Community(_));
             let last = dialog.last_message.as_ref();
+            let kind = chat_kind(peer);
+            let enums::PeerNotifySettings::Settings(settings) = &raw.notify_settings;
+            let mute_until = match settings.mute_until {
+                Some(until) => until,
+                None => {
+                    let category = notification_category(kind);
+                    if let Some(until) = notify_defaults.get(&category) {
+                        *until
+                    } else {
+                        let until = self.default_mute_until(category).await?;
+                        notify_defaults.insert(category, until);
+                        until
+                    }
+                }
+            };
             chats.push(Chat {
                 id,
                 title: title.to_owned(),
@@ -408,12 +424,8 @@ impl Telegram {
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
                 avatar: peer_avatar(peer),
                 archived: raw.folder_id == Some(1),
-                kind: chat_kind(peer),
-                muted: match &raw.notify_settings {
-                    enums::PeerNotifySettings::Settings(settings) => settings
-                        .mute_until
-                        .is_some_and(|until| is_muted(until, now)),
-                },
+                kind,
+                muted: is_muted(mute_until, now),
             });
             peers.insert(id, dialog.peer_ref());
         }
@@ -443,22 +455,47 @@ impl Telegram {
             .await?;
         let mute_until = match settings.mute_until {
             Some(until) => until,
-            None => {
-                let category = match kind {
-                    ChatKind::Group => enums::InputNotifyPeer::InputNotifyChats,
-                    ChatKind::Broadcast => enums::InputNotifyPeer::InputNotifyBroadcasts,
-                    ChatKind::Contact | ChatKind::User | ChatKind::Bot => {
-                        enums::InputNotifyPeer::InputNotifyUsers
-                    }
-                };
-                let enums::PeerNotifySettings::Settings(defaults) = self
-                    .client
-                    .invoke(&GetNotifySettings { peer: category })
-                    .await?;
-                defaults.mute_until.unwrap_or_default()
-            }
+            None => self.default_mute_until(kind).await?,
         };
         Ok(!is_muted(mute_until, SystemTime::now()))
+    }
+
+    async fn default_mute_until(&self, kind: ChatKind) -> Result<i32> {
+        let peer = match notification_category(kind) {
+            ChatKind::Group => enums::InputNotifyPeer::InputNotifyChats,
+            ChatKind::Broadcast => enums::InputNotifyPeer::InputNotifyBroadcasts,
+            _ => enums::InputNotifyPeer::InputNotifyUsers,
+        };
+        let enums::PeerNotifySettings::Settings(settings) = self
+            .client
+            .invoke(&grammers_client::tl::functions::account::GetNotifySettings { peer })
+            .await?;
+        Ok(settings.mute_until.unwrap_or_default())
+    }
+
+    pub async fn set_muted(&self, chat: i64, muted: bool) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        let notify_peer =
+            enums::InputNotifyPeer::from(types::InputNotifyPeer { peer: peer.into() });
+        let enums::PeerNotifySettings::Settings(settings) = self
+            .client
+            .invoke(
+                &grammers_client::tl::functions::account::GetNotifySettings {
+                    peer: notify_peer.clone(),
+                },
+            )
+            .await?;
+        let updated = self
+            .client
+            .invoke(
+                &grammers_client::tl::functions::account::UpdateNotifySettings {
+                    peer: notify_peer,
+                    settings: notification_settings(settings, muted).into(),
+                },
+            )
+            .await?;
+        ensure!(updated, "Telegram не подтвердил изменение уведомлений");
+        Ok(())
     }
 
     pub async fn folders(&self) -> Result<Vec<ChatFolder>> {
@@ -1572,6 +1609,28 @@ fn message_text(message: &TelegramMessage) -> String {
     }
 }
 
+fn notification_category(kind: ChatKind) -> ChatKind {
+    match kind {
+        ChatKind::Contact | ChatKind::Bot => ChatKind::User,
+        _ => kind,
+    }
+}
+
+fn notification_settings(
+    settings: types::PeerNotifySettings,
+    muted: bool,
+) -> types::InputPeerNotifySettings {
+    types::InputPeerNotifySettings {
+        show_previews: settings.show_previews,
+        silent: settings.silent,
+        mute_until: Some(if muted { i32::MAX } else { 0 }),
+        sound: settings.other_sound,
+        stories_muted: settings.stories_muted,
+        stories_hide_sender: settings.stories_hide_sender,
+        stories_sound: settings.stories_other_sound,
+    }
+}
+
 fn is_muted(until: i32, now: SystemTime) -> bool {
     u64::try_from(until)
         .is_ok_and(|until| until > now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
@@ -1733,6 +1792,39 @@ mod tests {
         assert!(!is_muted(1_000, now));
         assert!(!is_muted(0, now));
         assert!(!is_muted(-1, now));
+    }
+
+    #[test]
+    fn changing_mute_preserves_custom_notification_and_story_settings() {
+        let settings = types::PeerNotifySettings {
+            show_previews: Some(false),
+            silent: Some(true),
+            mute_until: None,
+            ios_sound: None,
+            android_sound: None,
+            other_sound: Some(enums::NotificationSound::None),
+            stories_muted: Some(true),
+            stories_hide_sender: Some(true),
+            stories_ios_sound: None,
+            stories_android_sound: None,
+            stories_other_sound: Some(enums::NotificationSound::Default),
+        };
+        for muted in [true, false] {
+            let updated = notification_settings(settings.clone(), muted);
+            assert_eq!(updated.show_previews, settings.show_previews);
+            assert_eq!(updated.silent, settings.silent);
+            assert_eq!(updated.sound, settings.other_sound);
+            assert_eq!(updated.stories_muted, settings.stories_muted);
+            assert_eq!(updated.stories_hide_sender, settings.stories_hide_sender);
+            assert_eq!(updated.stories_sound, settings.stories_other_sound);
+            assert_eq!(
+                is_muted(
+                    updated.mute_until.unwrap(),
+                    UNIX_EPOCH + Duration::from_secs(1_000)
+                ),
+                muted
+            );
+        }
     }
 
     #[test]
