@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gtk::glib;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
@@ -53,6 +53,8 @@ struct Ui {
     folder_picker: gtk::DropDown,
     content: gtk::Stack,
     title: adw::WindowTitle,
+    profile_button: gtk::Button,
+    profile_dialog: glib::WeakRef<adw::Dialog>,
     history: gtk::Box,
     message_menu: gtk::Popover,
     menu_message: Cell<Option<i32>>,
@@ -222,7 +224,14 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let pane = adw::ToolbarView::new();
     let pane_header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Чаты", "");
-    pane_header.set_title_widget(Some(&title));
+    let profile_button = gtk::Button::builder()
+        .child(&title)
+        .tooltip_text("Информация о чате")
+        .sensitive(false)
+        .build();
+    profile_button.add_css_class("flat");
+    profile_button.update_property(&[gtk::accessible::Property::Label("Информация о чате")]);
+    pane_header.set_title_widget(Some(&profile_button));
     let archive_chat = icon_button("folder-symbolic", "Переместить в архив");
     archive_chat.set_visible(false);
     pane_header.pack_end(&archive_chat);
@@ -359,6 +368,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         folder_picker,
         content,
         title,
+        profile_button,
+        profile_dialog: glib::WeakRef::new(),
         history,
         message_menu,
         menu_message: Cell::new(None),
@@ -487,6 +498,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         #[weak]
         ui,
         move |_| ui.open_message_search(true)
+    ));
+    ui.profile_button.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.open_chat_profile()
     ));
     for (name, scoped, accelerator) in [
         ("search-chat", true, "<Primary>f"),
@@ -1374,10 +1390,59 @@ impl Ui {
         });
     }
 
+    fn open_chat_profile(self: &Rc<Self>) {
+        let Some(id) = self.selection.get() else {
+            return;
+        };
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        if self
+            .profile_dialog
+            .upgrade()
+            .is_some_and(|dialog| dialog.is_visible())
+            || self
+                .message_search
+                .upgrade()
+                .is_some_and(|dialog| dialog.is_visible())
+        {
+            return;
+        }
+        let client = self.client.borrow().clone();
+        let demo = self.is_demo.get();
+        let dialog = crate::profile::open(
+            &window,
+            crate::profile::ProfileContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move || {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            demo::peer_profile(id).ok_or_else(|| anyhow::anyhow!("Чат не найден"))
+                        } else {
+                            let client = client.context("Нет подключения к Telegram")?;
+                            client.peer_profile(id).await
+                        }
+                    })
+                }),
+                avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
+                )),
+            },
+        );
+        self.profile_dialog.set(Some(&dialog));
+    }
+
     fn open_message_search(self: &Rc<Self>, scoped: bool) {
         if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
             || self
                 .message_search
+                .upgrade()
+                .is_some_and(|dialog| dialog.is_visible())
+            || self
+                .profile_dialog
                 .upgrade()
                 .is_some_and(|dialog| dialog.is_visible())
         {
@@ -1519,6 +1584,7 @@ impl Ui {
         self.update_archive_button();
         self.update_mute_button();
         self.search_in_chat.set_visible(true);
+        self.profile_button.set_sensitive(true);
         self.message_menu.popdown();
         self.generation.set(self.generation.get().wrapping_add(1));
         self.search_anchor.set(anchor);

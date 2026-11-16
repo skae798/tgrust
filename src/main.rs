@@ -1,6 +1,7 @@
 mod demo;
 mod formatting;
 mod model;
+mod profile;
 mod search;
 mod storage;
 mod telegram;

@@ -1,6 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Message};
+use crate::model::{
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Message, PeerProfile,
+};
 
 pub const OWN_NAME: &str = "Алексей";
 pub const OWN_AVATAR: Avatar = Avatar {
@@ -68,6 +70,45 @@ pub fn folders() -> Vec<ChatFolder> {
             ..ChatFolder::default()
         },
     ]
+}
+
+pub fn peer_profile(id: i64) -> Option<PeerProfile> {
+    let chat = chats().into_iter().find(|chat| chat.id == id)?;
+    Some(PeerProfile {
+        id,
+        title: if chat.saved_messages {
+            OWN_NAME.to_owned()
+        } else {
+            chat.title
+        },
+        kind: chat.kind,
+        is_self: chat.saved_messages,
+        avatar: if chat.saved_messages {
+            Some(OWN_AVATAR)
+        } else {
+            chat.avatar
+        },
+        about: match id {
+            1 => "Обсуждаем макеты, сроки и материалы проекта. Демонстрационная группа.",
+            2 => "Демонстрационные данные аккаунта.",
+            _ => "Объявления и новости проекта. Демонстрационный канал.",
+        }
+        .to_owned(),
+        usernames: vec![
+            match id {
+                1 => "@demo_tgrust_team",
+                2 => "@demo_tgrust_account",
+                _ => "@demo_tgrust_news",
+            }
+            .to_owned(),
+        ],
+        phone: chat.saved_messages.then(|| "+00000000000".to_owned()),
+        members: (id != 2).then_some(if id == 1 { 8 } else { 120 }),
+        online_members: (id == 1).then_some(2),
+        verified: id == 3,
+        scam: false,
+        fake: false,
+    })
 }
 
 pub fn history(chat: i64) -> Vec<Message> {

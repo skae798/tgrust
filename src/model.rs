@@ -37,6 +37,23 @@ pub enum ChatKind {
     Bot,
 }
 
+#[derive(Clone)]
+pub struct PeerProfile {
+    pub id: i64,
+    pub title: String,
+    pub kind: ChatKind,
+    pub is_self: bool,
+    pub avatar: Option<Avatar>,
+    pub about: String,
+    pub usernames: Vec<String>,
+    pub phone: Option<String>,
+    pub members: Option<u32>,
+    pub online_members: Option<u32>,
+    pub verified: bool,
+    pub scam: bool,
+    pub fake: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct ChatFolder {
     pub id: i32,
