@@ -44,7 +44,7 @@ struct SearchDialog {
     closed: Cell<bool>,
 }
 
-pub fn open(window: &adw::ApplicationWindow, context: SearchContext, scoped: bool) {
+pub fn open(window: &adw::ApplicationWindow, context: SearchContext, scoped: bool) -> adw::Dialog {
     let dialog = adw::Dialog::builder()
         .title("Поиск по сообщениям")
         .content_width(520)
@@ -164,6 +164,7 @@ pub fn open(window: &adw::ApplicationWindow, context: SearchContext, scoped: boo
         state.reset();
     });
     dialog.present(Some(window));
+    dialog
 }
 
 impl SearchDialog {

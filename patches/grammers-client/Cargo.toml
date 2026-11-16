@@ -76,10 +76,6 @@ name = "send_album"
 path = "examples/send_album.rs"
 required-features = ["grammers-session/sqlite-storage"]
 
-[[test]]
-name = "deps"
-path = "tests/deps.rs"
-
 [dependencies.futures-util]
 version = "0.3.34"
 features = ["alloc"]
@@ -139,9 +135,6 @@ optional = true
 version = "1.54.1"
 features = ["signal"]
 default-features = false
-
-[dev-dependencies.toml]
-version = "1.2.1"
 
 [dev-dependencies.tracing-subscriber]
 version = "0.3.23"

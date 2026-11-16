@@ -776,7 +776,6 @@ dependencies = [
  "pin-project-lite",
  "pulldown-cmark",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
  "url",

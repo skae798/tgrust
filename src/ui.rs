@@ -77,6 +77,7 @@ struct Ui {
     folders_generation: Cell<u64>,
     updating_folders: Cell<bool>,
     search_chat: RefCell<Option<Chat>>,
+    message_search: glib::WeakRef<adw::Dialog>,
     selection: Cell<Option<i64>>,
     notification_chat: Cell<Option<i64>>,
     notified_messages: RefCell<HashMap<i64, i32>>,
@@ -225,7 +226,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let archive_chat = icon_button("folder-symbolic", "Переместить в архив");
     archive_chat.set_visible(false);
     pane_header.pack_end(&archive_chat);
-    let mute_chat = icon_button("notifications-symbolic", "Выключить уведомления");
+    let mute_chat = icon_button(
+        "preferences-system-notifications-symbolic",
+        "Выключить уведомления",
+    );
     mute_chat.set_visible(false);
     pane_header.pack_end(&mute_chat);
     let search_in_chat = icon_button("system-search-symbolic", "Поиск в чате");
@@ -379,6 +383,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         folders_generation: Cell::new(0),
         updating_folders: Cell::new(false),
         search_chat: RefCell::new(None),
+        message_search: glib::WeakRef::new(),
         selection: Cell::new(None),
         notification_chat: Cell::new(None),
         notified_messages: RefCell::new(HashMap::new()),
@@ -1291,7 +1296,10 @@ impl Ui {
             let (icon, title) = if chat.muted {
                 ("notifications-disabled-symbolic", "Включить уведомления")
             } else {
-                ("notifications-symbolic", "Выключить уведомления")
+                (
+                    "preferences-system-notifications-symbolic",
+                    "Выключить уведомления",
+                )
             };
             self.mute_chat.set_icon_name(icon);
             self.mute_chat.set_tooltip_text(Some(title));
@@ -1367,6 +1375,14 @@ impl Ui {
     }
 
     fn open_message_search(self: &Rc<Self>, scoped: bool) {
+        if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
+            || self
+                .message_search
+                .upgrade()
+                .is_some_and(|dialog| dialog.is_visible())
+        {
+            return;
+        }
         let Some(window) = self.window.upgrade() else {
             return;
         };
@@ -1406,7 +1422,7 @@ impl Ui {
         } else {
             Vec::new()
         };
-        crate::search::open(
+        let dialog = crate::search::open(
             &window,
             crate::search::SearchContext {
                 runtime: self.runtime.clone(),
@@ -1425,6 +1441,7 @@ impl Ui {
             },
             scoped,
         );
+        self.message_search.set(Some(&dialog));
     }
 
     fn show_chat(self: &Rc<Self>, id: i64, anchor: Option<i32>) {
