@@ -21,8 +21,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, FormattedText,
-    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
-    ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle,
+    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
+    Reaction, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle,
     UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
@@ -454,6 +454,84 @@ impl Telegram {
             .get(&id)
             .copied()
             .context("Чат не найден")
+    }
+
+    pub async fn peer_profile(&self, id: i64) -> Result<PeerProfile> {
+        let reference = self.peer(id).await?;
+        if reference.id.kind() == PeerKind::User {
+            let enums::users::UserFull::Full(result) = self
+                .client
+                .invoke(&grammers_client::tl::functions::users::GetFullUser {
+                    id: reference.into(),
+                })
+                .await?;
+            let enums::UserFull::Full(full) = result.full_user;
+            ensure!(
+                Some(full.id) == reference.id.bare_id(),
+                "Telegram вернул другой профиль"
+            );
+            let raw = result
+                .users
+                .into_iter()
+                .find(|user| user.id() == full.id)
+                .context("Профиль пользователя недоступен")?;
+            let peer = Peer::User(grammers_client::peer::User::from_raw(&self.client, raw));
+            let mut profile = peer_profile_view(&peer)?;
+            if !matches!(&peer, Peer::User(user) if user.deleted()) {
+                profile.about = full.about.unwrap_or_default();
+            }
+            ensure!(profile.id == id, "Telegram вернул другой профиль");
+            return Ok(profile);
+        }
+        let enums::messages::ChatFull::Full(result) = match reference.id.kind() {
+            PeerKind::Chat => {
+                self.client
+                    .invoke(&grammers_client::tl::functions::messages::GetFullChat {
+                        chat_id: reference.id.bare_id().context("Чат не найден")?,
+                    })
+                    .await?
+            }
+            PeerKind::Channel => {
+                self.client
+                    .invoke(&grammers_client::tl::functions::channels::GetFullChannel {
+                        channel: reference.into(),
+                    })
+                    .await?
+            }
+            PeerKind::User => unreachable!(),
+        };
+        ensure!(
+            Some(result.full_chat.id()) == reference.id.bare_id(),
+            "Telegram вернул другой чат"
+        );
+        let peer = result
+            .chats
+            .into_iter()
+            .map(|chat| Peer::from_raw(&self.client, chat))
+            .find(|peer| peer.id() == reference.id)
+            .context("Информация о чате недоступна")?;
+        let mut profile = peer_profile_view(&peer)?;
+        match result.full_chat {
+            enums::ChatFull::Full(full) => {
+                profile.about = full.about;
+                if let enums::ChatParticipants::Participants(participants) = full.participants {
+                    profile.members = u32::try_from(participants.participants.len()).ok();
+                }
+            }
+            enums::ChatFull::ChannelFull(full) => {
+                profile.about = full.about;
+                profile.members = full
+                    .participants_count
+                    .and_then(|count| u32::try_from(count).ok())
+                    .or(profile.members);
+                profile.online_members = full
+                    .online_count
+                    .and_then(|count| u32::try_from(count).ok());
+            }
+            enums::ChatFull::CommunityFull(full) => profile.about = full.about,
+        }
+        ensure!(profile.id == id, "Telegram вернул другой чат");
+        Ok(profile)
     }
 
     pub async fn notification_enabled(&self, chat: i64, kind: ChatKind) -> Result<bool> {
@@ -1227,6 +1305,92 @@ fn attachment_id(media: &Media) -> Option<AttachmentThumbnail> {
     }
 }
 
+fn public_usernames(primary: Option<&str>, extra: Option<&[enums::Username]>) -> Vec<String> {
+    let mut names = Vec::<String>::new();
+    let extras = extra.into_iter().flatten().filter_map(|name| {
+        let enums::Username::Username(name) = name;
+        name.active.then_some(name.username.as_str())
+    });
+    for name in primary.into_iter().chain(extras) {
+        let name = name.trim().trim_start_matches('@');
+        if !name.is_empty() {
+            let name = format!("@{name}");
+            if !names.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
+    let mut profile = PeerProfile {
+        id: peer.id().bot_api_dialog_id().context("Чат не найден")?,
+        title: peer
+            .name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Без названия")
+            .to_owned(),
+        kind: chat_kind(peer),
+        is_self: false,
+        avatar: peer_avatar(peer),
+        about: String::new(),
+        usernames: Vec::new(),
+        phone: None,
+        members: None,
+        online_members: None,
+        verified: false,
+        scam: false,
+        fake: false,
+    };
+    let channel = match peer {
+        Peer::Channel(channel) => Some(&channel.raw),
+        Peer::Group(group) => match &group.raw {
+            enums::Chat::Channel(channel) => Some(channel),
+            enums::Chat::Chat(chat) => {
+                profile.members = u32::try_from(chat.participants_count).ok();
+                None
+            }
+            _ => None,
+        },
+        Peer::User(user) => {
+            profile.is_self = user.is_self();
+            let name = user.full_name();
+            if !name.is_empty() {
+                profile.title = name;
+            }
+            if user.deleted() {
+                profile.title = "Удалённый аккаунт".to_owned();
+                profile.avatar = None;
+            } else if let enums::User::User(raw) = &user.raw {
+                profile.usernames =
+                    public_usernames(raw.username.as_deref(), raw.usernames.as_deref());
+                profile.phone = raw
+                    .phone
+                    .as_ref()
+                    .filter(|phone| !phone.is_empty())
+                    .cloned();
+                profile.verified = raw.verified;
+                profile.scam = raw.scam;
+                profile.fake = raw.fake;
+            }
+            None
+        }
+        Peer::Community(_) => None,
+    };
+    if let Some(channel) = channel {
+        profile.usernames =
+            public_usernames(channel.username.as_deref(), channel.usernames.as_deref());
+        profile.members = channel
+            .participants_count
+            .and_then(|count| u32::try_from(count).ok());
+        profile.verified = channel.verified;
+        profile.scam = channel.scam;
+        profile.fake = channel.fake;
+    }
+    Ok(profile)
+}
+
 fn peer_avatar(peer: &Peer) -> Option<Avatar> {
     let (photo, dc) = match peer {
         Peer::User(user) => {
@@ -1751,6 +1915,31 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn profile_names_exclude_inactive_aliases_and_deduplicate_case_insensitively() {
+        let alias = |name: &str, active| {
+            types::Username {
+                editable: true,
+                active,
+                deletable: false,
+                expired: false,
+                username: name.to_owned(),
+            }
+            .into()
+        };
+        let names = public_usernames(
+            Some("Demo"),
+            Some(&[
+                alias("demo", true),
+                alias("inactive_demo", false),
+                alias("second_demo", true),
+                alias("", true),
+            ]),
+        );
+        assert_eq!(names, ["@Demo", "@second_demo"]);
+        assert!(public_usernames(None, None).is_empty());
+    }
 
     #[test]
     fn spoiler_entities_round_trip_and_hide_quoted_text() {
