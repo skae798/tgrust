@@ -18,3 +18,11 @@ tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "sync",
 
 [profile.dev]
 debug = 0
+
+[workspace]
+resolver = "3"
+members = ["patches/grammers-client"]
+default-members = ["."]
+
+[patch.crates-io]
+grammers-client = { path = "patches/grammers-client" }

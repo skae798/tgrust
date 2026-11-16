@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -98,9 +98,59 @@ impl ChatImage {
     }
 }
 
+#[derive(Clone)]
 pub struct SearchHit {
     pub chat: Chat,
     pub message: Message,
+}
+
+pub const SEARCH_PAGE_SIZE: usize = 50;
+
+pub struct SearchPage {
+    pub hits: Vec<SearchHit>,
+    pub has_more: bool,
+}
+
+pub struct SearchHandle {
+    pub requests:
+        tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<anyhow::Result<SearchPage>>>,
+}
+
+impl SearchHandle {
+    pub async fn next_page(&self) -> anyhow::Result<SearchPage> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.requests.send(sender).await?;
+        receiver.await?
+    }
+}
+
+#[derive(Default)]
+pub struct SearchBuffer {
+    pending: VecDeque<SearchHit>,
+    seen: HashSet<(i64, i32)>,
+    pub exhausted: bool,
+}
+
+impl SearchBuffer {
+    pub fn push(&mut self, hit: SearchHit) {
+        if self.seen.insert((hit.chat.id, hit.message.id)) {
+            self.pending.push_back(hit);
+        }
+    }
+
+    pub fn needs_more(&self) -> bool {
+        !self.exhausted && self.pending.len() <= SEARCH_PAGE_SIZE
+    }
+
+    pub fn take_page(&mut self) -> SearchPage {
+        SearchPage {
+            hits: self
+                .pending
+                .drain(..self.pending.len().min(SEARCH_PAGE_SIZE))
+                .collect(),
+            has_more: !self.pending.is_empty() || !self.exhausted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -417,6 +467,53 @@ pub fn merge_latest_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_pages_keep_cross_chat_ids_and_skip_repeated_results() {
+        let chat = crate::demo::chats().remove(0);
+        let hit = |chat_id, message_id| SearchHit {
+            chat: Chat {
+                id: chat_id,
+                ..chat.clone()
+            },
+            message: messages(&[message_id]).remove(0),
+        };
+        let mut buffer = SearchBuffer::default();
+        for id in 1..=SEARCH_PAGE_SIZE as i32 {
+            buffer.push(hit(1, id));
+        }
+        buffer.push(hit(1, 1));
+        assert!(buffer.needs_more());
+        buffer.push(hit(2, SEARCH_PAGE_SIZE as i32));
+        assert!(!buffer.needs_more());
+        let first = buffer.take_page();
+        assert_eq!(first.hits.len(), SEARCH_PAGE_SIZE);
+        assert!(first.has_more);
+        // A repeat of a previously delivered result must not reappear on the next page.
+        buffer.push(hit(1, 1));
+        buffer.push(hit(2, SEARCH_PAGE_SIZE as i32));
+        buffer.exhausted = true;
+        let last = buffer.take_page();
+        assert_eq!(last.hits.len(), 1);
+        assert_eq!(last.hits[0].chat.id, 2);
+        assert!(!last.has_more);
+    }
+
+    #[test]
+    fn exact_search_page_does_not_offer_an_empty_next_page() {
+        let chat = crate::demo::chats().remove(0);
+        let mut buffer = SearchBuffer::default();
+        for message in messages(&(1..=SEARCH_PAGE_SIZE as i32).collect::<Vec<_>>()) {
+            buffer.push(SearchHit {
+                chat: chat.clone(),
+                message,
+            });
+        }
+        buffer.exhausted = true;
+        let page = buffer.take_page();
+        assert_eq!(page.hits.len(), SEARCH_PAGE_SIZE);
+        assert!(!page.has_more);
+    }
 
     #[test]
     fn explicit_folder_members_override_categories_and_archive_filter() {

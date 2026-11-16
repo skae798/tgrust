@@ -49,6 +49,7 @@ struct Ui {
     archive: gtk::ToggleButton,
     archive_chat: gtk::Button,
     mute_chat: gtk::Button,
+    search_in_chat: gtk::Button,
     folder_picker: gtk::DropDown,
     content: gtk::Stack,
     title: adw::WindowTitle,
@@ -227,6 +228,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let mute_chat = icon_button("notifications-symbolic", "Выключить уведомления");
     mute_chat.set_visible(false);
     pane_header.pack_end(&mute_chat);
+    let search_in_chat = icon_button("system-search-symbolic", "Поиск в чате");
+    search_in_chat.set_visible(false);
+    pane_header.pack_end(&search_in_chat);
     pane.add_top_bar(&pane_header);
     let content = gtk::Stack::new();
     let empty = adw::StatusPage::builder()
@@ -347,6 +351,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         archive,
         archive_chat,
         mute_chat,
+        search_in_chat,
         folder_picker,
         content,
         title,
@@ -471,8 +476,26 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     search_messages.connect_clicked(glib::clone!(
         #[weak]
         ui,
-        move |_| ui.open_message_search()
+        move |_| ui.open_message_search(false)
     ));
+    ui.search_in_chat.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.open_message_search(true)
+    ));
+    for (name, scoped, accelerator) in [
+        ("search-chat", true, "<Primary>f"),
+        ("search-messages", false, "<Primary><Shift>f"),
+    ] {
+        let action = gtk::gio::SimpleAction::new(name, None);
+        action.connect_activate(glib::clone!(
+            #[weak]
+            ui,
+            move |_, _| ui.open_message_search(scoped)
+        ));
+        window.add_action(&action);
+        app.set_accels_for_action(&format!("win.{name}"), &[accelerator]);
+    }
     ui.latest.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -1343,165 +1366,65 @@ impl Ui {
         });
     }
 
-    fn open_message_search(self: &Rc<Self>) {
+    fn open_message_search(self: &Rc<Self>, scoped: bool) {
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        let dialog = adw::Dialog::builder()
-            .title("Поиск по сообщениям")
-            .content_width(520)
-            .content_height(480)
-            .build();
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        content.set_margin_start(14);
-        content.set_margin_end(14);
-        content.set_margin_top(8);
-        let search = gtk::SearchEntry::builder()
-            .placeholder_text("Текст сообщения")
-            .hexpand(true)
-            .build();
-        let submit = gtk::Button::with_label("Найти");
-        submit.add_css_class("suggested-action");
-        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        bar.append(&search);
-        bar.append(&submit);
-        content.append(&bar);
-        let status = label("", "dim-label");
-        status.set_wrap(true);
-        content.append(&status);
-        let results = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&results)
-            .vexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        content.append(&scroll);
-        toolbar.set_content(Some(&content));
-        dialog.set_child(Some(&toolbar));
-        dialog.set_focus(Some(&search));
-        let generation = Rc::new(Cell::new(0_u64));
-        submit.connect_clicked(glib::clone!(
-            #[weak(rename_to = ui)]
-            self,
-            #[weak]
-            dialog,
-            #[weak]
-            search,
-            #[weak]
-            status,
-            #[weak]
-            results,
-            #[strong]
-            generation,
-            move |_| {
-                let query = search.text().trim().to_owned();
-                if query.is_empty() {
-                    return;
-                }
-                let request = generation.get().wrapping_add(1);
-                generation.set(request);
-                while let Some(child) = results.first_child() {
-                    results.remove(&child);
-                }
-                status.set_text("Поиск…");
-                if ui.is_demo.get() {
-                    let query = query.to_lowercase();
-                    let history = ui.demo_messages.borrow();
-                    let hits = ui
-                        .chats
+        let chat = self.selection.get().and_then(|id| {
+            self.chats
+                .borrow()
+                .iter()
+                .find(|chat| chat.id == id)
+                .cloned()
+                .or_else(|| {
+                    self.search_chat
                         .borrow()
-                        .iter()
-                        .flat_map(|chat| {
-                            history
-                                .get(&chat.id)
-                                .cloned()
-                                .unwrap_or_else(|| demo::history(chat.id))
-                                .into_iter()
-                                .map(move |message| SearchHit {
-                                    chat: chat.clone(),
-                                    message,
-                                })
-                        })
-                        .filter(|hit| hit.message.text.to_lowercase().contains(&query))
-                        .take(50)
-                        .collect();
-                    ui.show_search_results(&dialog, &results, &status, hits);
-                } else if let Some(client) = ui.client.borrow().clone() {
-                    ui.job(
-                        async move { client.search(&query).await },
-                        glib::clone!(
-                            #[weak]
-                            dialog,
-                            #[weak]
-                            status,
-                            #[weak]
-                            results,
-                            #[strong]
-                            generation,
-                            move |ui, result| {
-                                if generation.get() == request {
-                                    match result {
-                                        Ok(hits) => {
-                                            ui.show_search_results(&dialog, &results, &status, hits)
-                                        }
-                                        Err(error) => status.set_text(&format!(
-                                            "Не удалось выполнить поиск. {error}"
-                                        )),
-                                    }
-                                }
-                            }
-                        ),
-                    );
-                }
-            }
-        ));
-        search.connect_activate(glib::clone!(
-            #[weak]
-            submit,
-            move |_| submit.emit_clicked()
-        ));
-        dialog.present(Some(&window));
-    }
-
-    fn show_search_results(
-        self: &Rc<Self>,
-        dialog: &adw::Dialog,
-        results: &gtk::Box,
-        status: &gtk::Label,
-        hits: Vec<SearchHit>,
-    ) {
-        status.set_text(if hits.is_empty() {
-            "Сообщения не найдены"
-        } else {
-            ""
+                        .clone()
+                        .filter(|chat| chat.id == id)
+                })
         });
-        for hit in hits {
-            let button = gtk::Button::new();
-            button.add_css_class("flat");
-            let body = gtk::Box::new(gtk::Orientation::Vertical, 3);
-            let title = label(&hit.chat.title, "heading");
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            let excerpt = label(&hit.message.reply_summary(), "dim-label");
-            excerpt.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            body.append(&title);
-            body.append(&excerpt);
-            button.set_child(Some(&body));
-            button.connect_clicked(glib::clone!(
-                #[weak(rename_to = ui)]
-                self,
-                #[weak]
-                dialog,
-                move |_| {
-                    let chat = hit.chat.id;
-                    ui.search_chat.replace(Some(hit.chat.clone()));
-                    dialog.close();
-                    ui.show_chat(chat, Some(hit.message.id));
-                }
-            ));
-            results.append(&button);
-        }
+        let demo_hits = if self.is_demo.get() {
+            let history = self.demo_messages.borrow();
+            let mut hits: Vec<_> = self
+                .chats
+                .borrow()
+                .iter()
+                .flat_map(|chat| {
+                    history
+                        .get(&chat.id)
+                        .cloned()
+                        .unwrap_or_else(|| demo::history(chat.id))
+                        .into_iter()
+                        .map(move |message| SearchHit {
+                            chat: chat.clone(),
+                            message,
+                        })
+                })
+                .collect();
+            hits.sort_by_key(|hit| std::cmp::Reverse((hit.message.timestamp, hit.message.id)));
+            hits
+        } else {
+            Vec::new()
+        };
+        crate::search::open(
+            &window,
+            crate::search::SearchContext {
+                runtime: self.runtime.clone(),
+                client: self.client.borrow().clone(),
+                demo_hits,
+                chat,
+                selected: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |hit: SearchHit| {
+                        let id = hit.chat.id;
+                        ui.search_chat.replace(Some(hit.chat));
+                        ui.show_chat(id, Some(hit.message.id));
+                    }
+                )),
+            },
+            scoped,
+        );
     }
 
     fn show_chat(self: &Rc<Self>, id: i64, anchor: Option<i32>) {
@@ -1578,6 +1501,7 @@ impl Ui {
         }
         self.update_archive_button();
         self.update_mute_button();
+        self.search_in_chat.set_visible(true);
         self.message_menu.popdown();
         self.generation.set(self.generation.get().wrapping_add(1));
         self.search_anchor.set(anchor);

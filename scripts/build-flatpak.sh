@@ -24,7 +24,7 @@ flock 9
 stage=$(mktemp -d "$cache_dir/source.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -- "$stage/source"
-git -C "$root" archive "$revision" Cargo.toml Cargo.lock LICENSE data src | tar -x -C "$stage/source"
+git -C "$root" archive "$revision" Cargo.toml Cargo.lock LICENSE data src patches | tar -x -C "$stage/source"
 git -C "$root" show "$revision:packaging/flatpak/$app_id.yml" > "$stage/$app_id.yml"
 (
     cd -- "$stage/source"

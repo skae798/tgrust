@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use grammers_client::client::{LoginToken, PasswordToken};
+use grammers_client::client::{GlobalSearchIter, LoginToken, PasswordToken, SearchIter};
 use grammers_client::media::{Downloadable, InputMedia, Media, PhotoSize, Uploaded};
 use grammers_client::message::{InputMessage, Message as TelegramMessage};
 use grammers_client::peer::Peer;
@@ -22,8 +22,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
-    ReplyPreview, SearchHit, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind,
-    redact_spoilers,
+    ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle,
+    UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -55,6 +55,20 @@ pub struct Telegram {
     history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
     profile: OnceCell<Peer>,
+}
+
+enum SearchMessages {
+    Global(GlobalSearchIter),
+    Chat(SearchIter),
+}
+
+impl SearchMessages {
+    async fn next(&mut self) -> Result<Option<TelegramMessage>, InvocationError> {
+        match self {
+            Self::Global(messages) => messages.next().await,
+            Self::Chat(messages) => messages.next().await,
+        }
+    }
 }
 
 impl Telegram {
@@ -546,26 +560,70 @@ impl Telegram {
             .ok()
     }
 
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
+    pub async fn search(self: &Arc<Self>, query: &str, chat: Option<i64>) -> Result<SearchHandle> {
+        let messages = match chat {
+            Some(id) => SearchMessages::Chat(
+                self.client
+                    .search_messages(self.peer(id).await?)
+                    .query(query),
+            ),
+            None => SearchMessages::Global(self.client.search_all_messages().query(query)),
+        };
+        let (requests, mut receiver) =
+            mpsc::channel::<tokio::sync::oneshot::Sender<Result<SearchPage>>>(1);
+        let client = self.clone();
+        tokio::spawn(async move {
+            let mut messages = messages;
+            let mut buffer = SearchBuffer::default();
+            let mut pending = None;
+            while let Some(mut response) = receiver.recv().await {
+                let result = tokio::select! {
+                    _ = response.closed() => break,
+                    result = client.search_page(&mut messages, &mut buffer, &mut pending) => result,
+                };
+                let finished = result.as_ref().is_ok_and(|page| !page.has_more);
+                if response.send(result).is_err() || finished {
+                    break;
+                }
+            }
+        });
+        Ok(SearchHandle { requests })
+    }
+
+    async fn search_page(
+        &self,
+        messages: &mut SearchMessages,
+        buffer: &mut SearchBuffer,
+        pending: &mut Option<TelegramMessage>,
+    ) -> Result<SearchPage> {
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
-        let mut messages = self.client.search_all_messages().query(query).limit(50);
-        let mut hits = Vec::new();
-        let mut peers = HashMap::new();
-        while let Some(message) = messages.next().await? {
+        while buffer.needs_more() {
+            if pending.is_none() {
+                *pending = messages.next().await?;
+            }
+            let Some(message) = pending.as_ref() else {
+                buffer.exhausted = true;
+                break;
+            };
             let Some(id) = message.peer_id().bot_api_dialog_id() else {
+                pending.take();
                 continue;
             };
-            let Some(peer) = message.peer() else { continue };
+            let Some(peer) = message.peer() else {
+                pending.take();
+                continue;
+            };
             let Some(peer_ref) = message
                 .peer_ref()
                 .await
                 .map_err(anyhow::Error::from_boxed)?
             else {
+                pending.take();
                 continue;
             };
-            peers.insert(id, peer_ref);
-            hits.push(SearchHit {
+            self.peers.write().await.insert(id, peer_ref);
+            buffer.push(SearchHit {
                 chat: Chat {
                     id,
                     title: match peer {
@@ -589,11 +647,11 @@ impl Telegram {
                     kind: chat_kind(peer),
                     muted: false,
                 },
-                message: message_view(&message, self_id, profile),
+                message: message_view(message, self_id, profile),
             });
+            pending.take();
         }
-        self.peers.write().await.extend(peers);
-        Ok(hits)
+        Ok(buffer.take_page())
     }
 
     pub async fn history(
