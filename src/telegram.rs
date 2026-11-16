@@ -23,6 +23,7 @@ use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
     ReplyPreview, SearchHit, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind,
+    redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -386,7 +387,12 @@ impl Telegram {
             chats.push(Chat {
                 id,
                 title: title.to_owned(),
-                preview: last.map(preview).unwrap_or_default(),
+                preview: last
+                    .map(|message| {
+                        let text = message_text(message);
+                        redact_spoilers(&text, &message_styles(message)).into_owned()
+                    })
+                    .unwrap_or_default(),
                 preview_sender: if group {
                     last.and_then(|message| preview_sender(message, profile))
                 } else {
@@ -1284,7 +1290,10 @@ fn message_view(
                     .filter(|text| !text.trim().is_empty())
                     .map(|text| ReplyPreview {
                         sender: None,
-                        text: text.clone(),
+                        text: quote_preview(
+                            text,
+                            header.quote_entities.as_deref().unwrap_or_default(),
+                        ),
                     });
                 (id, quote)
             }
@@ -1307,12 +1316,9 @@ fn message_view(
         text: if attachment.is_some() {
             message.text().to_owned()
         } else {
-            preview(message)
+            message_text(message)
         },
-        styles: incoming_styles(
-            message.text(),
-            message.fmt_entities().map_or(&[], Vec::as_slice),
-        ),
+        styles: message_styles(message),
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
@@ -1435,6 +1441,7 @@ fn incoming_styles(text: &str, entities: &[enums::MessageEntity]) -> Vec<TextSpa
                 Entity::Underline(_) => TextStyle::Underline,
                 Entity::Strike(_) => TextStyle::Strike,
                 Entity::Code(_) | Entity::Pre(_) => TextStyle::Code,
+                Entity::Spoiler(_) => TextStyle::Spoiler,
                 _ => return None,
             };
             let start = *boundaries.get(&entity.offset())?;
@@ -1487,6 +1494,7 @@ fn outgoing_entities(formatted: &FormattedText) -> Vec<enums::MessageEntity> {
                 TextStyle::Italic => types::MessageEntityItalic { offset, length }.into(),
                 TextStyle::Underline => types::MessageEntityUnderline { offset, length }.into(),
                 TextStyle::Strike => types::MessageEntityStrike { offset, length }.into(),
+                TextStyle::Spoiler => types::MessageEntitySpoiler { offset, length }.into(),
                 TextStyle::Code => unreachable!("code spans are exclusive"),
             });
         }
@@ -1511,6 +1519,7 @@ fn can_edit_text(message: &TelegramMessage) -> bool {
                     | enums::MessageEntity::Underline(_)
                     | enums::MessageEntity::Strike(_)
                     | enums::MessageEntity::Code(_)
+                    | enums::MessageEntity::Spoiler(_)
                     | enums::MessageEntity::Url(_)
                     | enums::MessageEntity::Email(_)
                     | enums::MessageEntity::Mention(_)
@@ -1540,7 +1549,18 @@ fn thumbnail(media: &Media) -> Option<AttachmentThumbnail> {
     }
 }
 
-fn preview(message: &TelegramMessage) -> String {
+fn quote_preview(text: &str, entities: &[enums::MessageEntity]) -> String {
+    redact_spoilers(text, &incoming_styles(text, entities)).into_owned()
+}
+
+fn message_styles(message: &TelegramMessage) -> Vec<TextSpan> {
+    incoming_styles(
+        message.text(),
+        message.fmt_entities().map_or(&[], Vec::as_slice),
+    )
+}
+
+fn message_text(message: &TelegramMessage) -> String {
     if !message.text().is_empty() {
         message.text().to_owned()
     } else if message.action().is_some() {
@@ -1614,6 +1634,30 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn spoiler_entities_round_trip_and_hide_quoted_text() {
+        let text = "😀видно: тайна.";
+        let start = text.find("тайна").unwrap();
+        let end = start + "тайна".len();
+        let message = FormattedText {
+            text: text.to_owned(),
+            spans: vec![TextSpan {
+                range: start..end,
+                style: TextStyle::Spoiler,
+            }],
+        };
+        let entities = outgoing_entities(&message);
+        assert!(matches!(
+            entities.as_slice(),
+            [enums::MessageEntity::Spoiler(types::MessageEntitySpoiler {
+                offset: 9,
+                length: 5
+            })]
+        ));
+        assert_eq!(incoming_styles(text, &entities), message.spans);
+        assert_eq!(quote_preview(text, &entities), "😀видно: ▰▰▰.");
+    }
 
     #[test]
     fn formatted_entities_use_utf16_and_keep_overlapping_styles() {

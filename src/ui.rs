@@ -12,11 +12,13 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::demo;
-use crate::formatting::{editor_text, message_attributes, set_editor_text, setup_editor};
+use crate::formatting::{
+    concealed_message, editor_text, message_attributes, set_editor_text, setup_editor,
+};
 use crate::model::{
     COMMON_REACTIONS, Chat, ChatFolder, ChatImage, FormattedText, HISTORY_PAGE_SIZE, HistoryCache,
     HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply, SearchHit,
-    UpdateStatus, Upload, UploadKind, merge_latest_history,
+    TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -87,6 +89,7 @@ struct Ui {
     sending: Cell<bool>,
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
+    revealed_spoilers: RefCell<HashMap<i32, FormattedText>>,
     history_cache: RefCell<HistoryCache>,
     history_revision: Cell<HistoryRevision>,
     history_refreshed: Cell<Option<Instant>>,
@@ -378,6 +381,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         sending: Cell::new(false),
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
+        revealed_spoilers: RefCell::new(HashMap::new()),
         history_cache: RefCell::new(HistoryCache::default()),
         history_revision: Cell::new(HistoryRevision::default()),
         history_refreshed: Cell::new(None),
@@ -1455,6 +1459,7 @@ impl Ui {
         self.loaded.set(false);
         self.has_older.set(false);
         self.messages.borrow_mut().clear();
+        self.revealed_spoilers.borrow_mut().clear();
         self.history_refreshed.set(None);
         self.title.set_title(&chat.title);
         self.title
@@ -1727,6 +1732,9 @@ impl Ui {
             self.history.append(&self.older);
         }
         let messages = self.messages.borrow();
+        self.revealed_spoilers
+            .borrow_mut()
+            .retain(|id, _| messages.contains_key(id));
         if messages.is_empty() {
             let text = if self.loaded.get() {
                 "Нет сообщений"
@@ -1837,14 +1845,14 @@ impl Ui {
                     if let Some(item) = captions.next()
                         && captions.next().is_none()
                     {
-                        append_message_text(&bubble, item);
+                        self.append_message_text(&bubble, item);
                     }
                 } else {
                     for item in &group {
                         if let Some(widget) = self.attachment_widget(chat, item, is_album) {
                             bubble.append(&widget);
                         }
-                        append_message_text(&bubble, item);
+                        self.append_message_text(&bubble, item);
                     }
                 }
             }
@@ -2734,7 +2742,7 @@ impl Ui {
             chat.preview = messages
                 .iter()
                 .find(|message| !message.text.is_empty())
-                .map(|message| message.text.clone())
+                .map(|message| message.preview_text().into_owned())
                 .unwrap_or_else(|| "Вложение".into());
             chat.preview_sender = chat.group.then(|| last.sender.clone());
             chat.preview_image = last
@@ -2855,6 +2863,9 @@ impl Ui {
 
     fn apply_text_edit(self: &Rc<Self>, chat: i64, id: i32, text: FormattedText) {
         self.history_cache.borrow_mut().remove(chat);
+        if self.selection.get() == Some(chat) {
+            self.revealed_spoilers.borrow_mut().remove(&id);
+        }
         if self.is_demo.get() {
             let mut demo = self.demo_messages.borrow_mut();
             if let Some(messages) = demo.get_mut(&chat)
@@ -2870,7 +2881,7 @@ impl Ui {
                         .iter_mut()
                         .find(|item| item.id == chat)
                 {
-                    chat.preview.clone_from(&text.text);
+                    chat.preview = redact_spoilers(&text.text, &text.spans).into_owned();
                 }
                 self.render_chats();
             }
@@ -2962,7 +2973,9 @@ impl Ui {
                 .find(|item| item.id == chat)
             {
                 let last = messages.last();
-                chat.preview = last.map(|message| message.text.clone()).unwrap_or_default();
+                chat.preview = last
+                    .map(|message| message.preview_text().into_owned())
+                    .unwrap_or_default();
                 chat.preview_sender = last
                     .filter(|_| chat.group)
                     .map(|message| message.sender.clone());
@@ -3233,6 +3246,56 @@ impl Ui {
         viewer.present();
     }
 
+    fn append_message_text(self: &Rc<Self>, bubble: &gtk::Box, message: &Message) {
+        if message.text.is_empty() {
+            return;
+        }
+        let label = label("", "");
+        let formatted = message.formatted_text();
+        let hidden = formatted
+            .spans
+            .iter()
+            .any(|span| span.style == TextStyle::Spoiler)
+            && self.revealed_spoilers.borrow().get(&message.id) != Some(&formatted);
+        if hidden {
+            concealed_message(&label, &formatted);
+            let id = message.id;
+            let generation = self.generation.get();
+            label.connect_activate_link(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                #[upgrade_or]
+                glib::Propagation::Stop,
+                move |label, _| {
+                    let formatted = formatted.clone();
+                    glib::idle_add_local_once(glib::clone!(
+                        #[weak]
+                        ui,
+                        #[weak]
+                        label,
+                        move || {
+                            if ui.generation.get() == generation && label.is_mapped() {
+                                label.set_text(&formatted.text);
+                                label.set_attributes(Some(&message_attributes(&formatted.spans)));
+                                ui.revealed_spoilers.borrow_mut().insert(id, formatted);
+                            }
+                        }
+                    ));
+                    glib::Propagation::Stop
+                }
+            ));
+        } else {
+            label.set_text(&formatted.text);
+            if !formatted.spans.is_empty() {
+                label.set_attributes(Some(&message_attributes(&formatted.spans)));
+            }
+        }
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_max_width_chars(64);
+        bubble.append(&label);
+    }
+
     fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(message));
     }
@@ -3246,19 +3309,6 @@ fn attachment_message_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
         widget = item.parent();
     }
     None
-}
-
-fn append_message_text(bubble: &gtk::Box, message: &Message) {
-    if !message.text.is_empty() {
-        let text = label(&message.text, "");
-        if !message.styles.is_empty() {
-            text.set_attributes(Some(&message_attributes(&message.styles)));
-        }
-        text.set_wrap(true);
-        text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        text.set_max_width_chars(64);
-        bubble.append(&text);
-    }
 }
 
 fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {

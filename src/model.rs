@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::PathBuf;
@@ -109,6 +110,45 @@ pub enum TextStyle {
     Underline,
     Strike,
     Code,
+    Spoiler,
+}
+
+pub const SPOILER_PLACEHOLDER: &str = "▰▰▰";
+
+pub fn spoiler_ranges(spans: &[TextSpan]) -> Vec<Range<usize>> {
+    let mut ranges: Vec<_> = spans
+        .iter()
+        .filter(|span| span.style == TextStyle::Spoiler)
+        .map(|span| span.range.clone())
+        .collect();
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && last.end >= range.start
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+pub fn redact_spoilers<'a>(text: &'a str, spans: &[TextSpan]) -> Cow<'a, str> {
+    let ranges = spoiler_ranges(spans);
+    if ranges.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut redacted = String::new();
+    let mut end = 0;
+    for range in ranges {
+        redacted.push_str(&text[end..range.start]);
+        redacted.push_str(SPOILER_PLACEHOLDER);
+        end = range.end;
+    }
+    redacted.push_str(&text[end..]);
+    Cow::Owned(redacted)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,7 +244,8 @@ impl Message {
     }
 
     pub fn reply_preview(&self) -> ReplyPreview {
-        let text = self.text.lines().find(|line| !line.trim().is_empty());
+        let preview = self.preview_text();
+        let text = preview.lines().find(|line| !line.trim().is_empty());
         ReplyPreview {
             sender: Some(self.sender.clone()),
             text: text
@@ -215,11 +256,16 @@ impl Message {
     }
 
     pub fn reply_summary(&self) -> String {
-        let text = self.text.lines().find(|line| !line.trim().is_empty());
+        let preview = self.preview_text();
+        let text = preview.lines().find(|line| !line.trim().is_empty());
         match text.or(self.attachment.as_deref()) {
             Some(text) => format!("{} · {text}", self.sender),
             None => self.sender.clone(),
         }
+    }
+
+    pub fn preview_text(&self) -> Cow<'_, str> {
+        redact_spoilers(&self.text, &self.styles)
     }
 }
 
