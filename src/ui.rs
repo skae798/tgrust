@@ -17,9 +17,9 @@ use crate::formatting::{
 };
 use crate::model::{
     COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText, HISTORY_PAGE_SIZE,
-    HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply,
-    SearchHit, TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats,
-    redact_spoilers,
+    HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
+    ReadRequest, Reply, SearchHit, TextStyle, UpdateStatus, Upload, UploadKind,
+    merge_latest_history, order_chats, redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -50,6 +50,8 @@ struct Ui {
     menu_chat: Cell<Option<i64>>,
     restore_chat_focus: Cell<bool>,
     pinning_chats: RefCell<HashSet<i64>>,
+    reading_chats: RefCell<HashSet<i64>>,
+    unread_overrides: RefCell<HashSet<i64>>,
     filter: gtk::SearchEntry,
     archive: gtk::ToggleButton,
     archive_chat: gtk::Button,
@@ -377,6 +379,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         menu_chat: Cell::new(None),
         restore_chat_focus: Cell::new(false),
         pinning_chats: RefCell::new(HashSet::new()),
+        reading_chats: RefCell::new(HashSet::new()),
+        unread_overrides: RefCell::new(HashSet::new()),
         filter,
         archive,
         archive_chat,
@@ -795,6 +799,8 @@ impl Ui {
                     }
                     match result {
                         Ok((client, step)) => {
+                            ui.unread_overrides.borrow_mut().clear();
+                            ui.reading_chats.borrow_mut().clear();
                             ui.client.replace(Some(client));
                             ui.show_step(step);
                         }
@@ -918,6 +924,8 @@ impl Ui {
 
     fn start_demo(self: &Rc<Self>) {
         self.is_demo.set(true);
+        self.unread_overrides.borrow_mut().clear();
+        self.reading_chats.borrow_mut().clear();
         self.client.replace(None);
         self.root.set_visible_child_name("chats");
         self.chats.replace(demo::chats());
@@ -1261,8 +1269,18 @@ impl Ui {
             preview_line.append(&preview);
             description.append(&preview_line);
             line.append(&description);
-            if chat.unread > 0 {
-                let unread = label(&chat.unread.to_string(), "unread-count");
+            if chat.is_unread() {
+                let value = if chat.unread > 0 {
+                    chat.unread.to_string()
+                } else {
+                    "●".into()
+                };
+                let unread = label(&value, "unread-count");
+                unread.update_property(&[gtk::accessible::Property::Label(if chat.unread > 0 {
+                    "Непрочитанные сообщения"
+                } else {
+                    "Отмечен непрочитанным"
+                })]);
                 unread.set_valign(gtk::Align::Center);
                 line.append(&unread);
             }
@@ -1340,15 +1358,19 @@ impl Ui {
         let folder = (!self.archive.is_active())
             .then(|| self.selected_folder())
             .flatten();
-        let Some(pinned) = self
+        let Some((pinned, unread, through)) = self
             .chats
             .borrow()
             .iter()
             .find(|chat| chat.id == id)
             .map(|chat| {
-                folder
-                    .as_ref()
-                    .map_or(chat.pinned, |folder| folder.pinned.contains(&id))
+                (
+                    folder
+                        .as_ref()
+                        .map_or(chat.pinned, |folder| folder.pinned.contains(&id)),
+                    chat.is_unread(),
+                    chat.last_message_id,
+                )
             })
         else {
             return;
@@ -1379,7 +1401,24 @@ impl Ui {
             }
         ));
         menu.append(&pin);
-        menu.set_sensitive(!self.pinning_chats.borrow().contains(&id));
+        pin.set_sensitive(!self.pinning_chats.borrow().contains(&id));
+        let read = gtk::Button::with_label(if unread {
+            "Отметить прочитанным"
+        } else {
+            "Отметить непрочитанным"
+        });
+        read.add_css_class("flat");
+        read.set_sensitive(!self.reading_chats.borrow().contains(&id));
+        read.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.restore_chat_focus.set(true);
+                ui.chat_menu.popdown();
+                ui.change_dialog_unread(id, !unread, through);
+            }
+        ));
+        menu.append(&read);
         self.restore_chat_focus.set(false);
         self.menu_chat.set(Some(id));
         self.chat_menu.set_child(Some(&menu));
@@ -1391,7 +1430,7 @@ impl Ui {
                 1,
             )));
         self.chat_menu.popup();
-        self.chat_menu.child_focus(gtk::DirectionType::TabForward);
+        pin.grab_focus();
     }
 
     fn pin_chat(self: &Rc<Self>, id: i64, pinned: bool, folder: Option<i32>) {
@@ -1845,6 +1884,12 @@ impl Ui {
             .set_subtitle(if chat.broadcast { "Канал" } else { "" });
         self.split.set_show_content(true);
         let client = self.client.borrow().clone();
+        if self.unread_overrides.borrow_mut().remove(&id)
+            && let Some(client) = &client
+        {
+            client.begin_read_change(id);
+        }
+
         let revision = client
             .as_ref()
             .map_or_else(HistoryRevision::default, |client| {
@@ -1948,6 +1993,7 @@ impl Ui {
                 .find(|chat| chat.id == id)
             {
                 chat.unread = 0;
+                chat.unread_mark = false;
             }
             self.loaded.set(true);
             self.has_older.set(has_older);
@@ -1964,25 +2010,128 @@ impl Ui {
         }
     }
 
+    fn read_request(&self, id: i64) -> Option<ReadRequest> {
+        if self.unread_overrides.borrow().contains(&id) {
+            return None;
+        }
+        self.client.borrow().as_ref().map(|client| ReadRequest {
+            revision: client.read_revision(id),
+            clear_mark: self.reading_chats.borrow().contains(&id)
+                || self
+                    .chats
+                    .borrow()
+                    .iter()
+                    .any(|chat| chat.id == id && chat.unread_mark),
+        })
+    }
+
     fn mark_cached_read(self: &Rc<Self>, chat: &Chat) {
-        if chat.unread == 0 {
+        if (!chat.is_unread() && !self.reading_chats.borrow().contains(&chat.id))
+            || self.unread_overrides.borrow().contains(&chat.id)
+        {
+            return;
+        }
+        if self.is_demo.get() {
+            self.apply_dialog_read(chat.id, false, chat.last_message_id);
             return;
         }
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
-        let Some((&max_id, _)) = self.messages.borrow().last_key_value() else {
+        let Some(read) = self.read_request(chat.id) else {
             return;
         };
+        let max_id = self
+            .messages
+            .borrow()
+            .last_key_value()
+            .map_or(0, |(&id, _)| id);
         let id = chat.id;
         self.job(
-            async move { client.mark_read_through(id, max_id).await },
+            async move { client.mark_read_through(id, max_id, read).await },
             |ui, result| {
-                if result.is_ok() {
+                if matches!(result, Ok(true)) {
                     ui.refresh_chats();
                 }
             },
         );
+    }
+
+    fn change_dialog_unread(self: &Rc<Self>, id: i64, unread: bool, through: i32) {
+        if self.reading_chats.borrow().contains(&id) {
+            return;
+        }
+        self.unread_overrides.borrow_mut().insert(id);
+        if self.is_demo.get() {
+            self.apply_dialog_read(id, unread, through);
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let revision = client.begin_read_change(id);
+        let owner = Arc::downgrade(&client);
+        self.reading_chats.borrow_mut().insert(id);
+        self.job(
+            async move {
+                client
+                    .set_dialog_unread(id, unread, through, revision)
+                    .await
+            },
+            move |ui, result| {
+                let owner_matches = owner.upgrade().is_some_and(|owner| {
+                    ui.client
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|client| Arc::ptr_eq(&owner, client))
+                });
+                if !owner_matches {
+                    return;
+                }
+                ui.reading_chats.borrow_mut().remove(&id);
+                let current = ui
+                    .client
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|client| client.read_revision(id) == revision);
+                if current {
+                    match result {
+                        Ok(true) => ui.apply_dialog_read(id, unread, through),
+                        Ok(false) => {}
+                        Err(error) => {
+                            ui.toast(&format!("Не удалось изменить отметку чата. {error}"))
+                        }
+                    }
+                }
+                ui.refresh_chats();
+            },
+        );
+    }
+
+    fn apply_dialog_read(self: &Rc<Self>, id: i64, unread: bool, through: i32) {
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
+        if !unread {
+            self.unread_overrides.borrow_mut().remove(&id);
+        }
+        let mut withdraw = false;
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|chat| chat.id == id)
+        {
+            if unread {
+                chat.unread_mark = true;
+            } else {
+                chat.read_through(through);
+            }
+            withdraw = !chat.is_unread();
+        }
+        if withdraw {
+            self.withdraw_chat_notification(id);
+        }
+        self.render_chats();
     }
 
     fn demo_history(
@@ -2073,7 +2222,8 @@ impl Ui {
             .chats
             .borrow()
             .iter()
-            .any(|chat| chat.id == id && chat.unread > 0);
+            .any(|chat| chat.id == id && chat.is_unread());
+        let read = mark_read.then(|| self.read_request(id)).flatten();
         self.job(
             async move {
                 if let Some(page) = demo_page {
@@ -2086,7 +2236,7 @@ impl Ui {
                     let (messages, older) = client.history_around(id, anchor).await?;
                     Ok((messages, older, false))
                 } else {
-                    client.history(id, before, mark_read).await
+                    client.history(id, before, read).await
                 }
             },
             move |ui, result| {
@@ -3193,6 +3343,7 @@ impl Ui {
                 .map(|message| message.preview_text().into_owned())
                 .unwrap_or_else(|| "Вложение".into());
             chat.last_activity = last.timestamp;
+            chat.last_message_id = last.id;
             chat.preview_sender = chat.group.then(|| last.sender.clone());
             chat.preview_image = last
                 .thumbnail

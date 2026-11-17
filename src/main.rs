@@ -3,6 +3,7 @@ mod demo;
 mod formatting;
 mod model;
 mod profile;
+mod read_state;
 mod search;
 mod storage;
 mod telegram;
