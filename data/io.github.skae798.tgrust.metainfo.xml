@@ -7,8 +7,8 @@
   <summary>Unofficial Telegram client for GNOME</summary>
   <summary xml:lang="ru">Неофициальный клиент Telegram для GNOME</summary>
   <description>
-    <p>Read and send Telegram messages in a native GNOME interface. Search conversations, view photo albums, and save attachments through the system file chooser.</p>
-    <p xml:lang="ru">Читайте и отправляйте сообщения Telegram в интерфейсе GNOME. Ищите переписку, просматривайте фотоальбомы и сохраняйте вложения через системный диалог.</p>
+    <p>Read and send Telegram messages in a native GNOME interface. Search conversations, view photo albums, play video and audio, and save attachments through the system file chooser.</p>
+    <p xml:lang="ru">Читайте и отправляйте сообщения Telegram в интерфейсе GNOME. Ищите переписку, просматривайте фотоальбомы, воспроизводите видео и аудио и сохраняйте вложения через системный диалог.</p>
   </description>
   <launchable type="desktop-id">io.github.skae798.tgrust.desktop</launchable>
   <url type="homepage">https://github.com/skae798/tgrust</url>

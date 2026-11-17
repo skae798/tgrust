@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, Message,
-    PeerProfile,
+    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -23,6 +23,7 @@ pub fn chats() -> Vec<Chat> {
         (1, "Дизайн-команда", "Пробный кадр", 3, false),
         (2, "Избранное", "Проверить сборку на ноутбуке", 0, false),
         (3, "Новости проекта", "Опубликован план на неделю", 0, true),
+        (5, "Демомедиа", "Видео и аудио", 0, false),
     ]
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
@@ -198,6 +199,10 @@ pub fn history(chat: i64) -> Vec<Message> {
             ("Анна", "Сохранённая заметка", false, None),
         ],
         3 => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
+        5 => vec![
+            ("Анна", "", false, Some("demo-audio.wav")),
+            (OWN_NAME, "", true, Some("demo-video.webm")),
+        ],
         _ => Vec::new(),
     };
     let mut messages: Vec<_> = samples
@@ -220,9 +225,20 @@ pub fn history(chat: i64) -> Vec<Message> {
             styles: Vec::new(),
             outgoing,
             attachment: attachment.map(str::to_owned),
+            playback: (chat == 5).then_some(if index == 0 {
+                PlayableMedia::Audio
+            } else {
+                PlayableMedia::Video {
+                    width: 960,
+                    height: 540,
+                }
+            }),
             photo_preview: (chat == 1 && index == 3) || chat == 3,
-            thumbnail: ((chat == 1 && index == 3) || chat == 3)
-                .then_some(AttachmentThumbnail::Photo(chat)),
+            thumbnail: if chat == 5 && index == 1 {
+                Some(AttachmentThumbnail::Document(5))
+            } else {
+                ((chat == 1 && index == 3) || chat == 3).then_some(AttachmentThumbnail::Photo(chat))
+            },
             reply_to: (chat == 1 && index == 1).then_some(81),
             reply_preview: None,
             can_reply: true,
@@ -274,4 +290,25 @@ pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs() as i64)
+}
+
+pub async fn playback_preview(
+    media: PlayableMedia,
+    progress: tokio::sync::watch::Sender<PlaybackProgress>,
+) -> anyhow::Result<PlaybackFile> {
+    let bytes: &[u8] = match media {
+        PlayableMedia::Audio => include_bytes!("../data/demo-audio.wav"),
+        PlayableMedia::Video { .. } => include_bytes!("../data/demo-video.webm"),
+    };
+    let mut output = crate::storage::PlaybackDownload::new(bytes.len() as u64)?;
+    progress.send_replace(PlaybackProgress {
+        received: 0,
+        total: bytes.len() as u64,
+    });
+    output.write(bytes).await?;
+    progress.send_replace(PlaybackProgress {
+        received: bytes.len() as u64,
+        total: bytes.len() as u64,
+    });
+    output.finish(media).await
 }

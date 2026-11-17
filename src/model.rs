@@ -361,6 +361,54 @@ impl FormattedText {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayableMedia {
+    Video { width: i32, height: i32 },
+    Audio,
+}
+
+impl PlayableMedia {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Video { .. } => "Видео",
+            Self::Audio => "Аудио",
+        }
+    }
+
+    pub fn open_label(self) -> &'static str {
+        match self {
+            Self::Video { .. } => "Открыть видео",
+            Self::Audio => "Открыть аудио",
+        }
+    }
+
+    pub fn dimensions(self) -> (i32, i32) {
+        match self {
+            Self::Video { width, height } if width > 0 && height > 0 => (width, height),
+            Self::Video { .. } => (640, 360),
+            Self::Audio => (360, 96),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct PlaybackProgress {
+    pub received: u64,
+    pub total: u64,
+}
+
+pub struct PlaybackFile {
+    pub file: std::fs::File,
+    pub media: PlayableMedia,
+}
+
+impl PlaybackFile {
+    pub fn path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+}
+
 #[derive(Clone)]
 pub struct Message {
     pub id: i32,
@@ -372,6 +420,7 @@ pub struct Message {
     pub outgoing: bool,
     pub attachment: Option<String>,
     pub photo_preview: bool,
+    pub playback: Option<PlayableMedia>,
     pub thumbnail: Option<AttachmentThumbnail>,
     pub reply_to: Option<i32>,
     pub reply_preview: Option<ReplyPreview>,
@@ -789,6 +838,7 @@ mod tests {
                 outgoing: false,
                 attachment: None,
                 photo_preview: false,
+                playback: None,
                 thumbnail: None,
                 reply_to: None,
                 reply_preview: None,

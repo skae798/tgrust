@@ -6,6 +6,86 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+/// Preview data has no directory entry, including after a crash. It is never a saved attachment.
+pub struct PlaybackDownload {
+    file: File,
+    writer: tokio::fs::File,
+    received: u64,
+    expected: u64,
+}
+
+impl PlaybackDownload {
+    pub fn new(expected: u64) -> Result<Self> {
+        let base = env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .context("Укажите XDG_CACHE_HOME или HOME")?;
+        Self::new_in(expected, &base.join("tgrust/preview"))
+    }
+
+    fn new_in(expected: u64, directory: &Path) -> Result<Self> {
+        ensure!(
+            (1..=4 * 1024_u64.pow(3)).contains(&expected),
+            "Размер медиа должен быть от 1 байта до 4 ГиБ"
+        );
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)?;
+        let metadata = fs::symlink_metadata(directory)?;
+        ensure!(
+            metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
+            "Каталог предпросмотра должен быть обычным каталогом с правами 0700"
+        );
+        let file = tempfile::tempfile_in(directory)
+            .context("Не удалось создать временное хранилище медиа")?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        let writer = tokio::fs::File::from_std(file.try_clone()?);
+        Ok(Self {
+            file,
+            writer,
+            received: 0,
+            expected,
+        })
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        let received = self
+            .received
+            .checked_add(bytes.len() as u64)
+            .context("Размер медиа изменился")?;
+        ensure!(received <= self.expected, "Медиа больше указанного размера");
+        self.writer.write_all(bytes).await?;
+        self.received = received;
+        Ok(())
+    }
+
+    pub async fn restart(&mut self) -> Result<()> {
+        self.writer.flush().await?;
+        self.writer.set_len(0).await?;
+        self.writer.rewind().await?;
+        self.received = 0;
+        Ok(())
+    }
+
+    pub async fn finish(
+        mut self,
+        media: crate::model::PlayableMedia,
+    ) -> Result<crate::model::PlaybackFile> {
+        ensure!(
+            self.received == self.expected,
+            "Медиа загружено не полностью"
+        );
+        self.writer.flush().await?;
+        drop(self.writer);
+        Ok(crate::model::PlaybackFile {
+            file: self.file,
+            media,
+        })
+    }
+}
+
 fn session_directory() -> Result<PathBuf> {
     let base = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -185,6 +265,55 @@ impl PendingSave {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_storage_is_anonymous_private_bounded_and_can_restart() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("preview");
+            let mut output = PlaybackDownload::new_in(4, &root).unwrap();
+            assert_eq!(output.file.metadata().unwrap().nlink(), 0);
+            assert_eq!(
+                output.file.metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            output.write(b"old").await.unwrap();
+            output.restart().await.unwrap();
+            assert!(output.write(b"excess").await.is_err());
+            output.write(b"good").await.unwrap();
+            let file = output
+                .finish(crate::model::PlayableMedia::Audio)
+                .await
+                .unwrap();
+            assert_eq!(fs::read(file.path()).unwrap(), b"good");
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            drop(file);
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            assert!(PlaybackDownload::new_in(0, &root).is_err());
+            assert!(PlaybackDownload::new_in(4 * 1024_u64.pow(3) + 1, &root).is_err());
+            let mut incomplete = PlaybackDownload::new_in(4, &root).unwrap();
+            incomplete.write(b"x").await.unwrap();
+            assert!(
+                incomplete
+                    .finish(crate::model::PlayableMedia::Audio)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        });
+    }
+
+    #[test]
+    fn playback_storage_rejects_shared_and_symlink_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = directory.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(PlaybackDownload::new_in(1, &shared).is_err());
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(directory.path(), &link).unwrap();
+        assert!(PlaybackDownload::new_in(1, &link).is_err());
+    }
 
     #[test]
     fn launcher_selects_only_a_single_existing_session() -> Result<()> {
