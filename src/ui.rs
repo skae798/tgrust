@@ -16,9 +16,9 @@ use crate::formatting::{
     concealed_message, editor_text, message_attributes, set_editor_text, setup_editor,
 };
 use crate::model::{
-    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, FormattedText, HISTORY_PAGE_SIZE, HistoryCache,
-    HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply, SearchHit,
-    TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, redact_spoilers,
+    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText, HISTORY_PAGE_SIZE,
+    HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply,
+    SearchHit, TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -55,6 +55,7 @@ struct Ui {
     title: adw::WindowTitle,
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
+    contacts_dialog: glib::WeakRef<adw::Dialog>,
     history: gtk::Box,
     message_menu: gtk::Popover,
     menu_message: Cell<Option<i32>>,
@@ -78,7 +79,7 @@ struct Ui {
     folders: RefCell<Vec<ChatFolder>>,
     folders_generation: Cell<u64>,
     updating_folders: Cell<bool>,
-    search_chat: RefCell<Option<Chat>>,
+    external_chat: RefCell<Option<Chat>>,
     message_search: glib::WeakRef<adw::Dialog>,
     selection: Cell<Option<i64>>,
     notification_chat: Cell<Option<i64>>,
@@ -194,6 +195,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .tooltip_text("Архив чатов")
         .build();
     side_header.pack_start(&archive);
+    let contacts_button = icon_button("x-office-address-book-symbolic", "Контакты");
+    side_header.pack_start(&contacts_button);
     sidebar.add_top_bar(&side_header);
     let side_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let filter = gtk::SearchEntry::builder()
@@ -370,6 +373,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         title,
         profile_button,
         profile_dialog: glib::WeakRef::new(),
+        contacts_dialog: glib::WeakRef::new(),
         history,
         message_menu,
         menu_message: Cell::new(None),
@@ -393,7 +397,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         folders: RefCell::new(Vec::new()),
         folders_generation: Cell::new(0),
         updating_folders: Cell::new(false),
-        search_chat: RefCell::new(None),
+        external_chat: RefCell::new(None),
         message_search: glib::WeakRef::new(),
         selection: Cell::new(None),
         notification_chat: Cell::new(None),
@@ -517,6 +521,11 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         window.add_action(&action);
         app.set_accels_for_action(&format!("win.{name}"), &[accelerator]);
     }
+    contacts_button.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.open_contacts()
+    ));
     ui.latest.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -1390,6 +1399,81 @@ impl Ui {
         });
     }
 
+    fn chat_dialog_open(&self) -> bool {
+        [
+            &self.message_search,
+            &self.profile_dialog,
+            &self.contacts_dialog,
+        ]
+        .iter()
+        .any(|dialog| dialog.upgrade().is_some_and(|dialog| dialog.is_visible()))
+    }
+
+    fn open_contacts(self: &Rc<Self>) {
+        if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
+            || self.chat_dialog_open()
+        {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let dialog = crate::contacts::open(
+            &window,
+            crate::contacts::ContactContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |refresh| {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            Ok(Arc::new(demo::contacts()))
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .contacts(refresh)
+                                .await
+                        }
+                    })
+                }),
+                avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| {
+                        ui.load_avatar(avatar, ChatImage::Avatar(photo));
+                    }
+                )),
+                selected: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |contact: Contact| {
+                        let chat = contact.chat();
+                        if let Some(known) = ui
+                            .chats
+                            .borrow_mut()
+                            .iter_mut()
+                            .find(|chat| chat.id == contact.id)
+                        {
+                            known.title = chat.title.clone();
+                            known.avatar = chat.avatar;
+                            known.kind = chat.kind;
+                        }
+                        ui.external_chat.replace(Some(chat));
+                        ui.render_chats();
+                        ui.show_chat(contact.id, None);
+                    }
+                )),
+                ready: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.focus_composer()
+                )),
+            },
+        );
+        self.contacts_dialog.set(Some(&dialog));
+    }
+
     fn open_chat_profile(self: &Rc<Self>) {
         let Some(id) = self.selection.get() else {
             return;
@@ -1397,15 +1481,7 @@ impl Ui {
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        if self
-            .profile_dialog
-            .upgrade()
-            .is_some_and(|dialog| dialog.is_visible())
-            || self
-                .message_search
-                .upgrade()
-                .is_some_and(|dialog| dialog.is_visible())
-        {
+        if self.chat_dialog_open() {
             return;
         }
         let client = self.client.borrow().clone();
@@ -1437,14 +1513,7 @@ impl Ui {
 
     fn open_message_search(self: &Rc<Self>, scoped: bool) {
         if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
-            || self
-                .message_search
-                .upgrade()
-                .is_some_and(|dialog| dialog.is_visible())
-            || self
-                .profile_dialog
-                .upgrade()
-                .is_some_and(|dialog| dialog.is_visible())
+            || self.chat_dialog_open()
         {
             return;
         }
@@ -1458,7 +1527,7 @@ impl Ui {
                 .find(|chat| chat.id == id)
                 .cloned()
                 .or_else(|| {
-                    self.search_chat
+                    self.external_chat
                         .borrow()
                         .clone()
                         .filter(|chat| chat.id == id)
@@ -1499,7 +1568,7 @@ impl Ui {
                     self,
                     move |hit: SearchHit| {
                         let id = hit.chat.id;
-                        ui.search_chat.replace(Some(hit.chat));
+                        ui.external_chat.replace(Some(hit.chat));
                         ui.show_chat(id, Some(hit.message.id));
                     }
                 )),
@@ -1517,7 +1586,7 @@ impl Ui {
             .find(|chat| chat.id == id)
             .cloned()
             .or_else(|| {
-                self.search_chat
+                self.external_chat
                     .borrow()
                     .as_ref()
                     .filter(|chat| chat.id == id)
@@ -1537,6 +1606,9 @@ impl Ui {
                 self.archive.set_active(chat.archived);
             }
         }
+        self.title.set_title(&chat.title);
+        self.title
+            .set_subtitle(if chat.broadcast { "Канал" } else { "" });
         self.split.set_show_content(true);
         let client = self.client.borrow().clone();
         let revision = client
@@ -1597,9 +1669,6 @@ impl Ui {
         self.messages.borrow_mut().clear();
         self.revealed_spoilers.borrow_mut().clear();
         self.history_refreshed.set(None);
-        self.title.set_title(&chat.title);
-        self.title
-            .set_subtitle(if chat.broadcast { "Канал" } else { "" });
         self.content.set_visible_child_name("conversation");
         let buffer = self.input.buffer();
         if let Some(draft) = self.drafts.borrow().get(&id) {
@@ -2868,6 +2937,15 @@ impl Ui {
 
     fn add_demo_messages(self: &Rc<Self>, chat: i64, messages: Vec<Message>) {
         let Some(last) = messages.last() else { return };
+        if !self.chats.borrow().iter().any(|item| item.id == chat)
+            && let Some(contact) = self
+                .external_chat
+                .borrow()
+                .as_ref()
+                .filter(|item| item.id == chat)
+        {
+            self.chats.borrow_mut().insert(0, contact.clone());
+        }
         self.history_cache.borrow_mut().remove(chat);
         if let Some(chat) = self
             .chats
@@ -3044,7 +3122,7 @@ impl Ui {
             .iter()
             .any(|item| item.id == chat && item.saved_messages)
             || self
-                .search_chat
+                .external_chat
                 .borrow()
                 .as_ref()
                 .is_some_and(|item| item.id == chat && item.saved_messages);
