@@ -22,6 +22,8 @@ pub struct Chat {
     pub preview_image: Option<ChatImage>,
     pub group: bool,
     pub unread: i32,
+    pub unread_mark: bool,
+    pub last_message_id: i32,
     pub broadcast: bool,
     pub saved_messages: bool,
     pub archived: bool,
@@ -93,12 +95,33 @@ impl Contact {
             preview_image: None,
             group: false,
             unread: 0,
+            unread_mark: false,
+            last_message_id: 0,
             broadcast: false,
             saved_messages: self.is_self,
             archived: false,
             kind: self.kind,
             muted: false,
             avatar: self.avatar,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ReadRequest {
+    pub revision: u64,
+    pub clear_mark: bool,
+}
+
+impl Chat {
+    pub fn is_unread(&self) -> bool {
+        self.unread > 0 || self.unread_mark
+    }
+
+    pub fn read_through(&mut self, max_id: i32) {
+        self.unread_mark = false;
+        if max_id > 0 && self.last_message_id <= max_id {
+            self.unread = 0;
         }
     }
 }
@@ -160,7 +183,7 @@ impl ChatFolder {
         }
         self.kinds.contains(&chat.kind)
             && (!self.exclude_muted || !chat.muted)
-            && (!self.exclude_read || chat.unread > 0)
+            && (!self.exclude_read || chat.is_unread())
             && (!self.exclude_archived || !chat.archived)
     }
 }
@@ -569,6 +592,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manual_unread_mark_filters_as_unread_without_faking_a_message_count() {
+        let mut chat = crate::demo::chats().remove(0);
+        chat.unread = 0;
+        chat.unread_mark = true;
+        let folder = ChatFolder {
+            kinds: vec![chat.kind],
+            exclude_read: true,
+            ..ChatFolder::default()
+        };
+        assert!(chat.is_unread());
+        assert_eq!(chat.unread, 0);
+        assert!(folder.contains(&chat));
+        chat.unread_mark = false;
+        assert!(!chat.is_unread());
+        assert!(!folder.contains(&chat));
+        chat.unread = 3;
+        assert!(folder.contains(&chat));
+    }
+
+    #[test]
+    fn reading_an_older_snapshot_does_not_clear_a_newer_message_count() {
+        let mut chat = crate::demo::chats().remove(0);
+        chat.last_message_id = 100;
+        chat.unread = 4;
+        chat.unread_mark = true;
+        chat.read_through(90);
+        assert!(!chat.unread_mark);
+        assert_eq!(chat.unread, 4);
+        chat.read_through(0);
+        assert_eq!(chat.unread, 4);
+        chat.read_through(100);
+        assert_eq!(chat.unread, 0);
+        assert!(!chat.is_unread());
+    }
+
+    #[test]
     fn chat_order_keeps_server_pin_order_and_uses_separate_folder_pins() {
         let base = crate::demo::chats().remove(0);
         let chats: Vec<_> = [(1, true, 10), (2, false, 30), (3, true, 20), (4, false, 40)]
@@ -697,6 +756,8 @@ mod tests {
             preview_image: None,
             group: true,
             unread: 0,
+            unread_mark: false,
+            last_message_id: 0,
             broadcast: false,
             saved_messages: false,
             archived: true,

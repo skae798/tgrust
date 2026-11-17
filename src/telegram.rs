@@ -23,8 +23,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
-    Reaction, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle,
-    UpdateStatus, Upload, UploadKind, redact_spoilers,
+    Reaction, ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage,
+    TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name, open_session_file};
 
@@ -59,6 +59,7 @@ pub struct Telegram {
     contacts_cache: Mutex<Option<ContactSnapshot>>,
     contacts_revision: AtomicU64,
     dialog_settings: Mutex<()>,
+    read_state: crate::read_state::ReadState,
 }
 
 struct ContactSnapshot {
@@ -146,6 +147,7 @@ impl Telegram {
                 contacts_cache: Mutex::new(None),
                 contacts_revision: AtomicU64::new(0),
                 dialog_settings: Mutex::new(()),
+                read_state: crate::read_state::ReadState::default(),
             }),
             step,
         ))
@@ -281,6 +283,7 @@ impl Telegram {
                             | enums::Update::DialogPinned(_)
                             | enums::Update::PinnedDialogs(_)
                             | enums::Update::NotifySettings(_)
+                            | enums::Update::DialogUnreadMark(_)
                     ) {
                         self.invalidate_views();
                     }
@@ -467,7 +470,9 @@ impl Telegram {
                     thumbnail(&media).map(|media| ChatImage::attachment(id, message.id(), media))
                 }),
                 group,
-                unread: raw.unread_count.max(i32::from(raw.unread_mark)),
+                unread: raw.unread_count.max(0),
+                unread_mark: raw.unread_mark,
+                last_message_id: raw.top_message.max(0),
                 broadcast: matches!(peer, Peer::Channel(_)),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
                 avatar: peer_avatar(peer),
@@ -864,6 +869,8 @@ impl Telegram {
                     preview_image: None,
                     group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
                     unread: 0,
+                    unread_mark: false,
+                    last_message_id: 0,
                     broadcast: matches!(peer, Peer::Channel(_)),
                     saved_messages: Some(peer_ref.id) == self_id
                         || matches!(peer, Peer::User(user) if user.is_self()),
@@ -883,7 +890,7 @@ impl Telegram {
         &self,
         id: i64,
         before: Option<i32>,
-        mark_read: bool,
+        read: Option<ReadRequest>,
     ) -> Result<(Vec<Message>, bool, bool)> {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
@@ -912,8 +919,10 @@ impl Telegram {
             }
             result.push(message_view(&message, self_id, profile));
         }
-        let marked = if mark_read && let Some(message) = newest {
-            message.mark_as_read().await.is_ok()
+        let marked = if let Some(read) = read {
+            self.mark_read_through(id, newest.as_ref().map_or(0, |message| message.id()), read)
+                .await
+                .unwrap_or(false)
         } else {
             false
         };
@@ -923,15 +932,97 @@ impl Telegram {
         Ok((result, has_older, marked))
     }
 
-    pub async fn mark_read_through(&self, chat: i64, max_id: i32) -> Result<()> {
+    pub fn read_revision(&self, chat: i64) -> u64 {
+        self.read_state.revision(chat)
+    }
+
+    pub fn begin_read_change(&self, chat: i64) -> u64 {
+        self.read_state.advance(chat)
+    }
+
+    async fn mark_dialog_unread(&self, chat: i64, unread: bool) -> Result<()> {
+        let peer = self.peer(chat).await?;
+        let accepted = self
+            .client
+            .invoke(
+                &grammers_client::tl::functions::messages::MarkDialogUnread {
+                    unread,
+                    parent_peer: None,
+                    peer: types::InputDialogPeer { peer: peer.into() }.into(),
+                },
+            )
+            .await?;
+        ensure!(accepted, "Telegram не подтвердил отметку чата");
+        Ok(())
+    }
+
+    pub async fn set_dialog_unread(
+        &self,
+        chat: i64,
+        unread: bool,
+        through: i32,
+        revision: u64,
+    ) -> Result<bool> {
+        let result = self
+            .read_state
+            .run(chat, revision, async {
+                // A failed response can still follow an accepted server-side marker.
+                if unread {
+                    self.read_state.set_may_be_marked(chat, true);
+                }
+                self.mark_dialog_unread(chat, unread).await?;
+                if !unread {
+                    self.read_state.set_may_be_marked(chat, false);
+                    self.read_through(chat, through).await?;
+                }
+                Ok(())
+            })
+            .await;
+        // A failure may follow a successful first RPC; always reconcile with Telegram.
+        self.invalidate_views();
+        result.map(|result| result.is_some())
+    }
+
+    pub async fn mark_read_through(
+        &self,
+        chat: i64,
+        max_id: i32,
+        read: ReadRequest,
+    ) -> Result<bool> {
+        let result = self
+            .read_state
+            .run(chat, read.revision, async {
+                self.read_through(chat, max_id).await?;
+                // Inspect this after acquiring the queue: an older manual RPC may
+                // have completed since the user reopened the chat.
+                let clear = read.clear_mark || self.read_state.may_be_marked(chat);
+                if clear {
+                    self.mark_dialog_unread(chat, false).await?;
+                    self.read_state.set_may_be_marked(chat, false);
+                }
+                Ok(clear)
+            })
+            .await?;
+        if result == Some(true) {
+            self.invalidate_views();
+        }
+        Ok(result.is_some())
+    }
+
+    async fn read_through(&self, chat: i64, max_id: i32) -> Result<()> {
+        if max_id <= 0 {
+            return Ok(());
+        }
         let peer = self.peer(chat).await?;
         if peer.id.kind() == PeerKind::Channel {
-            self.client
+            let accepted = self
+                .client
                 .invoke(&grammers_client::tl::functions::channels::ReadHistory {
                     channel: peer.into(),
                     max_id,
                 })
                 .await?;
+            ensure!(accepted, "Telegram не подтвердил чтение истории");
         } else {
             self.client
                 .invoke(&grammers_client::tl::functions::messages::ReadHistory {
@@ -951,7 +1042,7 @@ impl Telegram {
             .message_by_id(peer, anchor)
             .await?
             .context("Сообщение больше недоступно")?;
-        let (mut messages, older, _) = self.history(chat, Some(anchor), false).await?;
+        let (mut messages, older, _) = self.history(chat, Some(anchor), None).await?;
         messages.push(message_view(&original, self_id, profile));
         let mut newer = self
             .client

@@ -39,6 +39,8 @@ pub fn chats() -> Vec<Chat> {
         }),
         group: id == 1,
         unread,
+        unread_mark: false,
+        last_message_id: history(id).last().map_or(0, |message| message.id),
         broadcast,
         saved_messages: id == 2,
         avatar: (id != 2).then_some(Avatar {
@@ -70,6 +72,18 @@ pub fn folders() -> Vec<ChatFolder> {
             title: "С уведомлениями".into(),
             kinds: vec![ChatKind::Group, ChatKind::User, ChatKind::Broadcast],
             exclude_muted: true,
+            ..ChatFolder::default()
+        },
+        ChatFolder {
+            id: 4,
+            title: "Непрочитанные".into(),
+            kinds: vec![
+                ChatKind::Group,
+                ChatKind::User,
+                ChatKind::Broadcast,
+                ChatKind::Contact,
+            ],
+            exclude_read: true,
             ..ChatFolder::default()
         },
     ]
