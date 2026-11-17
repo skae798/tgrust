@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Message, PeerProfile,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, Message,
+    PeerProfile,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -73,6 +74,23 @@ pub fn folders() -> Vec<ChatFolder> {
 }
 
 pub fn peer_profile(id: i64) -> Option<PeerProfile> {
+    if let Some(contact) = contacts().into_iter().find(|contact| contact.id == id) {
+        return Some(PeerProfile {
+            id,
+            title: contact.name,
+            kind: contact.kind,
+            is_self: false,
+            avatar: contact.avatar,
+            about: "Демонстрационный контакт.".into(),
+            usernames: contact.usernames,
+            phone: contact.phone,
+            members: None,
+            online_members: None,
+            verified: false,
+            scam: false,
+            fake: false,
+        });
+    }
     let chat = chats().into_iter().find(|chat| chat.id == id)?;
     Some(PeerProfile {
         id,
@@ -111,6 +129,30 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
     })
 }
 
+pub fn contacts() -> Vec<Contact> {
+    [
+        (10, "Анна Соколова", "@demo_anna"),
+        (11, "Борис Мельник", "@demo_boris"),
+        (12, "Мария Орлова", "@demo_maria"),
+    ]
+    .into_iter()
+    .map(|(id, name, username)| Contact {
+        id,
+        name: name.into(),
+        usernames: vec![username.into()],
+        phone: (id == 10).then(|| "+00000000010".into()),
+        avatar: (id != 12).then_some(Avatar {
+            peer: id,
+            photo: id,
+            dc: 0,
+        }),
+        kind: ChatKind::Contact,
+        is_self: false,
+        available: true,
+    })
+    .collect()
+}
+
 pub fn history(chat: i64) -> Vec<Message> {
     let today = now();
     let samples = match chat {
@@ -139,7 +181,8 @@ pub fn history(chat: i64) -> Vec<Message> {
             (OWN_NAME, "Проверить сборку на ноутбуке", true, None),
             ("Анна", "Сохранённая заметка", false, None),
         ],
-        _ => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
+        3 => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
+        _ => Vec::new(),
     };
     let mut messages: Vec<_> = samples
         .into_iter()

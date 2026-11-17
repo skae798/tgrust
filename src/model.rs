@@ -38,6 +38,68 @@ pub enum ChatKind {
 }
 
 #[derive(Clone)]
+pub struct Contact {
+    pub id: i64,
+    pub name: String,
+    pub usernames: Vec<String>,
+    pub phone: Option<String>,
+    pub avatar: Option<Avatar>,
+    pub kind: ChatKind,
+    pub is_self: bool,
+    pub available: bool,
+}
+
+impl Contact {
+    pub fn matches(&self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return true;
+        }
+        let text = format!("{} {}", self.name, self.usernames.join(" ")).to_lowercase();
+        if query.split_whitespace().all(|word| text.contains(word)) {
+            return true;
+        }
+        if query
+            .chars()
+            .all(|c| c.is_ascii_digit() || " +()- .".contains(c))
+        {
+            let digits: String = query.chars().filter(char::is_ascii_digit).collect();
+            return !digits.is_empty()
+                && self.phone.as_ref().is_some_and(|phone| {
+                    phone
+                        .chars()
+                        .filter(char::is_ascii_digit)
+                        .collect::<String>()
+                        .contains(&digits)
+                });
+        }
+        false
+    }
+
+    pub fn chat(&self) -> Chat {
+        Chat {
+            id: self.id,
+            title: if self.is_self {
+                "Избранное".to_owned()
+            } else {
+                self.name.clone()
+            },
+            preview: String::new(),
+            preview_sender: None,
+            preview_image: None,
+            group: false,
+            unread: 0,
+            broadcast: false,
+            saved_messages: self.is_self,
+            archived: false,
+            kind: self.kind,
+            muted: false,
+            avatar: self.avatar,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct PeerProfile {
     pub id: i64,
     pub title: String,
@@ -484,6 +546,41 @@ pub fn merge_latest_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contact_search_matches_names_aliases_and_formatted_phone_numbers() {
+        let mut contact = crate::demo::contacts().remove(0);
+        for query in [
+            "",
+            "СОКОЛОВА Анна",
+            "anna",
+            "@DEMO_ANNA",
+            "Анна @demo_anna",
+            "+000 (000) 000-10",
+        ] {
+            assert!(contact.matches(query), "{query}");
+        }
+        for query in ["Ольга", "++++", "55555"] {
+            assert!(!contact.matches(query), "{query}");
+        }
+        contact.phone = None;
+        assert!(!contact.matches("00010"));
+    }
+
+    #[test]
+    fn contact_chat_preserves_identity_and_recognizes_saved_messages() {
+        let mut contact = crate::demo::contacts().remove(0);
+        let chat = contact.chat();
+        assert_eq!(chat.id, contact.id);
+        assert_eq!(chat.title, contact.name);
+        assert!(!chat.saved_messages);
+        assert!(!chat.group);
+        contact.is_self = true;
+        let saved = contact.chat();
+        assert!(saved.saved_messages);
+        assert_eq!(saved.title, "Избранное");
+        assert_eq!(saved.id, contact.id);
+    }
 
     #[test]
     fn search_pages_keep_cross_chat_ids_and_skip_repeated_results() {

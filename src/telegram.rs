@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::client::{GlobalSearchIter, LoginToken, PasswordToken, SearchIter};
@@ -20,7 +21,7 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, FormattedText,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
     Reaction, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle,
     UpdateStatus, Upload, UploadKind, redact_spoilers,
@@ -55,6 +56,21 @@ pub struct Telegram {
     history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
     profile: OnceCell<Peer>,
+    contacts_cache: Mutex<Option<ContactSnapshot>>,
+    contacts_revision: AtomicU64,
+}
+
+struct ContactSnapshot {
+    loaded: Instant,
+    revision: u64,
+    contacts: Arc<Vec<Contact>>,
+}
+
+impl ContactSnapshot {
+    fn is_fresh(&self, revision: u64, now: Instant) -> bool {
+        self.revision == revision
+            && now.saturating_duration_since(self.loaded) < Duration::from_mins(5)
+    }
 }
 
 enum SearchMessages {
@@ -126,6 +142,8 @@ impl Telegram {
                 history_changes: StdMutex::default(),
                 image_downloads: Semaphore::new(4),
                 profile: OnceCell::new(),
+                contacts_cache: Mutex::new(None),
+                contacts_revision: AtomicU64::new(0),
             }),
             step,
         ))
@@ -234,6 +252,16 @@ impl Telegram {
                         && let Some(notification) = notification_for(message, started)
                     {
                         let _ = incoming.try_send(notification);
+                    }
+                    if matches!(
+                        update.raw(),
+                        enums::Update::UserName(_)
+                            | enums::Update::UserPhone(_)
+                            | enums::Update::User(_)
+                            | enums::Update::ContactsReset
+                            | enums::Update::PeerSettings(_)
+                    ) {
+                        self.contacts_revision.fetch_add(1, Ordering::Relaxed);
                     }
                     if matches!(
                         update,
@@ -454,6 +482,67 @@ impl Telegram {
             .get(&id)
             .copied()
             .context("Чат не найден")
+    }
+
+    pub async fn contacts(&self, refresh: bool) -> Result<Arc<Vec<Contact>>> {
+        let mut cache = self.contacts_cache.lock().await;
+        let revision = self.contacts_revision.load(Ordering::Relaxed);
+        if !refresh
+            && let Some(cached) = cache.as_ref()
+            && cached.is_fresh(revision, Instant::now())
+        {
+            return Ok(cached.contacts.clone());
+        }
+        let result = self
+            .client
+            .invoke(&grammers_client::tl::functions::contacts::GetContacts { hash: 0 })
+            .await?;
+        let enums::contacts::Contacts::Contacts(result) = result else {
+            bail!("Telegram не вернул список контактов. Повторите загрузку");
+        };
+        let mut users: HashMap<_, _> = result
+            .users
+            .into_iter()
+            .map(|user| (user.id(), user))
+            .collect();
+        let mut peers = HashMap::new();
+        let mut contacts = Vec::new();
+        for contact in result.contacts {
+            let enums::Contact::Contact(contact) = contact;
+            let Some(raw) = users.remove(&contact.user_id) else {
+                continue;
+            };
+            let user = grammers_client::peer::User::from_raw(&self.client, raw);
+            let reference = user.to_ref().await.map_err(anyhow::Error::from_boxed)?;
+            let peer = Peer::User(user);
+            let profile = peer_profile_view(&peer)?;
+            if let Some(reference) = reference {
+                peers.insert(profile.id, reference);
+            }
+            contacts.push(Contact {
+                id: profile.id,
+                name: profile.title,
+                usernames: profile.usernames,
+                phone: profile.phone,
+                avatar: profile.avatar,
+                kind: if profile.kind == ChatKind::Bot {
+                    ChatKind::Bot
+                } else {
+                    ChatKind::Contact
+                },
+                is_self: profile.is_self,
+                available: reference.is_some(),
+            });
+        }
+        contacts.sort_by_cached_key(|contact| (contact.name.to_lowercase(), contact.id));
+        self.peers.write().await.extend(peers);
+        let contacts = Arc::new(contacts);
+        *cache = Some(ContactSnapshot {
+            loaded: Instant::now(),
+            revision,
+            contacts: contacts.clone(),
+        });
+        Ok(contacts)
     }
 
     pub async fn peer_profile(&self, id: i64) -> Result<PeerProfile> {
@@ -1915,6 +2004,19 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn contacts_cache_expires_and_metadata_updates_invalidate_it() {
+        let now = Instant::now();
+        let cache = ContactSnapshot {
+            loaded: now,
+            revision: 3,
+            contacts: Arc::new(Vec::new()),
+        };
+        assert!(cache.is_fresh(3, now + Duration::from_secs(299)));
+        assert!(!cache.is_fresh(3, now + Duration::from_secs(300)));
+        assert!(!cache.is_fresh(4, now));
+    }
 
     #[test]
     fn profile_names_exclude_inactive_aliases_and_deduplicate_case_insensitively() {
