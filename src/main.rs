@@ -1,5 +1,6 @@
 mod contacts;
 mod demo;
+mod devices;
 mod formatting;
 mod media_viewer;
 mod model;
