@@ -109,7 +109,7 @@ Flatpak хранит свою сессию в `~/.var/app/io.github.skae798.tgru
 | `src/ui.rs`, `src/style.css` | Интерфейс Libadwaita и обмен данными с Tokio |
 | `src/telegram.rs` | Сессия, авторизация, диалоги, история, обновления и загрузки |
 | `src/storage.rs` | Каталог сессии, сохранение вложений и временное хранилище медиа |
-| `src/media_viewer.rs` | Проигрыватель GTK, управление загрузкой и размеры окна |
+| `src/media_viewer.rs`, `src/playback_controls.rs` | Проигрыватель GTK, управление загрузкой и размеры окна |
 | `src/model.rs`, `src/demo.rs` | Модели интерфейса и демоданные |
 
 ## Проверки

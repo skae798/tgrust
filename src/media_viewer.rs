@@ -33,7 +33,7 @@ struct Viewer {
     retry: gtk::Button,
     media: RefCell<Option<gtk::MediaFile>>,
     picture: gtk::Picture,
-    controls: gtk::MediaControls,
+    controls: Rc<crate::playback_controls::PlaybackControls>,
     file: RefCell<Option<PlaybackFile>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     screen: (i32, i32),
@@ -123,11 +123,11 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
     audio.update_property(&[gtk::accessible::Property::Label("Воспроизведение аудио")]);
     visual.add_named(&audio, Some("audio"));
     stack.add_named(&visual, Some("player"));
-    let controls = gtk::MediaControls::new(None::<&gtk::MediaStream>);
+    let controls = crate::playback_controls::PlaybackControls::new();
     controls.set_margin_start(8);
     controls.set_margin_end(8);
     controls.set_visible(false);
-    toolbar.add_bottom_bar(&controls);
+    toolbar.add_bottom_bar(&controls.widget);
     window.set_content(Some(&toolbar));
     let state = Rc::new(Viewer {
         context,
@@ -332,7 +332,7 @@ impl Viewer {
         else {
             return;
         };
-        self.controls.set_media_stream(None::<&gtk::MediaStream>);
+        self.controls.set_media_stream(None);
         let media = gtk::MediaFile::new();
         if let Some(previous) = self.media.replace(Some(media.clone())) {
             previous.pause();
@@ -354,7 +354,7 @@ impl Viewer {
     }
 
     fn show_error(&self, error: &str) {
-        self.controls.set_media_stream(None::<&gtk::MediaStream>);
+        self.controls.set_media_stream(None);
         if let Some(media) = self.media.borrow().as_ref() {
             media.pause();
         }
@@ -424,7 +424,7 @@ impl Viewer {
             .window
             .upgrade()
             .and_then(|window| gtk::prelude::RootExt::focus(&window));
-        if !focused.is_some_and(|widget| widget.is_ancestor(&self.controls)) {
+        if !focused.is_some_and(|widget| widget.is_ancestor(&self.controls.widget)) {
             self.controls.child_focus(gtk::DirectionType::TabForward);
         }
     }
@@ -436,7 +436,7 @@ impl Viewer {
         if let Some(task) = self.task.take() {
             task.abort();
         }
-        self.controls.set_media_stream(None::<&gtk::MediaStream>);
+        self.controls.set_media_stream(None);
         if let Some(media) = self.media.take() {
             media.pause();
             media.clear();

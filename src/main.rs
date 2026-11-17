@@ -3,6 +3,7 @@ mod demo;
 mod formatting;
 mod media_viewer;
 mod model;
+mod playback_controls;
 mod profile;
 mod read_state;
 mod search;
