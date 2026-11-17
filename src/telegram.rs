@@ -27,6 +27,7 @@ use crate::model::{
     SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
     UploadKind, redact_spoilers,
 };
+use crate::session_runner::SessionRunner;
 use crate::storage::{PendingSave, PlaybackDownload, attachment_name, open_session_file};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,11 +45,37 @@ enum LoginState {
     Authorized,
 }
 
+impl LoginState {
+    fn step(&self) -> LoginStep {
+        match self {
+            Self::Phone => LoginStep::Phone,
+            Self::Code(_) => LoginStep::Code,
+            Self::Password(_) => LoginStep::Password,
+            Self::Authorized => LoginStep::Authorized,
+        }
+    }
+}
+
+async fn initial_login_state(
+    authorization: impl std::future::Future<Output = Result<bool>>,
+    has_api_hash: bool,
+) -> Result<LoginState> {
+    if authorization.await? {
+        Ok(LoginState::Authorized)
+    } else {
+        ensure!(
+            has_api_hash,
+            "Сессия истекла. Запустите tgrust с TGRUST_API_ID и TGRUST_API_HASH для повторного входа."
+        );
+        Ok(LoginState::Phone)
+    }
+}
+
 pub struct Telegram {
     client: Client,
     session: Arc<SqliteSession>,
     sender: SenderPoolHandle,
-    runner: tokio::task::AbortHandle,
+    runner: SessionRunner,
     updates: Mutex<Option<mpsc::Receiver<grammers_session::updates::UpdatesLike>>>,
     api_hash: Option<String>,
     state: Mutex<LoginState>,
@@ -105,38 +132,27 @@ impl Telegram {
         } = SenderPool::new(session.clone(), api_id);
         let sender = (*handle).clone();
         let client = Client::new(handle);
-        let runner = tokio::spawn(async move {
+        let runner = SessionRunner::spawn(async move {
             let _lock = lock;
             runner.run().await;
         });
-        let authorized = match tokio::time::timeout(Duration::from_secs(20), client.is_authorized())
-            .await
-            .context("Telegram не ответил вовремя")
-            .and_then(|result| result.map_err(anyhow::Error::from))
-        {
-            Ok(authorized) => authorized,
-            Err(error) => {
-                runner.abort();
-                let _ = runner.await;
-                return Err(error);
-            }
-        };
-        let (state, step) = if authorized {
-            (LoginState::Authorized, LoginStep::Authorized)
-        } else {
-            ensure!(
-                api_hash.is_some(),
-                "Сессия истекла. Запустите tgrust с TGRUST_API_ID и TGRUST_API_HASH для повторного входа."
-            );
-            (LoginState::Phone, LoginStep::Phone)
-        };
+        let (runner, state) = runner
+            .finish_startup(
+                Duration::from_secs(20),
+                initial_login_state(
+                    async { client.is_authorized().await.map_err(anyhow::Error::from) },
+                    api_hash.is_some(),
+                ),
+            )
+            .await?;
+        let step = state.step();
         let (changes, _) = watch::channel(UpdateStatus::default());
         Ok((
             Arc::new(Self {
                 client,
                 session,
                 sender,
-                runner: runner.abort_handle(),
+                runner,
                 updates: Mutex::new(Some(updates)),
                 api_hash,
                 state: Mutex::new(state),
@@ -155,12 +171,7 @@ impl Telegram {
     }
 
     pub async fn login_step(&self) -> LoginStep {
-        match &*self.state.lock().await {
-            LoginState::Phone => LoginStep::Phone,
-            LoginState::Code(_) => LoginStep::Code,
-            LoginState::Password(_) => LoginStep::Password,
-            LoginState::Authorized => LoginStep::Authorized,
-        }
+        self.state.lock().await.step()
     }
 
     pub async fn login(&self, value: &str) -> Result<LoginStep> {
@@ -2286,6 +2297,192 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    async fn idle_session_runner(
+        path: &std::path::Path,
+    ) -> (SessionRunner, Client, Arc<SqliteSession>) {
+        let lock = crate::storage::lock_session_file(path, true).unwrap();
+        let session = Arc::new(SqliteSession::open(path).await.unwrap());
+        session
+            .set_update_state(grammers_session::types::UpdateState::Primary {
+                pts: 42,
+                date: 1,
+                seq: 1,
+            })
+            .await
+            .unwrap();
+        let SenderPool { runner, handle, .. } = SenderPool::new(session.clone(), 12345);
+        let client = Client::new(handle);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let runner = SessionRunner::spawn(async move {
+            let _lock = lock;
+            let _ = started.send(());
+            runner.run().await;
+        });
+        ready.await.unwrap();
+        assert!(!runner.is_finished());
+        assert_session_locked(path);
+        (runner, client, session)
+    }
+
+    fn assert_session_locked(path: &std::path::Path) {
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(matches!(
+            second.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    }
+
+    fn reacquire_session(path: &std::path::Path) -> std::fs::File {
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        second
+            .try_lock()
+            .expect("The sender still owns the session lock");
+        second
+    }
+
+    async fn await_session_release(path: &std::path::Path) -> std::fs::File {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap();
+                match file.try_lock() {
+                    Ok(()) => return file,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("Cannot lock synthetic session: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("The cancelled sender did not release its session")
+    }
+
+    #[test]
+    fn missing_login_credentials_releases_the_session_before_returning_an_error() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("synthetic.session");
+            let (runner, _client, _session) = idle_session_runner(&path).await;
+            let error = runner
+                .finish_startup(
+                    Duration::from_secs(1),
+                    initial_login_state(async { Ok(false) }, false),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("TGRUST_API_HASH"));
+            let _lock = reacquire_session(&path);
+            let reopened = SqliteSession::open(&path).await.unwrap();
+            assert_eq!(reopened.updates_state().await.unwrap().pts, 42);
+        });
+    }
+
+    #[test]
+    fn startup_rpc_failure_and_timeout_allow_immediate_session_retry() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for timeout in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("synthetic.session");
+                let (runner, _client, _session) = idle_session_runner(&path).await;
+                let error = runner
+                    .finish_startup(
+                        Duration::from_millis(20),
+                        initial_login_state(
+                            async {
+                                if timeout {
+                                    std::future::pending().await
+                                } else {
+                                    Err(anyhow::anyhow!("Synthetic connection failure"))
+                                }
+                            },
+                            true,
+                        ),
+                    )
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains(if timeout {
+                    "не ответил вовремя"
+                } else {
+                    "Synthetic connection failure"
+                }));
+                let _lock = reacquire_session(&path);
+            }
+        });
+    }
+
+    #[test]
+    fn cancelling_startup_stops_its_sender_even_with_a_live_client_handle() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("synthetic.session");
+            let (runner, _client, _session) = idle_session_runner(&path).await;
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let startup = tokio::spawn(async move {
+                runner
+                    .finish_startup(
+                        Duration::from_secs(60),
+                        initial_login_state(
+                            async {
+                                let _ = started.send(());
+                                std::future::pending().await
+                            },
+                            true,
+                        ),
+                    )
+                    .await
+            });
+            ready.await.unwrap();
+            assert_session_locked(&path);
+            startup.abort();
+            assert!(startup.await.err().unwrap().is_cancelled());
+            let _lock = await_session_release(&path).await;
+        });
+    }
+
+    #[test]
+    fn successful_startup_keeps_the_session_until_its_last_owner_drops() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (authorized, has_hash, step) in [
+                (true, false, LoginStep::Authorized),
+                (true, true, LoginStep::Authorized),
+                (false, true, LoginStep::Phone),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("synthetic.session");
+                let (runner, _client, _session) = idle_session_runner(&path).await;
+                let (runner, state) = runner
+                    .finish_startup(
+                        Duration::from_secs(1),
+                        initial_login_state(async { Ok(authorized) }, has_hash),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(state.step(), step);
+                let owner = Arc::new(runner);
+                let second_owner = owner.clone();
+                drop(owner);
+                assert_session_locked(&path);
+                assert!(!second_owner.is_finished());
+                drop(second_owner);
+                let _lock = await_session_release(&path).await;
+            }
+        });
+    }
 
     #[test]
     fn playback_classification_uses_attributes_mime_and_document_names_but_excludes_ttl() {
