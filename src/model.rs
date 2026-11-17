@@ -168,10 +168,31 @@ impl DeviceSession {
     }
 }
 
+pub const SESSION_TTL_DAYS: [i32; 5] = [7, 30, 90, 180, 365];
+
+#[derive(Clone, Copy)]
+pub enum DeviceChange {
+    Terminate(i64),
+    TerminateOthers,
+    SetTtl(i32),
+}
+
 #[derive(Clone)]
 pub struct DeviceSessions {
     pub sessions: Vec<DeviceSession>,
     pub inactive_ttl_days: i32,
+}
+
+impl DeviceSessions {
+    pub fn apply_confirmed(&mut self, change: DeviceChange) {
+        match change {
+            DeviceChange::Terminate(id) => self
+                .sessions
+                .retain(|session| session.id != id || session.current),
+            DeviceChange::TerminateOthers => self.sessions.retain(|session| session.current),
+            DeviceChange::SetTtl(days) => self.inactive_ttl_days = days,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -670,6 +691,40 @@ pub fn merge_latest_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn confirmed_device_changes_preserve_current_identity_and_change_only_acknowledged_fields() {
+        let mut snapshot = crate::demo::device_sessions();
+        let ids: Vec<_> = snapshot.sessions.iter().map(|session| session.id).collect();
+        snapshot.apply_confirmed(DeviceChange::SetTtl(30));
+        assert_eq!(snapshot.inactive_ttl_days, 30);
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        snapshot.apply_confirmed(DeviceChange::Terminate(2));
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![0, -3]
+        );
+        snapshot.apply_confirmed(DeviceChange::TerminateOthers);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(snapshot.sessions[0].current);
+        assert_eq!(snapshot.sessions[0].id, 0);
+        assert_eq!(snapshot.inactive_ttl_days, 30);
+        snapshot.apply_confirmed(DeviceChange::TerminateOthers);
+        snapshot.apply_confirmed(DeviceChange::Terminate(0));
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert!(snapshot.sessions[0].current);
+    }
 
     #[test]
     fn manual_unread_mark_filters_as_unread_without_faking_a_message_count() {

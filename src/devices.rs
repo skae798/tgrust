@@ -9,15 +9,15 @@ use anyhow::{Context, Result};
 use gtk::glib;
 use tokio::runtime::Handle;
 
-use crate::model::{DeviceSession, DeviceSessions};
+use crate::model::{DeviceChange, DeviceSession, DeviceSessions, SESSION_TTL_DAYS};
 
 type LoadFuture = Pin<Box<dyn Future<Output = Result<DeviceSessions>> + Send>>;
-type TerminateFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type ChangeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 pub struct DevicesContext {
     pub runtime: Handle,
     pub load: Box<dyn Fn() -> LoadFuture>,
-    pub terminate: Box<dyn Fn(i64) -> TerminateFuture>,
+    pub change: Box<dyn Fn(DeviceChange) -> ChangeFuture>,
 }
 
 struct DevicesDialog {
@@ -28,6 +28,7 @@ struct DevicesDialog {
     refresh: gtk::Button,
     retry: gtk::Button,
     groups: gtk::Box,
+    scroll: gtk::ScrolledWindow,
     snapshot: RefCell<Option<DeviceSessions>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     mutating: Cell<bool>,
@@ -83,6 +84,7 @@ pub fn open(window: &adw::ApplicationWindow, context: DevicesContext) -> adw::Di
         refresh,
         retry,
         groups,
+        scroll,
         snapshot: RefCell::new(None),
         task: RefCell::new(None),
         mutating: Cell::new(false),
@@ -132,6 +134,7 @@ impl DevicesDialog {
         let prefix = success.map(str::to_owned);
         self.status
             .set_text(success.unwrap_or("Загрузка устройств…"));
+        self.scroll.grab_focus();
         self.retry.set_visible(false);
         let request = (self.context.load)();
         let task = self
@@ -170,6 +173,11 @@ impl DevicesDialog {
                     }
                 }
                 state.update_controls();
+                if state.retry.is_visible() {
+                    state.retry.grab_focus();
+                } else {
+                    state.refresh.grab_focus();
+                }
             }
         });
     }
@@ -262,22 +270,108 @@ impl DevicesDialog {
                 }
                 group.add(&row);
             }
+            if !current && count > 0 {
+                let terminate_all = gtk::Button::with_label("Завершить все остальные сеансы");
+                terminate_all.add_css_class("destructive-action");
+                terminate_all.connect_clicked(glib::clone!(
+                    #[weak(rename_to = state)]
+                    self,
+                    move |_| state.confirm_others()
+                ));
+                self.groups.append(&terminate_all);
+            }
             if count > 0 {
                 self.groups.append(&group);
             } else if !current {
                 self.groups.append(&text("Других активных сеансов нет"));
             }
         }
-        if snapshot.inactive_ttl_days > 0 {
-            self.groups.append(&text(&format!(
-                "Автозавершение текущего сеанса: {} дн.",
-                snapshot.inactive_ttl_days
-            )));
+        self.render_ttl(snapshot.inactive_ttl_days);
+    }
+
+    fn render_ttl(self: &Rc<Self>, current: i32) {
+        let group = adw::PreferencesGroup::builder()
+            .title("Автозавершение текущего сеанса")
+            .build();
+        let mut days = SESSION_TTL_DAYS.to_vec();
+        if !days.contains(&current) {
+            days.insert(0, current);
         }
+        let labels: Vec<_> = days.iter().map(|days| ttl_label(*days)).collect();
+        let model = gtk::StringList::new(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+        let chooser = adw::ComboRow::builder()
+            .title("Период неактивности")
+            .model(&model)
+            .build();
+        chooser.set_selected(days.iter().position(|days| *days == current).unwrap_or(0) as u32);
+        group.add(&chooser);
+        self.groups.append(&group);
+        let save = gtk::Button::with_label("Сохранить срок");
+        save.set_halign(gtk::Align::End);
+        save.add_css_class("suggested-action");
+        save.set_sensitive(false);
+        self.groups.append(&save);
+        let choices = days.clone();
+        chooser.connect_selected_notify(glib::clone!(
+            #[weak]
+            save,
+            move |chooser| {
+                let selected = choices.get(chooser.selected() as usize);
+                save.set_sensitive(
+                    selected
+                        .is_some_and(|days| *days != current && SESSION_TTL_DAYS.contains(days)),
+                );
+            }
+        ));
+        save.connect_clicked(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            #[weak]
+            chooser,
+            move |_| {
+                if let Some(days) = days.get(chooser.selected() as usize)
+                    && SESSION_TTL_DAYS.contains(days)
+                {
+                    state.change(DeviceChange::SetTtl(*days));
+                }
+            }
+        ));
+    }
+
+    fn confirm_others(self: &Rc<Self>) {
+        self.confirm_change(
+            DeviceChange::TerminateOthers,
+            "Завершить все остальные сеансы?",
+            "Другие устройства потеряют доступ к Telegram и потребуют повторного входа. Команда затронет все остальные сеансы, включая появившиеся после обновления списка. Текущий сеанс останется открыт.",
+            "Завершить все остальные",
+        );
     }
 
     fn confirm(self: &Rc<Self>, session: &DeviceSession) {
-        if self.closed.get() || self.busy() || !session.can_terminate() {
+        if !session.can_terminate() {
+            return;
+        }
+        self.confirm_change(
+            DeviceChange::Terminate(session.id),
+            "Завершить сеанс?",
+            &format!(
+                "{}\n{}\n{}\n\nНа этом устройстве потребуется снова войти в Telegram.",
+                session.device,
+                joined(&[&session.application, &session.app_version]),
+                joined(&[&session.ip, &session.country, &session.region])
+            ),
+            "Завершить сеанс",
+        );
+    }
+
+    fn confirm_change(
+        self: &Rc<Self>,
+        change: DeviceChange,
+        heading: &str,
+        body: &str,
+        action: &str,
+    ) {
+        if self.closed.get() || self.busy() {
             return;
         }
         let Some(parent) = self.dialog.upgrade() else {
@@ -286,22 +380,16 @@ impl DevicesDialog {
         self.confirming.set(true);
         self.update_controls();
         let confirmation = adw::AlertDialog::builder()
-            .heading("Завершить сеанс?")
+            .heading(heading)
             .body_use_markup(false)
-            .body(format!(
-                "{}\n{}\n{}\n\nНа этом устройстве потребуется снова войти в Telegram.",
-                session.device,
-                joined(&[&session.application, &session.app_version]),
-                joined(&[&session.ip, &session.country, &session.region])
-            ))
+            .body(body)
             .close_response("cancel")
             .default_response("cancel")
             .build();
         confirmation.add_response("cancel", "Отмена");
-        confirmation.add_response("terminate", "Завершить сеанс");
+        confirmation.add_response("terminate", action);
         confirmation.set_response_appearance("terminate", adw::ResponseAppearance::Destructive);
         let weak = Rc::downgrade(self);
-        let id = session.id;
         glib::MainContext::default().spawn_local(async move {
             let response = confirmation.choose_future(Some(&parent)).await;
             if let Some(state) = weak.upgrade()
@@ -310,20 +398,35 @@ impl DevicesDialog {
                 state.confirming.set(false);
                 state.update_controls();
                 if response == "terminate" {
-                    state.terminate(id);
+                    state.change(change);
                 }
             }
         });
     }
 
-    fn terminate(self: &Rc<Self>, id: i64) {
+    fn change(self: &Rc<Self>, change: DeviceChange) {
         if self.closed.get() || self.busy() {
             return;
         }
+        if let DeviceChange::SetTtl(days) = change
+            && (!SESSION_TTL_DAYS.contains(&days)
+                || self
+                    .snapshot
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.inactive_ttl_days == days))
+        {
+            return;
+        }
+        self.scroll.grab_focus();
         self.mutating.set(true);
-        self.status.set_text("Завершение сеанса…");
+        self.status.set_text(match change {
+            DeviceChange::SetTtl(_) => "Сохранение срока…",
+            DeviceChange::Terminate(_) => "Завершение сеанса…",
+            DeviceChange::TerminateOthers => "Завершение сеансов…",
+        });
         self.retry.set_visible(false);
-        let request = (self.context.terminate)(id);
+        let request = (self.context.change)(change);
         let task = self
             .context
             .runtime
@@ -345,20 +448,31 @@ impl DevicesDialog {
                 match result {
                     Ok(()) => {
                         if let Some(snapshot) = state.snapshot.borrow_mut().as_mut() {
-                            snapshot
-                                .sessions
-                                .retain(|session| session.id != id || session.current);
+                            snapshot.apply_confirmed(change);
                         }
                         state.render();
                         state.update_controls();
-                        state.load(Some("Сеанс завершён."));
+                        state.load(Some(match change {
+                            DeviceChange::Terminate(_) => "Сеанс завершён.",
+                            DeviceChange::TerminateOthers => "Другие сеансы завершены.",
+                            DeviceChange::SetTtl(_) => "Срок сохранён.",
+                        }));
                     }
                     Err(error) => {
                         state.status.set_text(&format!(
-                            "Не удалось подтвердить завершение сеанса. Обновите список. {error}"
+                            "{} Обновите список. {error}",
+                            match change {
+                                DeviceChange::SetTtl(_) =>
+                                    "Не удалось подтвердить сохранение срока.",
+                                DeviceChange::Terminate(_) =>
+                                    "Не удалось подтвердить завершение сеанса.",
+                                DeviceChange::TerminateOthers =>
+                                    "Не удалось подтвердить завершение сеансов.",
+                            }
                         ));
                         state.retry.set_visible(true);
                         state.update_controls();
+                        state.retry.grab_focus();
                     }
                 }
             }
@@ -389,4 +503,16 @@ fn timestamp(timestamp: i64) -> String {
         .flatten()
         .and_then(|time| time.format("%x %H:%M").ok())
         .map_or_else(|| "Неизвестно".into(), |time| time.to_string())
+}
+
+fn ttl_label(days: i32) -> String {
+    match days {
+        7 => "1 неделя".into(),
+        30 => "1 месяц".into(),
+        90 => "3 месяца".into(),
+        180 => "6 месяцев".into(),
+        365 => "1 год".into(),
+        days if days > 0 => format!("{days} дн. (текущий срок)"),
+        _ => "Срок не получен".into(),
+    }
 }

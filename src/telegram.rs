@@ -21,11 +21,11 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, DeviceSession,
-    DeviceSessions, FormattedText, HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage,
-    MAX_ALBUM_ITEMS, Message, PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, Reaction,
-    ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan,
-    TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, DeviceChange,
+    DeviceSession, DeviceSessions, FormattedText, HISTORY_PAGE_SIZE, HistoryRevision,
+    IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile, PlayableMedia, PlaybackFile,
+    PlaybackProgress, Reaction, ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit,
+    SearchPage, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{PendingSave, PlaybackDownload, attachment_name, open_session_file};
@@ -178,18 +178,27 @@ impl Telegram {
         Ok(device_sessions_view(raw.into()))
     }
 
-    pub async fn terminate_device_session(&self, id: i64) -> Result<()> {
-        let snapshot = self.device_sessions().await?;
-        let Some(request) = device_reset_request(&snapshot, id)? else {
-            // A different client may have already terminated this session.
-            return Ok(());
-        };
-        let confirmed = self
-            .client
-            .invoke(&request)
-            .await
-            .map_err(device_reset_error)?;
-        ensure!(confirmed, "Telegram не подтвердил завершение сеанса");
+    pub async fn change_device_session(&self, change: DeviceChange) -> Result<()> {
+        let confirmed = match change {
+            DeviceChange::Terminate(id) => {
+                let snapshot = self.device_sessions().await?;
+                let Some(request) = device_reset_request(&snapshot, id)? else {
+                    // A different client may have already terminated this session.
+                    return Ok(());
+                };
+                self.client.invoke(&request).await
+            }
+            DeviceChange::TerminateOthers => {
+                // This API atomically excludes the current authorization. tgrust
+                // uses live MTProto updates, not a registered push-device token.
+                self.client
+                    .invoke(&grammers_client::tl::functions::auth::ResetAuthorizations {})
+                    .await
+            }
+            DeviceChange::SetTtl(days) => self.client.invoke(&device_ttl_request(days)?).await,
+        }
+        .map_err(device_change_error)?;
+        ensure!(confirmed, "Telegram не подтвердил изменение сеансов");
         Ok(())
     }
 
@@ -1692,11 +1701,27 @@ fn device_reset_request(
         .then_some(grammers_client::tl::functions::account::ResetAuthorization { hash: id }))
 }
 
-fn device_reset_error(error: InvocationError) -> anyhow::Error {
+fn device_ttl_request(
+    days: i32,
+) -> Result<grammers_client::tl::functions::account::SetAuthorizationTtl> {
+    ensure!(
+        crate::model::SESSION_TTL_DAYS.contains(&days),
+        "Выберите срок 7, 30, 90, 180 или 365 дней"
+    );
+    Ok(
+        grammers_client::tl::functions::account::SetAuthorizationTtl {
+            authorization_ttl_days: days,
+        },
+    )
+}
+
+fn device_change_error(error: InvocationError) -> anyhow::Error {
     if error.is("FRESH_RESET_AUTHORISATION_FORBIDDEN") {
         anyhow::anyhow!(
-            "Telegram разрешает завершать другие сеансы только через 24 часа после входа на этом устройстве"
+            "Telegram ограничивает управление сеансами в первые 24 часа после входа на этом устройстве"
         )
+    } else if error.is("TTL_DAYS_INVALID") {
+        anyhow::anyhow!("Telegram отклонил выбранный срок. Обновите список устройств")
     } else if error.is("HASH_INVALID") {
         anyhow::anyhow!("Сеанс больше недоступен. Обновите список устройств")
     } else {
@@ -2476,6 +2501,19 @@ mod tests {
     }
 
     #[test]
+    fn session_ttl_requests_preserve_supported_days_and_reject_invalid_or_unoffered_values() {
+        for days in crate::model::SESSION_TTL_DAYS {
+            assert_eq!(
+                device_ttl_request(days).unwrap().authorization_ttl_days,
+                days
+            );
+        }
+        for days in [i32::MIN, -1, 0, 1, 14, 31, 366, i32::MAX] {
+            assert!(device_ttl_request(days).is_err());
+        }
+    }
+
+    #[test]
     fn devices_errors_explain_fresh_login_and_stale_session_without_logging_identifiers() {
         let error = |name: &str| {
             InvocationError::Rpc(RpcError {
@@ -2486,17 +2524,22 @@ mod tests {
             })
         };
         assert!(
-            device_reset_error(error("FRESH_RESET_AUTHORISATION_FORBIDDEN"))
+            device_change_error(error("FRESH_RESET_AUTHORISATION_FORBIDDEN"))
                 .to_string()
                 .contains("24 часа")
         );
         assert!(
-            device_reset_error(error("HASH_INVALID"))
+            device_change_error(error("TTL_DAYS_INVALID"))
+                .to_string()
+                .contains("отклонил выбранный срок")
+        );
+        assert!(
+            device_change_error(error("HASH_INVALID"))
                 .to_string()
                 .contains("Обновите список")
         );
         assert!(
-            device_reset_error(error("UNKNOWN_ERROR"))
+            device_change_error(error("UNKNOWN_ERROR"))
                 .to_string()
                 .contains("UNKNOWN_ERROR")
         );

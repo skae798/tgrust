@@ -1763,20 +1763,25 @@ impl Ui {
                         }
                     })
                 }),
-                terminate: Box::new(move |id| {
+                change: Box::new(move |change| {
+                    use crate::model::{DeviceChange, SESSION_TTL_DAYS};
                     let local = if demo {
                         let mut snapshot = demo_reset.borrow_mut();
-                        if id == 0
-                            || snapshot
-                                .sessions
-                                .iter()
-                                .any(|session| session.id == id && session.current)
-                        {
-                            Err(anyhow::anyhow!(
-                                "Текущий сеанс нельзя завершить из списка устройств"
-                            ))
+                        let invalid = match change {
+                            DeviceChange::Terminate(id) => {
+                                id == 0
+                                    || snapshot
+                                        .sessions
+                                        .iter()
+                                        .any(|session| session.id == id && session.current)
+                            }
+                            DeviceChange::SetTtl(days) => !SESSION_TTL_DAYS.contains(&days),
+                            DeviceChange::TerminateOthers => false,
+                        };
+                        if invalid {
+                            Err(anyhow::anyhow!("Недопустимое изменение сеанса"))
                         } else {
-                            snapshot.sessions.retain(|session| session.id != id);
+                            snapshot.apply_confirmed(change);
                             Ok(())
                         }
                     } else {
@@ -1789,7 +1794,7 @@ impl Ui {
                         } else {
                             client
                                 .context("Нет подключения к Telegram")?
-                                .terminate_device_session(id)
+                                .change_device_session(change)
                                 .await
                         }
                     })
