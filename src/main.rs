@@ -1,7 +1,9 @@
 mod contacts;
 mod demo;
 mod formatting;
+mod media_viewer;
 mod model;
+mod playback_controls;
 mod profile;
 mod read_state;
 mod search;
@@ -62,7 +64,11 @@ fn main() -> ExitCode {
         move |_, target| {
             let Some(app) = app.upgrade() else { return };
             app.activate();
-            if let Some(window) = app.active_window() {
+            if let Some(window) = app
+                .windows()
+                .into_iter()
+                .find(|window| window.is::<adw::ApplicationWindow>())
+            {
                 let _ = gtk::prelude::WidgetExt::activate_action(&window, "win.open-chat", target);
             }
         }

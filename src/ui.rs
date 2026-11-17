@@ -15,6 +15,8 @@ use crate::demo;
 use crate::formatting::{
     concealed_message, editor_text, message_attributes, set_editor_text, setup_editor,
 };
+use crate::media_viewer::fit_viewport as photo_viewport;
+use crate::model::PlayableMedia;
 use crate::model::{
     COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText, HISTORY_PAGE_SIZE,
     HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
@@ -116,7 +118,8 @@ struct Ui {
     reacting: RefCell<HashSet<(i64, i32)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
-    photo_viewer: glib::WeakRef<adw::Window>,
+    media_viewer: glib::WeakRef<adw::Window>,
+    media_generation: Cell<u64>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
 }
@@ -445,7 +448,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         reacting: RefCell::new(HashSet::new()),
         images: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
-        photo_viewer: glib::WeakRef::new(),
+        media_viewer: glib::WeakRef::new(),
+        media_generation: Cell::new(0),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
     });
@@ -747,7 +751,7 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
                     app.withdraw_notification(&notification_id(*id));
                 }
             }
-            if let Some(viewer) = ui.photo_viewer.upgrade() {
+            if let Some(viewer) = ui.media_viewer.upgrade() {
                 viewer.close();
             }
             ui.window.set(None);
@@ -1071,6 +1075,10 @@ impl Ui {
     }
 
     fn open_notified_chat(self: &Rc<Self>, id: i64) {
+        self.begin_media_preview();
+        if let Some(window) = self.window.upgrade() {
+            window.present();
+        }
         if self.chats.borrow().iter().any(|chat| chat.id == id) {
             self.show_chat(id, None);
         } else {
@@ -2355,6 +2363,8 @@ impl Ui {
                 previous_day = day;
             }
             let bubble = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            bubble.set_vexpand(false);
+            bubble.set_valign(gtk::Align::Start);
             bubble.add_css_class("message-bubble");
             bubble.set_widget_name(&format!("message-{}", message.id));
             if selected {
@@ -2415,7 +2425,10 @@ impl Ui {
                 bubble.append(&quote);
             }
             let is_album = group.len() > 1;
-            let photo_album = is_album && group.iter().all(|item| item.photo_preview);
+            let photo_album = is_album
+                && group.iter().all(|item| {
+                    item.photo_preview || matches!(item.playback, Some(PlayableMedia::Video { .. }))
+                });
             if let Some(chat) = self.selection.get() {
                 if photo_album {
                     let grid = gtk::FlowBox::builder()
@@ -2586,14 +2599,21 @@ impl Ui {
         in_album: bool,
     ) -> Option<gtk::Widget> {
         let id = message.id;
+        let playback = message.playback.filter(|_| !message.ephemeral);
+        let visual = message.photo_preview || matches!(playback, Some(PlayableMedia::Video { .. }));
         let preview = gtk::Stack::new();
+        preview.set_vexpand(false);
         let picture = gtk::Picture::builder()
             .content_fit(gtk::ContentFit::Contain)
             .can_shrink(true)
             .build();
         picture.update_property(&[gtk::accessible::Property::Label("Миниатюра вложения")]);
-        let fallback = if message.photo_preview {
-            let icon = gtk::Image::from_icon_name("image-x-generic-symbolic");
+        let fallback = if visual {
+            let icon = gtk::Image::from_icon_name(if playback.is_some() {
+                "media-playback-start-symbolic"
+            } else {
+                "image-x-generic-symbolic"
+            });
             icon.set_pixel_size(48);
             let (width, height) = if in_album { (120, 92) } else { (260, 128) };
             icon.set_size_request(width, height);
@@ -2616,7 +2636,7 @@ impl Ui {
         preview.add_child(&picture);
         preview.set_visible_child(&fallback);
         if let Some(media) = message.thumbnail {
-            let message_photo = message.photo_preview;
+            let message_photo = visual;
             self.load_chat_image(
                 ChatImage::attachment(chat, id, media),
                 glib::clone!(
@@ -2636,15 +2656,25 @@ impl Ui {
                 ),
             );
         }
-        if message.photo_preview {
+        if message.photo_preview || playback.is_some() {
             let button = gtk::Button::builder().child(&preview).build();
             button.add_css_class("flat");
             button.add_css_class("attachment-preview");
-            button.update_property(&[gtk::accessible::Property::Label("Открыть фото")]);
+            button.set_vexpand(false);
+            button.set_valign(gtk::Align::Start);
+            button.update_property(&[gtk::accessible::Property::Label(
+                playback.map_or("Открыть фото", PlayableMedia::open_label),
+            )]);
             button.connect_clicked(glib::clone!(
                 #[weak(rename_to = ui)]
                 self,
-                move |_| ui.open_photo_preview(chat, id)
+                move |_| {
+                    if let Some(media) = playback {
+                        ui.open_playback(chat, id, media);
+                    } else {
+                        ui.open_photo_preview(chat, id);
+                    }
+                }
             ));
             button.set_widget_name(&item_name);
             Some(button.upcast())
@@ -2927,6 +2957,17 @@ impl Ui {
                 ),
             );
         }
+        if let Some(media) = message.playback.filter(|_| !message.ephemeral) {
+            add_menu_button(
+                &menu,
+                media.open_label(),
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.open_playback(chat, id, media)
+                ),
+            );
+        }
         if message.photo_preview {
             add_menu_button(
                 &menu,
@@ -3097,6 +3138,7 @@ impl Ui {
                 timestamp: demo::now(),
                 attachment: None,
                 photo_preview: false,
+                playback: None,
                 thumbnail: None,
                 reply_to,
                 reply_preview: reply.map(|reply| reply.preview),
@@ -3747,7 +3789,48 @@ impl Ui {
         });
     }
 
+    fn begin_media_preview(&self) -> u64 {
+        let request = self.media_generation.get().wrapping_add(1);
+        self.media_generation.set(request);
+        if let Some(previous) = self.media_viewer.upgrade() {
+            previous.close();
+        }
+        request
+    }
+
+    fn open_playback(self: &Rc<Self>, chat: i64, id: i32, media: PlayableMedia) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        self.begin_media_preview();
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let viewer = crate::media_viewer::open(
+            &window,
+            crate::media_viewer::PlaybackContext {
+                runtime: self.runtime.clone(),
+                media,
+                muted: demo,
+                load: Box::new(move |progress| {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            demo::playback_preview(media, progress).await
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .playback_preview(chat, id, progress)
+                                .await
+                        }
+                    })
+                }),
+            },
+        );
+        self.media_viewer.set(Some(&viewer));
+    }
+
     fn open_photo_preview(self: &Rc<Self>, chat: i64, id: i32) {
+        let request = self.begin_media_preview();
         if self.is_demo.get() {
             self.present_photo(self.demo_image.get_or_init(demo_texture).upcast_ref());
         } else if let Some(client) = self.client.borrow().clone() {
@@ -3757,6 +3840,9 @@ impl Ui {
                 async move { client.photo_preview(chat, id).await },
                 move |ui, result| {
                     progress.dismiss();
+                    if ui.media_generation.get() != request {
+                        return;
+                    }
                     let texture = result.and_then(|bytes| {
                         gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
                             .map_err(anyhow::Error::from)
@@ -3796,10 +3882,9 @@ impl Ui {
             .resizable(false)
             .build();
         viewer.set_display(&display);
-        if let Some(previous) = self.photo_viewer.upgrade() {
-            previous.close();
-        }
-        self.photo_viewer.set(Some(&viewer));
+        viewer.set_application(window.application().as_ref());
+        viewer.set_size_request(-1, -1);
+        self.media_viewer.set(Some(&viewer));
         let toolbar = adw::ToolbarView::new();
         let header = adw::HeaderBar::builder()
             .show_title(false)
@@ -3820,6 +3905,7 @@ impl Ui {
             (texture.width(), texture.height()),
             (screen_width, screen_height),
             (header_width, header_height),
+            crate::media_viewer::frame_spacing(&viewer),
         );
         let content = gtk::Overlay::new();
         content.set_size_request(width, height);
@@ -3925,29 +4011,6 @@ fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {
     (quote, author, excerpt)
 }
 
-fn photo_viewport(
-    (width, height): (i32, i32),
-    (screen_width, screen_height): (i32, i32),
-    (header_width, header_height): (i32, i32),
-) -> (i32, i32) {
-    let (width, height) = (f64::from(width), f64::from(height));
-    let (screen_width, screen_height) = (f64::from(screen_width), f64::from(screen_height));
-    let (header_width, header_height) = (f64::from(header_width.max(1)), f64::from(header_height));
-    let area = screen_width * screen_height / 4.0;
-    // Solve (width * scale) * (height * scale + header_height) <= area.
-    let scale = (2.0 * area
-        / ((width * header_height).hypot((4.0 * width * height * area).sqrt())
-            + width * header_height))
-        .min((area / header_width - header_height) / height)
-        .min(screen_width / width)
-        .min((screen_height - header_height) / height)
-        .clamp(0.0, 1.0);
-    (
-        (width * scale).floor().max(1.0) as i32,
-        (height * scale).floor().max(1.0) as i32,
-    )
-}
-
 fn scaled_thumbnail(texture: &gtk::gdk::Texture) -> Option<gtk::gdk::Texture> {
     let width = f64::from(texture.width());
     let height = f64::from(texture.height());
@@ -4034,8 +4097,8 @@ mod tests {
         for screen @ (screen_width, screen_height) in [(1280, 800), (800, 1280), (640, 480)] {
             for (width, height) in [(480, 300), (1600, 1200), (900, 1600), (15, 1600), (1600, 9)] {
                 let (fitted_width, fitted_height) =
-                    photo_viewport((width, height), screen, (44, 47));
-                let area = fitted_width.max(44) * (fitted_height + 47);
+                    photo_viewport((width, height), screen, (44, 47), (10, 10));
+                let area = (fitted_width.max(44) + 10) * (fitted_height + 47 + 10);
                 assert!(4 * area <= screen_width * screen_height);
                 assert!(fitted_width <= width && fitted_height <= height);
                 assert!((fitted_width * height - fitted_height * width).abs() <= width.max(height));

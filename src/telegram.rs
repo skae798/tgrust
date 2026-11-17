@@ -23,10 +23,11 @@ use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
-    Reaction, ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage,
-    TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
+    PlayableMedia, PlaybackFile, PlaybackProgress, Reaction, ReadRequest, ReplyPreview,
+    SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
+    UploadKind, redact_spoilers,
 };
-use crate::storage::{PendingSave, attachment_name, open_session_file};
+use crate::storage::{PendingSave, PlaybackDownload, attachment_name, open_session_file};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginStep {
@@ -1213,6 +1214,58 @@ impl Telegram {
         }
     }
 
+    pub async fn playback_preview(
+        &self,
+        chat: i64,
+        id: i32,
+        progress: watch::Sender<PlaybackProgress>,
+    ) -> Result<PlaybackFile> {
+        let peer = self.peer(chat).await?;
+        let mut media = self.attachment_media(peer, id).await?;
+        let kind = playable_media(&media).context("Это вложение нельзя воспроизвести")?;
+        let identity = attachment_id(&media);
+        let expected = media.size().context("Неизвестен размер медиа")? as u64;
+        let mut output = PlaybackDownload::new(expected)?;
+        let mut received = 0;
+        let mut retried = false;
+        progress.send_replace(PlaybackProgress {
+            received,
+            total: expected,
+        });
+        let mut download = self.client.iter_download(&media);
+        loop {
+            match download.next().await {
+                Ok(Some(chunk)) => {
+                    output.write(&chunk).await?;
+                    received += chunk.len() as u64;
+                    progress.send_replace(PlaybackProgress {
+                        received,
+                        total: expected,
+                    });
+                }
+                Ok(None) => return output.finish(kind).await,
+                Err(error) if !retried && expired_file_reference(&error) => {
+                    media = self.attachment_media(peer, id).await?;
+                    ensure!(
+                        attachment_id(&media) == identity
+                            && playable_media(&media) == Some(kind)
+                            && media.size().map(|size| size as u64) == Some(expected),
+                        "Медиа в сообщении изменилось"
+                    );
+                    output.restart().await?;
+                    received = 0;
+                    progress.send_replace(PlaybackProgress {
+                        received,
+                        total: expected,
+                    });
+                    download = self.client.iter_download(&media);
+                    retried = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
     pub async fn photo_preview(&self, chat: i64, id: i32) -> Result<Vec<u8>> {
         let peer = self.peer(chat).await?;
         let mut previous = None;
@@ -1795,6 +1848,9 @@ fn message_view(
     let outgoing = message.outgoing();
     let attachment = attachment(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
+    let playback = attachment
+        .as_ref()
+        .and_then(|(media, _)| playable_media(media));
     let thumbnail = attachment.as_ref().and_then(|(media, _)| thumbnail(media));
     let (reply_to, reply_preview) = match &message.raw {
         enums::Message::Message(raw) => match &raw.reply_to {
@@ -1842,6 +1898,7 @@ fn message_view(
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
+        playback,
         thumbnail,
         reply_to,
         reply_preview,
@@ -2149,6 +2206,59 @@ fn notification_for(message: &TelegramMessage, started: SystemTime) -> Option<In
     })
 }
 
+fn playable_media(media: &Media) -> Option<PlayableMedia> {
+    let Media::Document(document) = media else {
+        return None;
+    };
+    if document.raw.ttl_seconds.is_some() {
+        return None;
+    }
+    let Some(enums::Document::Document(raw)) = &document.raw.document else {
+        return None;
+    };
+    raw.attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            enums::DocumentAttribute::Video(video) => Some(PlayableMedia::Video {
+                width: video.w,
+                height: video.h,
+            }),
+            enums::DocumentAttribute::Audio(_) => Some(PlayableMedia::Audio),
+            _ => None,
+        })
+        .or_else(|| {
+            let mime = raw.mime_type.to_ascii_lowercase();
+            if mime.starts_with("video/") {
+                Some(PlayableMedia::Video {
+                    width: 0,
+                    height: 0,
+                })
+            } else if mime.starts_with("audio/") {
+                Some(PlayableMedia::Audio)
+            } else if matches!(mime.as_str(), "application/octet-stream" | "image/gif") {
+                let extension = document
+                    .name()
+                    .and_then(|name| std::path::Path::new(name).extension())?
+                    .to_str()?
+                    .to_ascii_lowercase();
+                match extension.as_str() {
+                    "mp4" | "webm" | "mkv" | "mov" | "m4v" | "avi" | "3gp" | "gif" => {
+                        Some(PlayableMedia::Video {
+                            width: 0,
+                            height: 0,
+                        })
+                    }
+                    "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" => {
+                        Some(PlayableMedia::Audio)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+}
+
 fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
     let enums::Message::Message(raw) = &message.raw else {
         return None;
@@ -2176,6 +2286,94 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn playback_classification_uses_attributes_mime_and_document_names_but_excludes_ttl() {
+        let media = |mime: &str, attributes: Vec<enums::DocumentAttribute>, ttl_seconds| {
+            Media::Document(grammers_client::media::Document::from_raw_media(
+                types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(
+                        types::Document {
+                            id: 1,
+                            access_hash: 0,
+                            file_reference: vec![],
+                            date: 0,
+                            mime_type: mime.into(),
+                            size: 4,
+                            thumbs: None,
+                            video_thumbs: None,
+                            dc_id: 1,
+                            attributes,
+                        }
+                        .into(),
+                    ),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds,
+                },
+            ))
+        };
+        assert_eq!(
+            playable_media(&media("VIDEO/MP4", vec![], None)),
+            Some(PlayableMedia::Video {
+                width: 0,
+                height: 0
+            })
+        );
+        assert_eq!(
+            playable_media(&media("audio/ogg", vec![], None)),
+            Some(PlayableMedia::Audio)
+        );
+        assert_eq!(
+            playable_media(&media(
+                "application/octet-stream",
+                vec![
+                    types::DocumentAttributeFilename {
+                        file_name: "sample.MP4".into()
+                    }
+                    .into()
+                ],
+                None
+            )),
+            Some(PlayableMedia::Video {
+                width: 0,
+                height: 0
+            })
+        );
+        let video = types::DocumentAttributeVideo {
+            round_message: true,
+            supports_streaming: true,
+            nosound: false,
+            duration: 8.0,
+            w: 720,
+            h: 1280,
+            preload_prefix_size: None,
+            video_start_ts: None,
+            video_codec: None,
+        };
+        assert_eq!(
+            playable_media(&media(
+                "application/octet-stream",
+                vec![video.clone().into()],
+                None
+            )),
+            Some(PlayableMedia::Video {
+                width: 720,
+                height: 1280
+            })
+        );
+        assert_eq!(
+            playable_media(&media("video/mp4", vec![video.into()], Some(1))),
+            None
+        );
+        assert_eq!(playable_media(&media("text/plain", vec![], None)), None);
+    }
 
     #[test]
     fn changing_folder_pins_preserves_all_other_settings_and_peer_types() {
