@@ -58,6 +58,7 @@ pub struct Telegram {
     profile: OnceCell<Peer>,
     contacts_cache: Mutex<Option<ContactSnapshot>>,
     contacts_revision: AtomicU64,
+    dialog_settings: Mutex<()>,
 }
 
 struct ContactSnapshot {
@@ -144,6 +145,7 @@ impl Telegram {
                 profile: OnceCell::new(),
                 contacts_cache: Mutex::new(None),
                 contacts_revision: AtomicU64::new(0),
+                dialog_settings: Mutex::new(()),
             }),
             step,
         ))
@@ -276,6 +278,8 @@ impl Telegram {
                             | enums::Update::PinnedChannelMessages(_)
                             | enums::Update::MessageReactions(_)
                             | enums::Update::FolderPeers(_)
+                            | enums::Update::DialogPinned(_)
+                            | enums::Update::PinnedDialogs(_)
                             | enums::Update::NotifySettings(_)
                     ) {
                         self.invalidate_views();
@@ -444,6 +448,8 @@ impl Telegram {
             };
             chats.push(Chat {
                 id,
+                pinned: raw.pinned,
+                last_activity: last.map_or(0, |message| message.date().as_second()),
                 title: title.to_owned(),
                 preview: last
                     .map(|message| {
@@ -679,6 +685,55 @@ impl Telegram {
         Ok(())
     }
 
+    pub async fn set_chat_pinned(
+        &self,
+        chat: i64,
+        pinned: bool,
+        folder: Option<i32>,
+    ) -> Result<()> {
+        let _settings = self.dialog_settings.lock().await;
+        let reference = self.peer(chat).await?;
+        let accepted = if let Some(id) = folder {
+            // Read the complete current filter; never rebuild it from the smaller UI model.
+            let enums::messages::DialogFilters::Filters(result) = self
+                .client
+                .invoke(&grammers_client::tl::functions::messages::GetDialogFilters {})
+                .await?;
+            let mut filter = result
+                .filters
+                .into_iter()
+                .find(|filter| match filter {
+                    enums::DialogFilter::Filter(filter) => filter.id == id,
+                    enums::DialogFilter::Chatlist(filter) => filter.id == id,
+                    enums::DialogFilter::Default => false,
+                })
+                .context("Папка больше не существует. Обновите список папок")?;
+            let self_id = self.self_id().await?;
+            set_folder_pin(&mut filter, reference.into(), pinned, self_id)?;
+            self.client
+                .invoke(
+                    &grammers_client::tl::functions::messages::UpdateDialogFilter {
+                        id,
+                        filter: Some(filter),
+                    },
+                )
+                .await?
+        } else {
+            self.client
+                .invoke(&grammers_client::tl::functions::messages::ToggleDialogPin {
+                    pinned,
+                    peer: grammers_client::tl::types::InputDialogPeer {
+                        peer: reference.into(),
+                    }
+                    .into(),
+                })
+                .await?
+        };
+        ensure!(accepted, "Telegram не подтвердил изменение закрепления");
+        self.invalidate_views();
+        Ok(())
+    }
+
     pub async fn folders(&self) -> Result<Vec<ChatFolder>> {
         let self_id = self.self_id().await?;
         let enums::messages::DialogFilters::Filters(result) = self
@@ -693,6 +748,7 @@ impl Telegram {
     }
 
     pub async fn set_archived(&self, chat: i64, archived: bool) -> Result<()> {
+        let _settings = self.dialog_settings.lock().await;
         let peer = self.peer(chat).await?;
         self.client
             .invoke(&grammers_client::tl::functions::folders::EditPeerFolders {
@@ -793,6 +849,8 @@ impl Telegram {
             buffer.push(SearchHit {
                 chat: Chat {
                     id,
+                    pinned: false,
+                    last_activity: 0,
                     title: match peer {
                         Peer::User(user) if user.is_self() => "Избранное",
                         _ => peer
@@ -1516,22 +1574,45 @@ fn chat_kind(peer: &Peer) -> ChatKind {
     }
 }
 
+fn input_peer_id(peer: &enums::InputPeer, self_id: Option<PeerId>) -> Option<i64> {
+    match peer {
+        enums::InputPeer::PeerSelf => self_id,
+        enums::InputPeer::User(peer) => PeerId::user(peer.user_id),
+        enums::InputPeer::Chat(peer) => PeerId::chat(peer.chat_id),
+        enums::InputPeer::Channel(peer) => PeerId::channel(peer.channel_id),
+        enums::InputPeer::UserFromMessage(peer) => PeerId::user(peer.user_id),
+        enums::InputPeer::ChannelFromMessage(peer) => PeerId::channel(peer.channel_id),
+        enums::InputPeer::Empty => None,
+    }?
+    .bot_api_dialog_id()
+}
+
+fn set_folder_pin(
+    filter: &mut enums::DialogFilter,
+    peer: enums::InputPeer,
+    pinned: bool,
+    self_id: Option<PeerId>,
+) -> Result<()> {
+    let id = input_peer_id(&peer, self_id).context("Чат недоступен для закрепления")?;
+    let pins = match filter {
+        enums::DialogFilter::Filter(filter) => &mut filter.pinned_peers,
+        enums::DialogFilter::Chatlist(filter) => &mut filter.pinned_peers,
+        enums::DialogFilter::Default => {
+            bail!("Для общего списка используется отдельное закрепление")
+        }
+    };
+    pins.retain(|peer| input_peer_id(peer, self_id) != Some(id));
+    if pinned {
+        pins.insert(0, peer);
+    }
+    Ok(())
+}
+
 fn folder_view(folder: enums::DialogFilter, self_id: Option<PeerId>) -> Option<ChatFolder> {
     fn peers(peers: Vec<enums::InputPeer>, self_id: Option<PeerId>) -> Vec<i64> {
         peers
-            .into_iter()
-            .filter_map(|peer| {
-                match peer {
-                    enums::InputPeer::PeerSelf => self_id,
-                    enums::InputPeer::User(peer) => PeerId::user(peer.user_id),
-                    enums::InputPeer::Chat(peer) => PeerId::chat(peer.chat_id),
-                    enums::InputPeer::Channel(peer) => PeerId::channel(peer.channel_id),
-                    enums::InputPeer::UserFromMessage(peer) => PeerId::user(peer.user_id),
-                    enums::InputPeer::ChannelFromMessage(peer) => PeerId::channel(peer.channel_id),
-                    enums::InputPeer::Empty => None,
-                }?
-                .bot_api_dialog_id()
-            })
+            .iter()
+            .filter_map(|peer| input_peer_id(peer, self_id))
             .collect()
     }
     let result = match folder {
@@ -2004,6 +2085,100 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn changing_folder_pins_preserves_all_other_settings_and_peer_types() {
+        let user = |id, access_hash| {
+            enums::InputPeer::User(types::InputPeerUser {
+                user_id: id,
+                access_hash,
+            })
+        };
+        let channel: enums::InputPeer = types::InputPeerChannel {
+            channel_id: 5,
+            access_hash: 9,
+        }
+        .into();
+        let mut filter: enums::DialogFilter = types::DialogFilter {
+            contacts: true,
+            non_contacts: true,
+            groups: true,
+            broadcasts: false,
+            bots: true,
+            exclude_muted: true,
+            exclude_read: false,
+            exclude_archived: true,
+            title_noanimate: true,
+            id: 4,
+            title: types::TextWithEntities {
+                text: "Проверочная папка".into(),
+                entities: vec![],
+            }
+            .into(),
+            emoticon: Some("🌿".into()),
+            color: Some(3),
+            pinned_peers: vec![user(5, 1), channel.clone(), enums::InputPeer::PeerSelf],
+            include_peers: vec![user(8, 2)],
+            exclude_peers: vec![user(9, 3)],
+        }
+        .into();
+        let original = filter.clone();
+        let self_id = PeerId::user(5);
+        set_folder_pin(&mut filter, user(5, 4), true, self_id).unwrap();
+        let mut expected = original.clone();
+        let enums::DialogFilter::Filter(value) = &mut expected else {
+            unreachable!()
+        };
+        value.pinned_peers = vec![user(5, 4), channel.clone()];
+        assert_eq!(filter, expected);
+        set_folder_pin(&mut filter, enums::InputPeer::PeerSelf, false, self_id).unwrap();
+        let enums::DialogFilter::Filter(value) = &mut expected else {
+            unreachable!()
+        };
+        value.pinned_peers = vec![channel];
+        assert_eq!(filter, expected);
+        assert!(set_folder_pin(&mut filter, enums::InputPeer::Empty, true, self_id).is_err());
+        assert_eq!(filter, expected);
+    }
+
+    #[test]
+    fn shared_folder_pins_keep_invites_title_and_included_chats() {
+        let peer: enums::InputPeer = types::InputPeerChat { chat_id: 42 }.into();
+        let mut filter: enums::DialogFilter = types::DialogFilterChatlist {
+            has_my_invites: true,
+            title_noanimate: true,
+            id: 8,
+            title: types::TextWithEntities {
+                text: "Общая папка".into(),
+                entities: vec![],
+            }
+            .into(),
+            emoticon: Some("💬".into()),
+            color: Some(1),
+            pinned_peers: vec![],
+            include_peers: vec![peer.clone()],
+        }
+        .into();
+        let original = filter.clone();
+        set_folder_pin(&mut filter, peer.clone(), true, None).unwrap();
+        let mut expected = original.clone();
+        let enums::DialogFilter::Chatlist(value) = &mut expected else {
+            unreachable!()
+        };
+        value.pinned_peers = vec![peer.clone()];
+        assert_eq!(filter, expected);
+        set_folder_pin(&mut filter, peer, false, None).unwrap();
+        assert_eq!(filter, original);
+        assert!(
+            set_folder_pin(
+                &mut enums::DialogFilter::Default,
+                types::InputPeerChat { chat_id: 42 }.into(),
+                true,
+                None
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn contacts_cache_expires_and_metadata_updates_invalidate_it() {

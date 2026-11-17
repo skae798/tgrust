@@ -14,6 +14,8 @@ const CACHE_FRESHNESS: Duration = Duration::from_mins(15);
 #[derive(Clone)]
 pub struct Chat {
     pub id: i64,
+    pub pinned: bool,
+    pub last_activity: i64,
     pub title: String,
     pub preview: String,
     pub preview_sender: Option<String>,
@@ -79,6 +81,8 @@ impl Contact {
     pub fn chat(&self) -> Chat {
         Chat {
             id: self.id,
+            pinned: false,
+            last_activity: 0,
             title: if self.is_self {
                 "Избранное".to_owned()
             } else {
@@ -97,6 +101,23 @@ impl Contact {
             avatar: self.avatar,
         }
     }
+}
+
+pub fn order_chats(chats: &mut [&Chat], folder: Option<&ChatFolder>) {
+    chats.sort_by_key(|chat| {
+        let rank = folder.map_or(usize::from(!chat.pinned), |folder| {
+            folder
+                .pinned
+                .iter()
+                .position(|id| *id == chat.id)
+                .unwrap_or(usize::MAX)
+        });
+        let pinned = folder.map_or(chat.pinned, |folder| folder.pinned.contains(&chat.id));
+        (
+            rank,
+            std::cmp::Reverse(if pinned { 0 } else { chat.last_activity }),
+        )
+    });
 }
 
 #[derive(Clone)]
@@ -548,6 +569,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_order_keeps_server_pin_order_and_uses_separate_folder_pins() {
+        let base = crate::demo::chats().remove(0);
+        let chats: Vec<_> = [(1, true, 10), (2, false, 30), (3, true, 20), (4, false, 40)]
+            .into_iter()
+            .map(|(id, pinned, last_activity)| Chat {
+                id,
+                pinned,
+                last_activity,
+                ..base.clone()
+            })
+            .collect();
+        let mut visible: Vec<_> = chats.iter().collect();
+        order_chats(&mut visible, None);
+        assert_eq!(
+            visible.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+            [1, 3, 4, 2]
+        );
+        let folder = ChatFolder {
+            pinned: vec![2, 1],
+            ..ChatFolder::default()
+        };
+        order_chats(&mut visible, Some(&folder));
+        assert_eq!(
+            visible.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+            [2, 1, 4, 3]
+        );
+        let folder = ChatFolder::default();
+        order_chats(&mut visible, Some(&folder));
+        assert_eq!(
+            visible.iter().map(|chat| chat.id).collect::<Vec<_>>(),
+            [4, 2, 3, 1]
+        );
+    }
+
+    #[test]
     fn contact_search_matches_names_aliases_and_formatted_phone_numbers() {
         let mut contact = crate::demo::contacts().remove(0);
         for query in [
@@ -633,6 +689,8 @@ mod tests {
     fn explicit_folder_members_override_categories_and_archive_filter() {
         let chat = Chat {
             id: 1,
+            pinned: false,
+            last_activity: 0,
             title: "Тест".into(),
             preview: String::new(),
             preview_sender: None,

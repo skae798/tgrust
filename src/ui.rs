@@ -18,7 +18,8 @@ use crate::formatting::{
 use crate::model::{
     COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText, HISTORY_PAGE_SIZE,
     HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction, Reply,
-    SearchHit, TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, redact_spoilers,
+    SearchHit, TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats,
+    redact_spoilers,
 };
 use crate::storage::{PendingSave, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -45,6 +46,10 @@ struct Ui {
     split: adw::NavigationSplitView,
     toasts: adw::ToastOverlay,
     list: gtk::ListBox,
+    chat_menu: gtk::Popover,
+    menu_chat: Cell<Option<i64>>,
+    restore_chat_focus: Cell<bool>,
+    pinning_chats: RefCell<HashSet<i64>>,
     filter: gtk::SearchEntry,
     archive: gtk::ToggleButton,
     archive_chat: gtk::Button,
@@ -220,7 +225,12 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         .vexpand(true)
         .child(&list)
         .build();
-    side_body.append(&list_scroll);
+    let list_overlay = gtk::Overlay::new();
+    list_overlay.set_child(Some(&list_scroll));
+    let chat_menu = gtk::Popover::new();
+    chat_menu.set_has_arrow(false);
+    list_overlay.add_overlay(&chat_menu);
+    side_body.append(&list_overlay);
     sidebar.set_content(Some(&side_body));
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Чаты")));
 
@@ -363,6 +373,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         split,
         toasts,
         list,
+        chat_menu,
+        menu_chat: Cell::new(None),
+        restore_chat_focus: Cell::new(false),
+        pinning_chats: RefCell::new(HashSet::new()),
         filter,
         archive,
         archive_chat,
@@ -665,6 +679,38 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         }
     ));
     ui.message_menu.add_controller(menu_keys);
+    let chat_menu_keys = gtk::EventControllerKey::new();
+    chat_menu_keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    chat_menu_keys.connect_key_pressed(glib::clone!(
+        #[weak]
+        ui,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, key, _, _| {
+            if key == gtk::gdk::Key::Escape {
+                ui.restore_chat_focus.set(true);
+                ui.chat_menu.popdown();
+                if let Some(id) = ui.menu_chat.get() {
+                    ui.focus_chat_row(id);
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        }
+    ));
+    ui.chat_menu.add_controller(chat_menu_keys);
+    ui.chat_menu.connect_closed(glib::clone!(
+        #[weak]
+        ui,
+        move |_| {
+            if let Some(id) = ui.menu_chat.take()
+                && ui.restore_chat_focus.replace(false)
+            {
+                ui.focus_chat_row(id);
+            }
+        }
+    ));
     window.connect_is_active_notify(glib::clone!(
         #[weak]
         ui,
@@ -1111,6 +1157,13 @@ impl Ui {
     fn render_chats(self: &Rc<Self>) {
         self.update_archive_button();
         self.update_mute_button();
+        let focused = self
+            .list
+            .root()
+            .and_then(|root| gtk::prelude::RootExt::focus(&root))
+            .and_then(|widget| widget.ancestor(gtk::ListBoxRow::static_type()))
+            .filter(|row| row.parent().is_some_and(|parent| parent == self.list))
+            .and_then(|row| row.widget_name().parse().ok());
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
@@ -1127,15 +1180,7 @@ impl Ui {
                 in_list && chat.title.to_lowercase().contains(&query)
             })
             .collect::<Vec<_>>();
-        if let Some(folder) = &folder {
-            visible.sort_by_key(|chat| {
-                folder
-                    .pinned
-                    .iter()
-                    .position(|id| *id == chat.id)
-                    .unwrap_or(usize::MAX)
-            });
-        }
+        order_chats(&mut visible, folder.as_ref());
         for chat in visible {
             let row = gtk::ListBoxRow::new();
             row.set_widget_name(&chat.id.to_string());
@@ -1165,6 +1210,17 @@ impl Ui {
             let title_line = gtk::Box::new(gtk::Orientation::Horizontal, 4);
             title.set_hexpand(true);
             title_line.append(&title);
+            if folder
+                .as_ref()
+                .map_or(chat.pinned, |folder| folder.pinned.contains(&chat.id))
+            {
+                let pin = gtk::Image::from_icon_name("view-pin-symbolic");
+                pin.set_pixel_size(12);
+                pin.add_css_class("dim-label");
+                pin.set_tooltip_text(Some("Закреплённый чат"));
+                pin.update_property(&[gtk::accessible::Property::Label("Закреплённый чат")]);
+                title_line.append(&pin);
+            }
             if chat.muted {
                 let muted = gtk::Image::from_icon_name("notifications-disabled-symbolic");
                 muted.set_pixel_size(12);
@@ -1211,15 +1267,192 @@ impl Ui {
                 line.append(&unread);
             }
             row.set_child(Some(&line));
+            self.connect_chat_menu(&row, chat.id);
             self.list.append(&row);
             if self.selection.get() == Some(chat.id) {
                 self.list.select_row(Some(&row));
             }
         }
+        if let Some(id) = focused {
+            self.focus_chat_row(id);
+        }
     }
 
     fn select_chat(self: &Rc<Self>, id: i64) {
         self.show_chat(id, None);
+    }
+
+    fn connect_chat_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, id: i64) {
+        let click = gtk::GestureClick::new();
+        click.set_button(gtk::gdk::BUTTON_SECONDARY);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(|gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        click.connect_released(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[weak]
+            row,
+            move |_, _, x, y| ui.open_chat_menu(&row, id, x, y)
+        ));
+        row.add_controller(click);
+        let keys = gtk::EventControllerKey::new();
+        keys.connect_key_pressed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[weak]
+            row,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, key, _, modifiers| {
+                if key == gtk::gdk::Key::Menu
+                    || (key == gtk::gdk::Key::F10
+                        && modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK))
+                {
+                    ui.open_chat_menu(
+                        &row,
+                        id,
+                        f64::from(row.width()) / 2.0,
+                        f64::from(row.height()) / 2.0,
+                    );
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        row.add_controller(keys);
+    }
+
+    fn focus_chat_row(&self, id: i64) {
+        let mut index = 0;
+        while let Some(row) = self.list.row_at_index(index) {
+            if row.widget_name() == id.to_string() {
+                row.grab_focus();
+                break;
+            }
+            index += 1;
+        }
+    }
+
+    fn open_chat_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, id: i64, x: f64, y: f64) {
+        let folder = (!self.archive.is_active())
+            .then(|| self.selected_folder())
+            .flatten();
+        let Some(pinned) = self
+            .chats
+            .borrow()
+            .iter()
+            .find(|chat| chat.id == id)
+            .map(|chat| {
+                folder
+                    .as_ref()
+                    .map_or(chat.pinned, |folder| folder.pinned.contains(&id))
+            })
+        else {
+            return;
+        };
+        let Some(parent) = self.chat_menu.parent() else {
+            return;
+        };
+        let Some(point) =
+            row.compute_point(&parent, &gtk::graphene::Point::new(x as f32, y as f32))
+        else {
+            return;
+        };
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let folder = folder.map(|folder| folder.id);
+        let pin = gtk::Button::with_label(if pinned {
+            "Открепить чат"
+        } else {
+            "Закрепить чат"
+        });
+        pin.add_css_class("flat");
+        pin.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.restore_chat_focus.set(true);
+                ui.chat_menu.popdown();
+                ui.pin_chat(id, !pinned, folder);
+            }
+        ));
+        menu.append(&pin);
+        menu.set_sensitive(!self.pinning_chats.borrow().contains(&id));
+        self.restore_chat_focus.set(false);
+        self.menu_chat.set(Some(id));
+        self.chat_menu.set_child(Some(&menu));
+        self.chat_menu
+            .set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                point.x() as i32,
+                point.y() as i32,
+                1,
+                1,
+            )));
+        self.chat_menu.popup();
+        self.chat_menu.child_focus(gtk::DirectionType::TabForward);
+    }
+
+    fn pin_chat(self: &Rc<Self>, id: i64, pinned: bool, folder: Option<i32>) {
+        if self.pinning_chats.borrow().contains(&id) {
+            return;
+        }
+        if self.is_demo.get() {
+            self.apply_chat_pin(id, pinned, folder);
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        self.pinning_chats.borrow_mut().insert(id);
+        self.job(
+            async move { client.set_chat_pinned(id, pinned, folder).await },
+            move |ui, result| {
+                ui.pinning_chats.borrow_mut().remove(&id);
+                match result {
+                    Ok(()) => {
+                        ui.apply_chat_pin(id, pinned, folder);
+                        ui.refresh_chats();
+                        ui.refresh_folders();
+                    }
+                    Err(error) => {
+                        ui.toast(&format!("Не удалось изменить закрепление чата. {error}"))
+                    }
+                }
+            },
+        );
+    }
+
+    fn apply_chat_pin(self: &Rc<Self>, id: i64, pinned: bool, folder: Option<i32>) {
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
+        if let Some(folder) = folder {
+            if let Some(folder) = self
+                .folders
+                .borrow_mut()
+                .iter_mut()
+                .find(|item| item.id == folder)
+            {
+                folder.pinned.retain(|item| *item != id);
+                if pinned {
+                    folder.pinned.insert(0, id);
+                }
+            }
+        } else {
+            let mut chats = self.chats.borrow_mut();
+            if let Some(index) = chats.iter().position(|chat| chat.id == id) {
+                let mut chat = chats.remove(index);
+                chat.pinned = pinned;
+                chats.insert(0, chat);
+            }
+        }
+        self.render_chats();
+        self.toast(if pinned {
+            "Чат закреплён"
+        } else {
+            "Чат откреплён"
+        });
     }
 
     fn update_archive_button(&self) {
@@ -1296,6 +1529,7 @@ impl Ui {
             .find(|chat| chat.id == id)
         {
             chat.archived = archived;
+            chat.pinned = false;
         }
         if self.selection.get() == Some(id) {
             self.archive.set_active(archived);
@@ -2958,6 +3192,7 @@ impl Ui {
                 .find(|message| !message.text.is_empty())
                 .map(|message| message.preview_text().into_owned())
                 .unwrap_or_else(|| "Вложение".into());
+            chat.last_activity = last.timestamp;
             chat.preview_sender = chat.group.then(|| last.sender.clone());
             chat.preview_image = last
                 .thumbnail

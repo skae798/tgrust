@@ -27,6 +27,8 @@ pub fn chats() -> Vec<Chat> {
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
         id,
+        pinned: false,
+        last_activity: now() - id,
         title: title.to_owned(),
         preview: preview.to_owned(),
         preview_sender: (id == 1).then(|| "Анна".to_owned()),
