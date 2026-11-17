@@ -7,6 +7,7 @@ mod playback_controls;
 mod profile;
 mod read_state;
 mod search;
+mod session_runner;
 mod storage;
 mod telegram;
 mod ui;

@@ -86,6 +86,16 @@ impl PlaybackDownload {
     }
 }
 
+/// Explicitly unlock before closing: a forked child can briefly inherit the
+/// same open file description before exec closes its CLOEXEC descriptor.
+pub struct SessionLock(File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 fn session_directory() -> Result<PathBuf> {
     let base = env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -95,7 +105,7 @@ fn session_directory() -> Result<PathBuf> {
     Ok(base.join("tgrust"))
 }
 
-pub fn open_session_file(api_id: i32, create: bool) -> Result<(PathBuf, File)> {
+pub fn open_session_file(api_id: i32, create: bool) -> Result<(PathBuf, SessionLock)> {
     let directory = session_directory()?;
     DirBuilder::new()
         .recursive(true)
@@ -158,7 +168,7 @@ fn find_saved_session(directory: &Path) -> Result<Option<i32>> {
     Ok(selected)
 }
 
-fn lock_session_file(path: &Path, create: bool) -> Result<File> {
+pub(crate) fn lock_session_file(path: &Path, create: bool) -> Result<SessionLock> {
     let mut options = OpenOptions::new();
     options.read(true).write(true);
     let created = create.then(|| options.clone().create_new(true).mode(0o600).open(path));
@@ -192,8 +202,9 @@ fn lock_session_file(path: &Path, create: bool) -> Result<File> {
             return Err(error).context("Не удалось заблокировать файл сессии");
         }
     }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
+    let lock = SessionLock(file);
+    lock.0.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(lock)
 }
 
 pub fn attachment_name(name: &str, fallback: &str) -> String {
@@ -349,7 +360,7 @@ mod tests {
         assert!(!path.exists());
         let first = lock_session_file(&path, true).unwrap();
         assert_eq!(
-            first.metadata().unwrap().permissions().mode() & 0o777,
+            first.0.metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert!(lock_session_file(&path, true).is_err());
@@ -358,10 +369,27 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         let reopened = lock_session_file(&path, false).unwrap();
         assert_eq!(
-            reopened.metadata().unwrap().permissions().mode() & 0o777,
+            reopened.0.metadata().unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert_eq!(fs::read(path).unwrap(), b"existing session");
+    }
+
+    #[test]
+    fn session_lock_is_released_even_while_an_inherited_descriptor_stays_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic.session");
+        let owner = lock_session_file(&path, true).unwrap();
+        // dup and fork share the same open file description for flock purposes.
+        let inherited = owner.0.try_clone().unwrap();
+        assert!(lock_session_file(&path, false).is_err());
+        drop(owner);
+        let next_owner = lock_session_file(&path, false).unwrap();
+        assert!(inherited.metadata().unwrap().is_file());
+        drop(inherited);
+        assert!(lock_session_file(&path, false).is_err());
+        drop(next_owner);
+        assert!(lock_session_file(&path, false).is_ok());
     }
 
     #[test]
