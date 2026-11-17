@@ -144,6 +144,37 @@ pub fn order_chats(chats: &mut [&Chat], folder: Option<&ChatFolder>) {
 }
 
 #[derive(Clone)]
+pub struct DeviceSession {
+    pub id: i64,
+    pub current: bool,
+    pub device: String,
+    pub platform: String,
+    pub system_version: String,
+    pub application: String,
+    pub app_version: String,
+    pub created: i64,
+    pub active: i64,
+    pub ip: String,
+    pub country: String,
+    pub region: String,
+    pub official: bool,
+    pub password_pending: bool,
+    pub unconfirmed: bool,
+}
+
+impl DeviceSession {
+    pub fn can_terminate(&self) -> bool {
+        !self.current && self.id != 0
+    }
+}
+
+#[derive(Clone)]
+pub struct DeviceSessions {
+    pub sessions: Vec<DeviceSession>,
+    pub inactive_ttl_days: i32,
+}
+
+#[derive(Clone)]
 pub struct PeerProfile {
     pub id: i64,
     pub title: String,

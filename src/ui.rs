@@ -65,6 +65,8 @@ struct Ui {
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
     contacts_dialog: glib::WeakRef<adw::Dialog>,
+    devices_dialog: glib::WeakRef<adw::Dialog>,
+    demo_devices: Rc<RefCell<crate::model::DeviceSessions>>,
     history: gtk::Box,
     message_menu: gtk::Popover,
     menu_message: Cell<Option<i32>>,
@@ -195,7 +197,25 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
 
     let sidebar = adw::ToolbarView::new();
     let side_header = adw::HeaderBar::new();
-    side_header.set_title_widget(Some(&adw::WindowTitle::new("tgrust", "")));
+    let devices_button = gtk::Button::with_label("Устройства");
+    devices_button.add_css_class("flat");
+    let menu_body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    menu_body.set_margin_start(6);
+    menu_body.set_margin_end(6);
+    menu_body.set_margin_top(6);
+    menu_body.set_margin_bottom(6);
+    menu_body.append(&devices_button);
+    let menu_popup = gtk::Popover::builder().child(&menu_body).build();
+    menu_popup.set_default_widget(Some(&devices_button));
+    let app_menu = gtk::MenuButton::builder()
+        .label("tgrust")
+        .tooltip_text("Меню приложения (F10)")
+        .primary(true)
+        .popover(&menu_popup)
+        .build();
+    app_menu.add_css_class("flat");
+    app_menu.update_property(&[gtk::accessible::Property::Label("Меню приложения")]);
+    side_header.set_title_widget(Some(&app_menu));
     let refresh = icon_button("view-refresh-symbolic", "Обновить чаты");
     let search_messages = icon_button("system-search-symbolic", "Поиск по сообщениям");
     side_header.pack_end(&refresh);
@@ -395,6 +415,8 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         profile_button,
         profile_dialog: glib::WeakRef::new(),
         contacts_dialog: glib::WeakRef::new(),
+        devices_dialog: glib::WeakRef::new(),
+        demo_devices: Rc::new(RefCell::new(demo::device_sessions())),
         history,
         message_menu,
         menu_message: Cell::new(None),
@@ -543,6 +565,24 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         window.add_action(&action);
         app.set_accels_for_action(&format!("win.{name}"), &[accelerator]);
     }
+    devices_button.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        #[weak]
+        menu_popup,
+        move |_| {
+            menu_popup.popdown();
+            ui.open_devices();
+        }
+    ));
+    let devices_action = gtk::gio::SimpleAction::new("devices", None);
+    devices_action.connect_activate(glib::clone!(
+        #[weak]
+        ui,
+        move |_, _| ui.open_devices()
+    ));
+    window.add_action(&devices_action);
+    app.set_accels_for_action("win.devices", &["<Primary><Shift>d"]);
     contacts_button.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -1685,9 +1725,83 @@ impl Ui {
             &self.message_search,
             &self.profile_dialog,
             &self.contacts_dialog,
+            &self.devices_dialog,
         ]
         .iter()
         .any(|dialog| dialog.upgrade().is_some_and(|dialog| dialog.is_visible()))
+    }
+
+    fn open_devices(self: &Rc<Self>) {
+        if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
+            || self.chat_dialog_open()
+        {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let load_client = client.clone();
+        let demo_load = self.demo_devices.clone();
+        let demo_reset = self.demo_devices.clone();
+        let dialog = crate::devices::open(
+            &window,
+            crate::devices::DevicesContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move || {
+                    let snapshot = demo.then(|| demo_load.borrow().clone());
+                    let client = load_client.clone();
+                    Box::pin(async move {
+                        if let Some(snapshot) = snapshot {
+                            Ok(snapshot)
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .device_sessions()
+                                .await
+                        }
+                    })
+                }),
+                terminate: Box::new(move |id| {
+                    let local = if demo {
+                        let mut snapshot = demo_reset.borrow_mut();
+                        if id == 0
+                            || snapshot
+                                .sessions
+                                .iter()
+                                .any(|session| session.id == id && session.current)
+                        {
+                            Err(anyhow::anyhow!(
+                                "Текущий сеанс нельзя завершить из списка устройств"
+                            ))
+                        } else {
+                            snapshot.sessions.retain(|session| session.id != id);
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    };
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            local
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .terminate_device_session(id)
+                                .await
+                        }
+                    })
+                }),
+            },
+        );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| ui.focus_composer()
+        ));
+        self.devices_dialog.set(Some(&dialog));
     }
 
     fn open_contacts(self: &Rc<Self>) {

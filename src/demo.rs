@@ -312,3 +312,47 @@ pub async fn playback_preview(
     });
     output.finish(media).await
 }
+
+pub fn device_sessions() -> crate::model::DeviceSessions {
+    use crate::model::{DeviceSession, DeviceSessions};
+    let current = DeviceSession {
+        id: 0,
+        current: true,
+        device: "Демонстрационный компьютер".into(),
+        platform: "Linux".into(),
+        system_version: "GNOME".into(),
+        application: "tgrust".into(),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        created: now() - 172_800,
+        active: now(),
+        ip: "192.0.2.10".into(),
+        country: "Тестовая страна".into(),
+        region: "Демонстрационный регион".into(),
+        official: false,
+        password_pending: false,
+        unconfirmed: false,
+    };
+    let mut phone = current.clone();
+    phone.id = 2;
+    phone.current = false;
+    phone.device = "Тестовый телефон".into();
+    phone.platform = "Android".into();
+    phone.system_version = "Демоверсия".into();
+    phone.application = "Telegram".into();
+    phone.app_version = "демо".into();
+    phone.ip = "198.51.100.20".into();
+    phone.active -= 3600;
+    phone.official = true;
+    let mut laptop = phone.clone();
+    laptop.id = -3;
+    laptop.device = "Тестовый ноутбук".into();
+    laptop.platform = "Linux".into();
+    laptop.application = "Telegram Desktop".into();
+    laptop.ip = "203.0.113.30".into();
+    laptop.active -= 86_400;
+    laptop.unconfirmed = true;
+    DeviceSessions {
+        sessions: vec![current, phone, laptop],
+        inactive_ttl_days: 180,
+    }
+}

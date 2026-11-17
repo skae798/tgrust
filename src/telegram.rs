@@ -21,11 +21,11 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, FormattedText,
-    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
-    PlayableMedia, PlaybackFile, PlaybackProgress, Reaction, ReadRequest, ReplyPreview,
-    SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
-    UploadKind, redact_spoilers,
+    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, DeviceSession,
+    DeviceSessions, FormattedText, HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage,
+    MAX_ALBUM_ITEMS, Message, PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, Reaction,
+    ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan,
+    TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{PendingSave, PlaybackDownload, attachment_name, open_session_file};
@@ -168,6 +168,29 @@ impl Telegram {
             }),
             step,
         ))
+    }
+
+    pub async fn device_sessions(&self) -> Result<DeviceSessions> {
+        let raw = self
+            .client
+            .invoke(&grammers_client::tl::functions::account::GetAuthorizations {})
+            .await?;
+        Ok(device_sessions_view(raw.into()))
+    }
+
+    pub async fn terminate_device_session(&self, id: i64) -> Result<()> {
+        let snapshot = self.device_sessions().await?;
+        let Some(request) = device_reset_request(&snapshot, id)? else {
+            // A different client may have already terminated this session.
+            return Ok(());
+        };
+        let confirmed = self
+            .client
+            .invoke(&request)
+            .await
+            .map_err(device_reset_error)?;
+        ensure!(confirmed, "Telegram не подтвердил завершение сеанса");
+        Ok(())
     }
 
     pub async fn login_step(&self) -> LoginStep {
@@ -1607,6 +1630,80 @@ fn attachment_id(media: &Media) -> Option<AttachmentThumbnail> {
     }
 }
 
+fn device_sessions_view(raw: types::account::Authorizations) -> DeviceSessions {
+    let mut sessions: Vec<_> = raw
+        .authorizations
+        .into_iter()
+        .map(|raw| {
+            let enums::Authorization::Authorization(raw) = raw;
+            DeviceSession {
+                id: raw.hash,
+                current: raw.current,
+                device: raw.device_model,
+                platform: raw.platform,
+                system_version: raw.system_version,
+                application: raw.app_name,
+                app_version: raw.app_version,
+                created: raw.date_created.into(),
+                active: raw.date_active.into(),
+                ip: raw.ip,
+                country: raw.country,
+                region: raw.region,
+                official: raw.official_app,
+                password_pending: raw.password_pending,
+                unconfirmed: raw.unconfirmed,
+            }
+        })
+        .collect();
+    sessions.sort_by_key(|session| {
+        (
+            !session.current,
+            std::cmp::Reverse(session.active),
+            session.id,
+        )
+    });
+    let mut seen = std::collections::HashSet::new();
+    sessions.retain(|session| seen.insert(session.id));
+    DeviceSessions {
+        sessions,
+        inactive_ttl_days: raw.authorization_ttl_days,
+    }
+}
+
+fn device_reset_request(
+    snapshot: &DeviceSessions,
+    id: i64,
+) -> Result<Option<grammers_client::tl::functions::account::ResetAuthorization>> {
+    ensure!(
+        id != 0,
+        "Текущий сеанс нельзя завершить из списка устройств"
+    );
+    ensure!(
+        !snapshot
+            .sessions
+            .iter()
+            .any(|session| session.id == id && session.current),
+        "Текущий сеанс нельзя завершить из списка устройств"
+    );
+    Ok(snapshot
+        .sessions
+        .iter()
+        .any(|session| session.id == id)
+        .then_some(grammers_client::tl::functions::account::ResetAuthorization { hash: id }))
+}
+
+fn device_reset_error(error: InvocationError) -> anyhow::Error {
+    if error.is("FRESH_RESET_AUTHORISATION_FORBIDDEN") {
+        anyhow::anyhow!(
+            "Telegram разрешает завершать другие сеансы только через 24 часа после входа на этом устройстве"
+        )
+    } else if error.is("HASH_INVALID") {
+        anyhow::anyhow!("Сеанс больше недоступен. Обновите список устройств")
+    } else {
+        error.into()
+    }
+}
+
 fn public_usernames(primary: Option<&str>, extra: Option<&[enums::Username]>) -> Vec<String> {
     let mut names = Vec::<String>::new();
     let extras = extra.into_iter().flatten().filter_map(|name| {
@@ -2297,6 +2394,113 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    fn synthetic_device(hash: i64, current: bool, active: i32) -> enums::Authorization {
+        types::Authorization {
+            current,
+            official_app: true,
+            password_pending: true,
+            encrypted_requests_disabled: false,
+            call_requests_disabled: false,
+            unconfirmed: true,
+            hash,
+            device_model: "Synthetic <device>".into(),
+            platform: "Linux".into(),
+            system_version: "Demo OS".into(),
+            api_id: 12345,
+            app_name: "Demo & app".into(),
+            app_version: "0.0".into(),
+            date_created: 10,
+            date_active: active,
+            ip: "192.0.2.10".into(),
+            country: "Demo country".into(),
+            region: "Demo region".into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn devices_preserve_details_order_current_first_and_keep_its_canonical_identity() {
+        let snapshot = device_sessions_view(types::account::Authorizations {
+            authorization_ttl_days: 180,
+            authorizations: vec![
+                synthetic_device(-3, false, 100),
+                synthetic_device(7, false, 200),
+                synthetic_device(7, true, 20),
+                synthetic_device(2, false, 300),
+                synthetic_device(-3, false, 90),
+            ],
+        });
+        assert_eq!(snapshot.inactive_ttl_days, 180);
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![7, 2, -3]
+        );
+        let current = &snapshot.sessions[0];
+        assert!(current.current && !current.can_terminate());
+        assert_eq!(current.device, "Synthetic <device>");
+        assert_eq!(current.application, "Demo & app");
+        assert_eq!(current.app_version, "0.0");
+        assert_eq!(current.platform, "Linux");
+        assert_eq!(current.system_version, "Demo OS");
+        assert_eq!((current.created, current.active), (10, 20));
+        assert_eq!(current.ip, "192.0.2.10");
+        assert_eq!(
+            (current.country.as_str(), current.region.as_str()),
+            ("Demo country", "Demo region")
+        );
+        assert!(current.official && current.password_pending && current.unconfirmed);
+    }
+
+    #[test]
+    fn devices_reset_rejects_current_and_zero_ids_accepts_negative_ids_and_skips_absent_sessions() {
+        let snapshot = device_sessions_view(types::account::Authorizations {
+            authorization_ttl_days: 30,
+            authorizations: vec![
+                synthetic_device(7, true, 20),
+                synthetic_device(-3, false, 100),
+            ],
+        });
+        assert!(device_reset_request(&snapshot, 0).is_err());
+        assert!(device_reset_request(&snapshot, 7).is_err());
+        assert_eq!(
+            device_reset_request(&snapshot, -3).unwrap().unwrap().hash,
+            -3
+        );
+        assert!(device_reset_request(&snapshot, 123).unwrap().is_none());
+        assert!(snapshot.sessions[1].can_terminate());
+    }
+
+    #[test]
+    fn devices_errors_explain_fresh_login_and_stale_session_without_logging_identifiers() {
+        let error = |name: &str| {
+            InvocationError::Rpc(RpcError {
+                code: 406,
+                name: name.into(),
+                value: None,
+                caused_by: None,
+            })
+        };
+        assert!(
+            device_reset_error(error("FRESH_RESET_AUTHORISATION_FORBIDDEN"))
+                .to_string()
+                .contains("24 часа")
+        );
+        assert!(
+            device_reset_error(error("HASH_INVALID"))
+                .to_string()
+                .contains("Обновите список")
+        );
+        assert!(
+            device_reset_error(error("UNKNOWN_ERROR"))
+                .to_string()
+                .contains("UNKNOWN_ERROR")
+        );
+    }
 
     async fn idle_session_runner(
         path: &std::path::Path,
