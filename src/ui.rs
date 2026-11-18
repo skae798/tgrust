@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use anyhow::{Context, Result};
 use gtk::glib;
-use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::runtime::{Handle, Runtime};
+use tokio::sync::{oneshot, watch};
 
+use crate::accounts::{Account, Accounts};
 use crate::demo;
 use crate::formatting::{
     concealed_message, editor_text, message_attributes, set_editor_text, setup_editor,
@@ -37,7 +38,13 @@ enum ImageCacheEntry {
 struct Ui {
     runtime: Handle,
     stop: watch::Receiver<bool>,
-    session_removal: Rc<RefCell<Option<SessionRemoval>>>,
+    listener_finished: RefCell<Option<oneshot::Receiver<()>>>,
+    session_removal: RefCell<Option<SessionRemoval>>,
+    accounts: Rc<Accounts>,
+    account: Account,
+    api_hash: RefCell<Option<String>>,
+    api_hash_input: gtk::PasswordEntry,
+    accounts_dialog: glib::WeakRef<adw::Dialog>,
     logging_out: Cell<bool>,
     logout_dialog: glib::WeakRef<adw::Dialog>,
     window: glib::WeakRef<adw::ApplicationWindow>,
@@ -131,27 +138,25 @@ struct Ui {
 
 pub fn open(
     app: &adw::Application,
-    runtime: Handle,
-    stop: watch::Receiver<bool>,
-    demo: bool,
-    session_removal: Rc<RefCell<Option<SessionRemoval>>>,
-) {
+    accounts: Rc<Accounts>,
+    account: Account,
+    api_hash: Option<String>,
+    runtime: Runtime,
+) -> adw::ApplicationWindow {
+    let demo = matches!(account, Account::Demo(_));
+    let title = if matches!(account, Account::Welcome | Account::Demo(0)) {
+        "tgrust".into()
+    } else {
+        format!("tgrust — {}", account.label())
+    };
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("tgrust")
+        .title(title)
         .default_width(1050)
         .default_height(720)
         .width_request(360)
         .height_request(480)
         .build();
-
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(include_str!("style.css"));
-    gtk::style_context_add_provider_for_display(
-        &gtk::prelude::WidgetExt::display(&window),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
 
     let root = gtk::Stack::new();
     root.set_transition_type(gtk::StackTransitionType::Crossfade);
@@ -175,9 +180,15 @@ pub fn open(
     let login_reset = gtk::Button::with_label("Запросить новый код");
     login_reset.add_css_class("flat");
     login_reset.set_visible(false);
+    let api_hash_input = gtk::PasswordEntry::builder()
+        .placeholder_text("API hash для повторного входа")
+        .visible(false)
+        .build();
     let connect_retry = gtk::Button::with_label("Повторить подключение");
     connect_retry.add_css_class("suggested-action");
     connect_retry.set_visible(false);
+    let login_accounts = gtk::Button::with_label("Аккаунты");
+    login_accounts.add_css_class("flat");
     let demo_button = gtk::Button::with_label("Открыть деморежим");
     demo_button.add_css_class("flat");
     for widget in [
@@ -186,7 +197,9 @@ pub fn open(
         login_entry.upcast_ref(),
         login_submit.upcast_ref(),
         login_reset.upcast_ref(),
+        api_hash_input.upcast_ref(),
         connect_retry.upcast_ref(),
+        login_accounts.upcast_ref(),
         demo_button.upcast_ref(),
     ] {
         login_box.append(widget);
@@ -217,11 +230,23 @@ pub fn open(
     let logout = gtk::Button::with_label("Выйти из аккаунта");
     logout.add_css_class("flat");
     logout.add_css_class("destructive-action");
+    let account_button = gtk::Button::with_label("Аккаунты");
+    account_button.add_css_class("flat");
+    menu_body.append(&account_button);
     menu_body.append(&logout);
     let menu_popup = gtk::Popover::builder().child(&menu_body).build();
     menu_popup.set_default_widget(Some(&devices_button));
+    let menu_label = gtk::Label::builder()
+        .label(if matches!(account, Account::Welcome | Account::Demo(0)) {
+            "tgrust".into()
+        } else {
+            account.label()
+        })
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(14)
+        .build();
     let app_menu = gtk::MenuButton::builder()
-        .label("tgrust")
+        .child(&menu_label)
         .tooltip_text("Меню приложения (F10)")
         .primary(true)
         .popover(&menu_popup)
@@ -397,10 +422,17 @@ pub fn open(
     pane.set_content(Some(&content));
     split.set_content(Some(&adw::NavigationPage::new(&pane, "Чат")));
 
+    let (stop, stop_rx) = watch::channel(false);
     let ui = Rc::new(Ui {
-        runtime,
-        stop,
-        session_removal,
+        runtime: runtime.handle().clone(),
+        stop: stop_rx,
+        listener_finished: RefCell::new(None),
+        session_removal: RefCell::new(None),
+        accounts,
+        account,
+        api_hash: RefCell::new(api_hash),
+        api_hash_input,
+        accounts_dialog: glib::WeakRef::new(),
         logging_out: Cell::new(false),
         logout_dialog: glib::WeakRef::new(),
         window: window.downgrade(),
@@ -511,10 +543,19 @@ pub fn open(
         ui,
         move |_| ui.connect()
     ));
+    ui.api_hash_input.connect_activate(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.connect()
+    ));
     demo_button.connect_clicked(glib::clone!(
         #[weak]
         ui,
-        move |_| ui.start_demo()
+        move |_| {
+            if let Err(error) = ui.accounts.open_demo() {
+                ui.toast(&error.to_string());
+            }
+        }
     ));
     refresh.connect_clicked(glib::clone!(
         #[weak]
@@ -601,6 +642,18 @@ pub fn open(
             ui.confirm_logout();
         }
     ));
+    for button in [&account_button, &login_accounts] {
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            ui,
+            #[weak]
+            menu_popup,
+            move |_| {
+                menu_popup.popdown();
+                ui.open_accounts();
+            }
+        ));
+    }
     let devices_action = gtk::gio::SimpleAction::new("devices", None);
     devices_action.connect_activate(glib::clone!(
         #[weak]
@@ -811,19 +864,30 @@ pub fn open(
 
     window.connect_close_request({
         let ui = Rc::clone(&ui);
+        let runtime = RefCell::new(Some(runtime));
         move |_| {
             if ui.logging_out.get() {
                 return glib::Propagation::Stop;
             }
             if let Some(app) = ui.window.upgrade().and_then(|window| window.application()) {
                 for id in ui.notified_messages.borrow().keys() {
-                    app.withdraw_notification(&notification_id(*id));
+                    app.withdraw_notification(&ui.notification_id(*id));
                 }
             }
             if let Some(viewer) = ui.media_viewer.upgrade() {
                 viewer.close();
             }
             ui.window.set(None);
+            stop.send_replace(true);
+            ui.client.take();
+            if let Some(runtime) = runtime.take() {
+                ui.accounts.close(
+                    ui.account.clone(),
+                    runtime,
+                    ui.session_removal.take(),
+                    ui.listener_finished.take(),
+                );
+            }
             glib::Propagation::Proceed
         }
     });
@@ -833,6 +897,7 @@ pub fn open(
     } else {
         ui.connect();
     }
+    window
 }
 
 impl Ui {
@@ -863,34 +928,45 @@ impl Ui {
         self.connect_retry.set_visible(false);
         self.login_entry.set_visible(false);
         self.login_submit.set_visible(false);
-        match crate::credentials() {
-            Ok(Some((id, hash))) => {
-                self.login_status.set_text("Подключение…");
-                self.job(Telegram::connect(id, hash), |ui, result| {
-                    if ui.is_demo.get() {
-                        return;
-                    }
-                    match result {
-                        Ok((client, step)) => {
-                            ui.unread_overrides.borrow_mut().clear();
-                            ui.reading_chats.borrow_mut().clear();
-                            ui.client.replace(Some(client));
-                            ui.show_step(step);
-                        }
-                        Err(error) => {
-                            ui.login_status
-                                .set_text(&format!("Не удалось подключиться. {error}"));
-                            ui.connect_retry.set_visible(true);
-                            ui.connect_retry.grab_focus();
-                        }
-                    }
-                });
+        let Account::Saved(profile) = &self.account else {
+            self.login_status.set_text(&self.accounts.startup_hint());
+            return;
+        };
+        let hash = self.api_hash_input.text();
+        if !hash.is_empty() {
+            if let Err(error) = crate::accounts::validate_hash(&hash) {
+                self.login_status.set_text(&error.to_string());
+                self.connect_retry.set_visible(true);
+                self.api_hash_input.grab_focus();
+                return;
             }
-            Ok(None) => {
-                self.login_status.set_text("Для входа укажите TGRUST_API_ID и TGRUST_API_HASH при запуске. Инструкция есть в README.");
-            }
-            Err(error) => self.login_status.set_text(&error.to_string()),
+            self.api_hash.replace(Some(hash.to_string()));
+            self.api_hash_input.set_text("");
         }
+        self.api_hash_input.set_visible(false);
+        self.login_status.set_text("Подключение…");
+        self.job(
+            Telegram::connect(profile.clone(), self.api_hash.borrow().clone()),
+            |ui, result| match result {
+                Ok((client, step)) => {
+                    ui.unread_overrides.borrow_mut().clear();
+                    ui.reading_chats.borrow_mut().clear();
+                    ui.client.replace(Some(client));
+                    ui.show_step(step);
+                }
+                Err(error) => {
+                    ui.login_status
+                        .set_text(&format!("Не удалось подключиться. {error}"));
+                    ui.connect_retry.set_visible(true);
+                    if ui.api_hash.borrow().is_none() {
+                        ui.api_hash_input.set_visible(true);
+                        ui.api_hash_input.grab_focus();
+                    } else {
+                        ui.connect_retry.grab_focus();
+                    }
+                }
+            },
+        );
     }
 
     fn set_login_busy(&self, busy: bool) {
@@ -1018,13 +1094,21 @@ impl Ui {
         let mut changes = client.changes();
         let stop = self.stop.clone();
         let (incoming, mut messages) = tokio::sync::mpsc::channel(32);
-        self.job(client.clone().listen(stop, incoming), |ui, result| {
-            if result.is_err() {
-                ui.toast(
-                    "Обновления Telegram остановлены. Перезапустите клиент, чтобы проверить сессию.",
-                );
-            }
-        });
+        let (finish, finished) = oneshot::channel();
+        self.listener_finished.replace(Some(finished));
+        let listener = client.clone();
+        self.job(
+            async move {
+                let result = listener.listen(stop, incoming).await;
+                let _ = finish.send(());
+                result
+            },
+            |ui, result| {
+                if result.is_err() && !ui.logging_out.get() {
+                    ui.toast("Обновления Telegram остановлены. Откройте аккаунт заново, чтобы проверить сессию.");
+                }
+            },
+        );
         let (allowed, mut desktop_messages) = tokio::sync::mpsc::channel(32);
         let notification_client = client.clone();
         self.runtime.spawn(async move {
@@ -1070,6 +1154,9 @@ impl Ui {
             let mut previous = UpdateStatus::default();
             while let Some(status) = notifications.recv().await {
                 let Some(ui) = weak.upgrade() else { break };
+                let Some(client) = ui.client.borrow().clone() else {
+                    break;
+                };
                 if status.reconnecting && !previous.reconnecting {
                     ui.toast("Восстанавливаем связь с Telegram…");
                 }
@@ -1117,10 +1204,13 @@ impl Ui {
         else {
             return;
         };
-        let notification = gtk::gio::Notification::new(&message.title);
+        let title = format!("{} · {}", message.title, self.account.label());
+        let notification = gtk::gio::Notification::new(&title);
         notification.set_body(Some("Новое сообщение"));
-        notification
-            .set_default_action_and_target_value("app.open-chat", Some(&message.chat.to_variant()));
+        notification.set_default_action_and_target_value(
+            "app.open-account-chat",
+            Some(&(self.account.key(), message.chat).to_variant()),
+        );
         let mut notified = self.notified_messages.borrow_mut();
         if notified
             .get(&message.chat)
@@ -1129,7 +1219,11 @@ impl Ui {
             return;
         }
         notified.insert(message.chat, message.message);
-        app.send_notification(Some(&notification_id(message.chat)), &notification);
+        app.send_notification(Some(&self.notification_id(message.chat)), &notification);
+    }
+
+    fn notification_id(&self, chat: i64) -> String {
+        format!("account-{}-chat-{chat}", self.account.key())
     }
 
     fn withdraw_chat_notification(&self, chat: i64) {
@@ -1139,7 +1233,7 @@ impl Ui {
                 .upgrade()
                 .and_then(|window| window.application())
         {
-            app.withdraw_notification(&notification_id(chat));
+            app.withdraw_notification(&self.notification_id(chat));
         }
     }
 
@@ -1759,9 +1853,26 @@ impl Ui {
             &self.contacts_dialog,
             &self.devices_dialog,
             &self.logout_dialog,
+            &self.accounts_dialog,
         ]
         .iter()
         .any(|dialog| dialog.upgrade().is_some_and(|dialog| dialog.is_visible()))
+    }
+
+    fn open_accounts(self: &Rc<Self>) {
+        if self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let dialog = self.accounts.chooser(&window, &self.account);
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| ui.accounts_dialog.set(None)
+        ));
+        self.accounts_dialog.set(Some(&dialog));
     }
 
     fn confirm_logout(self: &Rc<Self>) {
@@ -1781,7 +1892,7 @@ impl Ui {
             .body(if demo {
                 "Деморежим закроется. Демонстрационные черновики будут удалены."
             } else {
-                "Сеанс на этом устройстве завершится. tgrust закроется и удалит локальный файл сессии и черновики. При следующем входе понадобятся ключи приложения и код Telegram."
+                "Сеанс на этом устройстве завершится. Окно аккаунта закроется, локальная сессия и черновики будут удалены. При следующем входе понадобятся ключи приложения и код Telegram."
             })
             .close_response("cancel")
             .default_response("cancel")
@@ -1823,12 +1934,7 @@ impl Ui {
                     Ok(removal) => {
                         ui.session_removal.replace(Some(removal));
                         if let Some(window) = ui.window.upgrade() {
-                            if let Some(app) = window.application() {
-                                window.close();
-                                app.quit();
-                            } else {
-                                window.close();
-                            }
+                            window.close();
                         }
                     }
                     Err(error) => {
@@ -4273,10 +4379,6 @@ fn scaled_thumbnail(texture: &gtk::gdk::Texture) -> Option<gtk::gdk::Texture> {
     );
     let thumbnail = pixbuf.scale_simple(width, height, gtk::gdk_pixbuf::InterpType::Bilinear)?;
     Some(gtk::gdk::Texture::for_pixbuf(&thumbnail))
-}
-
-fn notification_id(chat: i64) -> String {
-    format!("chat-{chat}")
 }
 
 fn demo_texture() -> gtk::gdk::MemoryTexture {

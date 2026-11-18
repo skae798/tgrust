@@ -67,7 +67,7 @@ async fn initial_login_state(
     } else {
         ensure!(
             has_api_hash,
-            "Сессия истекла. Запустите tgrust с TGRUST_API_ID и TGRUST_API_HASH для повторного входа."
+            "Сессия истекла. Введите API hash для повторного входа."
         );
         Ok(LoginState::Phone)
     }
@@ -121,8 +121,11 @@ impl SearchMessages {
 }
 
 impl Telegram {
-    pub async fn connect(api_id: i32, api_hash: Option<String>) -> Result<(Arc<Self>, LoginStep)> {
-        let (path, lock) = open_session_file(api_id, api_hash.is_some())?;
+    pub async fn connect(
+        profile: crate::model::AccountProfile,
+        api_hash: Option<String>,
+    ) -> Result<(Arc<Self>, LoginStep)> {
+        let (path, lock) = open_session_file(&profile, api_hash.is_some())?;
         let session = Arc::new(
             SqliteSession::open(&path)
                 .await
@@ -132,7 +135,7 @@ impl Telegram {
             runner,
             updates,
             handle,
-        } = SenderPool::new(session.clone(), api_id);
+        } = SenderPool::new(session.clone(), profile.api_id);
         let sender = (*handle).clone();
         let client = Client::new(handle);
         let session_removal = SessionRemoval::new(path, lock);
@@ -2660,7 +2663,7 @@ mod tests {
                 .await
                 .err()
                 .unwrap();
-            assert!(error.to_string().contains("TGRUST_API_HASH"));
+            assert!(error.to_string().contains("API hash"));
             let _lock = reacquire_session(&path);
             let reopened = SqliteSession::open(&path).await.unwrap();
             assert_eq!(reopened.updates_state().await.unwrap().pts, 42);
