@@ -24,8 +24,9 @@ use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, DeviceChange,
     DeviceSession, DeviceSessions, FormattedText, HISTORY_PAGE_SIZE, HistoryRevision,
     IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile, PlayableMedia, PlaybackFile,
-    PlaybackProgress, Reaction, ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit,
-    SearchPage, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
+    PlaybackProgress, PrivacyAudience, PrivacyChange, PrivacyKey, PrivacySetting, Reaction,
+    ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan,
+    TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -90,6 +91,7 @@ pub struct Telegram {
     contacts_cache: Mutex<Option<ContactSnapshot>>,
     contacts_revision: AtomicU64,
     dialog_settings: Mutex<()>,
+    privacy_settings: Mutex<()>,
     read_state: crate::read_state::ReadState,
 }
 
@@ -173,6 +175,7 @@ impl Telegram {
                 contacts_cache: Mutex::new(None),
                 contacts_revision: AtomicU64::new(0),
                 dialog_settings: Mutex::new(()),
+                privacy_settings: Mutex::new(()),
                 read_state: crate::read_state::ReadState::default(),
             }),
             step,
@@ -190,6 +193,49 @@ impl Telegram {
         }
         self.client.disconnect();
         Ok(self.session_removal.clone())
+    }
+
+    async fn privacy_rules(&self, key: PrivacyKey) -> Result<types::account::PrivacyRules> {
+        Ok(self
+            .client
+            .invoke(&grammers_client::tl::functions::account::GetPrivacy {
+                key: crate::privacy_rules::key(key),
+            })
+            .await?
+            .into())
+    }
+
+    pub async fn privacy_setting(&self, key: PrivacyKey) -> Result<PrivacySetting> {
+        Ok(crate::privacy_rules::current(
+            key,
+            &self.privacy_rules(key).await?,
+        ))
+    }
+
+    pub async fn set_privacy_setting(
+        &self,
+        key: PrivacyKey,
+        baseline: &PrivacySetting,
+        audience: PrivacyAudience,
+    ) -> Result<PrivacyChange> {
+        use crate::privacy_rules;
+        let _operation = self.privacy_settings.lock().await;
+        let raw = self.privacy_rules(key).await?;
+        let Some(rules) = privacy_rules::prepare(key, baseline, &raw, audience)? else {
+            return Ok(PrivacyChange::Conflict(privacy_rules::current(key, &raw)));
+        };
+        let updated: types::account::PrivacyRules = self
+            .client
+            .invoke(&grammers_client::tl::functions::account::SetPrivacy {
+                key: privacy_rules::key(key),
+                rules,
+            })
+            .await?
+            .into();
+        Ok(PrivacyChange::Saved {
+            setting: privacy_rules::current(key, &updated),
+            exceptions_changed: !privacy_rules::same_exceptions(&raw, &updated),
+        })
     }
 
     pub async fn device_sessions(&self) -> Result<DeviceSessions> {

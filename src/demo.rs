@@ -356,3 +356,27 @@ pub fn device_sessions() -> crate::model::DeviceSessions {
         inactive_ttl_days: 180,
     }
 }
+
+pub fn privacy_settings()
+-> std::collections::HashMap<crate::model::PrivacyKey, crate::model::PrivacySetting> {
+    use crate::model::{PrivacyAudience::*, PrivacyKey::*, PrivacySetting};
+    [
+        (PhoneNumber, Some(Nobody), 2, true),
+        (AddedByPhone, Some(Everyone), 0, true),
+        (LastSeen, Some(Contacts), 1, true),
+        (ProfilePhoto, None, 1, false),
+    ]
+    .into_iter()
+    .map(|(key, audience, exception_rules, editable)| {
+        (
+            key,
+            PrivacySetting {
+                audience,
+                exception_rules,
+                editable,
+                revision: Vec::new(),
+            },
+        )
+    })
+    .collect()
+}
