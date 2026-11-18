@@ -1,4 +1,5 @@
 mod accounts;
+mod blocked;
 mod contacts;
 mod demo;
 mod devices;
