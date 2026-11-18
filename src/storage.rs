@@ -2,6 +2,7 @@ use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -93,6 +94,57 @@ pub struct SessionLock(File);
 impl Drop for SessionLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
+    }
+}
+
+/// Holds the original session lock while a confirmed logout shuts down the client.
+#[derive(Clone)]
+pub struct SessionRemoval {
+    path: PathBuf,
+    lock: Arc<SessionLock>,
+}
+
+impl SessionRemoval {
+    pub fn new(path: PathBuf, lock: SessionLock) -> Self {
+        Self {
+            path,
+            lock: Arc::new(lock),
+        }
+    }
+
+    pub fn remove(self) -> Result<()> {
+        let locked = self.lock.0.metadata()?;
+        let current = fs::symlink_metadata(&self.path)?;
+        ensure!(
+            current.is_file()
+                && current.nlink() == 1
+                && (current.dev(), current.ino()) == (locked.dev(), locked.ino()),
+            "Файл сессии изменился после открытия"
+        );
+        let sidecars = ["-wal", "-shm", "-journal"].map(|suffix| {
+            let mut path = self.path.clone().into_os_string();
+            path.push(suffix);
+            PathBuf::from(path)
+        });
+        for path in &sidecars {
+            match fs::symlink_metadata(path) {
+                Ok(info) => ensure!(
+                    info.is_file() && info.nlink() == 1,
+                    "Некорректный служебный файл сессии"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        for path in &sidecars {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        fs::remove_file(&self.path)?;
+        Ok(())
     }
 }
 
@@ -203,6 +255,15 @@ pub(crate) fn lock_session_file(path: &Path, create: bool) -> Result<SessionLock
         }
     }
     let lock = SessionLock(file);
+    // The path can be unlinked between opening it and taking the lock.
+    let current = fs::symlink_metadata(path)?;
+    let opened = lock.0.metadata()?;
+    ensure!(
+        current.is_file()
+            && current.nlink() == 1
+            && (current.dev(), current.ino()) == (opened.dev(), opened.ino()),
+        "Файл сессии изменился во время открытия"
+    );
     lock.0.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(lock)
 }
@@ -390,6 +451,69 @@ mod tests {
         assert!(lock_session_file(&path, false).is_err());
         drop(next_owner);
         assert!(lock_session_file(&path, false).is_ok());
+    }
+
+    #[test]
+    fn logout_removes_only_the_locked_session_and_its_sqlite_sidecars() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+        let path = directory.path().join("123.session");
+        let lock = lock_session_file(&path, true)?;
+        let removal = SessionRemoval::new(path.clone(), lock);
+        tokio::runtime::Runtime::new()?.block_on(async {
+            use grammers_session::{Session, storages::SqliteSession, types::UpdateState};
+
+            let session = SqliteSession::open(&path).await?;
+            session
+                .set_update_state(UpdateState::Primary {
+                    pts: 1,
+                    date: 1,
+                    seq: 1,
+                })
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+        for name in [
+            "123.session-wal",
+            "123.session-shm",
+            "123.session-journal",
+            "456.session",
+            "saved.png",
+        ] {
+            fs::write(directory.path().join(name), b"fictional")?;
+        }
+        assert!(lock_session_file(&path, false).is_err());
+        removal.remove()?;
+        assert!(!path.exists());
+        for name in ["123.session-wal", "123.session-shm", "123.session-journal"] {
+            assert!(!directory.path().join(name).exists());
+        }
+        assert_eq!(find_saved_session(directory.path())?, Some(456));
+        assert_eq!(fs::read(directory.path().join("saved.png"))?, b"fictional");
+        assert!(lock_session_file(&path, true).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn logout_refuses_replaced_session_and_does_not_follow_sidecar_links() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("123.session");
+        let lock = lock_session_file(&path, true)?;
+        let removal = SessionRemoval::new(path.clone(), lock);
+        let saved = directory.path().join("saved.png");
+        fs::write(&saved, b"fictional")?;
+        let sidecar = directory.path().join("123.session-wal");
+        std::os::unix::fs::symlink(&saved, &sidecar)?;
+        assert!(removal.clone().remove().is_err());
+        assert!(path.is_file());
+        assert!(sidecar.is_symlink());
+        fs::remove_file(sidecar)?;
+        fs::rename(&path, directory.path().join("original.session"))?;
+        fs::write(&path, b"replacement")?;
+        assert!(removal.remove().is_err());
+        assert_eq!(fs::read(&path)?, b"replacement");
+        assert_eq!(fs::read(saved)?, b"fictional");
+        Ok(())
     }
 
     #[test]
