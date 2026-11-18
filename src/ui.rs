@@ -1,5 +1,5 @@
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,8 +21,8 @@ use crate::model::PlayableMedia;
 use crate::model::{
     Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
-    Reaction, ReadRequest, Reply, SearchHit, TextStyle, UpdateStatus, Upload, UploadKind,
-    merge_latest_history, order_chats, redact_spoilers,
+    Poll, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit, TextStyle,
+    UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, redact_spoilers,
 };
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -82,6 +82,7 @@ struct Ui {
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
+    poll_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
     own_avatar: Cell<Option<Option<Avatar>>>,
     account_label: gtk::Label,
@@ -147,6 +148,9 @@ struct Ui {
     uploads: RefCell<HashMap<i64, Vec<Upload>>>,
     replies: RefCell<HashMap<i64, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
+    voting: RefCell<HashSet<(i64, i32)>>,
+    poll_revision: Cell<u64>,
+    recent_polls: RefCell<VecDeque<(u64, PollUpdate)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
@@ -426,6 +430,7 @@ pub fn open(
     let attach_menu = gtk::gio::Menu::new();
     attach_menu.append(Some("Файлы"), Some("win.attach-file"));
     attach_menu.append(Some("Фотографии"), Some("win.attach-photo"));
+    attach_menu.append(Some("Опрос"), Some("win.create-poll"));
     attach.set_menu_model(Some(&attach_menu));
     let upload_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     upload_bar.add_css_class("composer");
@@ -536,6 +541,7 @@ pub fn open(
         profile_button,
         profile_dialog: glib::WeakRef::new(),
         own_profile_dialog: glib::WeakRef::new(),
+        poll_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
         own_avatar: Cell::new(None),
         account_label: menu_label,
@@ -603,6 +609,9 @@ pub fn open(
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
         reacting: RefCell::new(HashSet::new()),
+        voting: RefCell::new(HashSet::new()),
+        poll_revision: Cell::new(0),
+        recent_polls: RefCell::new(VecDeque::new()),
         images: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
@@ -912,6 +921,13 @@ pub fn open(
         ));
         window.add_action(&action);
     }
+    let create_poll = gtk::gio::SimpleAction::new("create-poll", None);
+    create_poll.connect_activate(glib::clone!(
+        #[weak]
+        ui,
+        move |_, _| ui.create_poll()
+    ));
+    window.add_action(&create_poll);
     remove_upload.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -1354,6 +1370,25 @@ impl Ui {
             },
         );
         let mut changes = client.changes();
+        let mut polls = client.poll_updates();
+        let mut poll_stop = self.stop.clone();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            loop {
+                let update = tokio::select! {
+                    _ = poll_stop.changed() => break,
+                    update = polls.recv() => update,
+                };
+                let Some(ui) = weak.upgrade() else { break };
+                match update {
+                    Ok(update) => ui.apply_poll_update(update),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        ui.load_history(None, false);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         let stop = self.stop.clone();
         let (incoming, mut messages) = tokio::sync::mpsc::channel(32);
         let (finish, finished) = oneshot::channel();
@@ -2117,6 +2152,7 @@ impl Ui {
             &self.message_search,
             &self.profile_dialog,
             &self.own_profile_dialog,
+            &self.poll_dialog,
             &self.contacts_dialog,
             &self.devices_dialog,
             &self.privacy_dialog,
@@ -3212,6 +3248,7 @@ impl Ui {
         }
         let generation = self.generation.get();
         let anchor = self.search_anchor.get();
+        let poll_revision = self.poll_revision.get();
         let revision = client
             .as_ref()
             .map_or_else(HistoryRevision::default, |client| {
@@ -3248,7 +3285,19 @@ impl Ui {
                 ui.history_refresh.set(false);
                 ui.older.set_sensitive(true);
                 match result {
-                    Ok((messages, has_older, marked)) => {
+                    Ok((mut messages, has_older, marked)) => {
+                        // A result pushed while the history request was in flight can be newer than the page.
+                        let recent = ui.recent_polls.borrow();
+                        for message in &mut messages {
+                            if let Some(poll) = &mut message.poll {
+                                for (revision, update) in &*recent {
+                                    if *revision > poll_revision {
+                                        update.apply(id, message.id, poll);
+                                    }
+                                }
+                            }
+                        }
+                        drop(recent);
                         let was_loaded = ui.loaded.replace(true);
                         let adjustment = ui.scroll.vadjustment();
                         let at_bottom =
@@ -3454,6 +3503,9 @@ impl Ui {
                     }
                 } else {
                     for item in &group {
+                        if let Some(poll) = &item.poll {
+                            bubble.append(&self.poll_card(chat, item.id, poll));
+                        }
                         if let Some(widget) = self.attachment_widget(chat, item, is_album) {
                             bubble.append(&widget);
                         }
@@ -4117,6 +4169,229 @@ impl Ui {
         });
     }
 
+    fn create_poll(self: &Rc<Self>) {
+        if !self.attach.is_sensitive() || self.chat_dialog_open() {
+            return;
+        }
+        let (Some(window), Some(chat)) = (self.window.upgrade(), self.selection.get()) else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let dialog = crate::poll_dialog::create(&window, move |draft, random_id| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let ui = weak.upgrade().context("Аккаунт закрыт")?;
+                if ui.is_demo.get() {
+                    ui.add_demo_messages(
+                        chat,
+                        vec![demo::poll_message(ui.next_demo_message(), draft)],
+                    );
+                    return Ok(());
+                }
+                let client = ui
+                    .client
+                    .borrow()
+                    .clone()
+                    .context("Нет подключения к Telegram")?;
+                let task = ui.runtime.spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(35),
+                        client.send_poll(chat, draft, random_id),
+                    )
+                    .await
+                    .context("Telegram не подтвердил отправку вовремя")?
+                });
+                drop(ui);
+                let message = task.await??;
+                if let Some(ui) = weak.upgrade() {
+                    ui.history_cache.borrow_mut().remove(chat);
+                    if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none() {
+                        if let Some(message) = message {
+                            ui.messages.borrow_mut().insert(message.id, message);
+                            ui.render_history(true);
+                        } else {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    ui.refresh_chats();
+                }
+                Ok(())
+            })
+        });
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.poll_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
+        self.poll_dialog.set(Some(&dialog));
+    }
+
+    fn poll_card(self: &Rc<Self>, chat: i64, id: i32, poll: &Poll) -> gtk::Box {
+        let card = crate::poll_dialog::card(poll);
+        if !poll.can_vote() {
+            return card;
+        }
+        let button = gtk::Button::with_label(if poll.has_vote() {
+            "Изменить голос"
+        } else {
+            "Голосовать"
+        });
+        button.set_halign(gtk::Align::Start);
+        button.set_sensitive(!self.voting.borrow().contains(&(chat, id)));
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                let Some(window) = ui.window.upgrade() else {
+                    return;
+                };
+                let current = ui.messages.borrow();
+                let Some(poll) = current.get(&id).and_then(|message| message.poll.as_ref()) else {
+                    return;
+                };
+                if ui.selection.get() != Some(chat) || ui.chat_dialog_open() || !poll.can_vote() {
+                    return;
+                }
+                let expected = poll.id;
+                crate::poll_dialog::vote(
+                    &window,
+                    poll,
+                    glib::clone!(
+                        #[weak]
+                        ui,
+                        move |options| ui.vote(chat, id, expected, options)
+                    ),
+                );
+            }
+        ));
+        card.append(&button);
+        card
+    }
+
+    fn vote(self: &Rc<Self>, chat: i64, id: i32, expected: i64, options: Vec<Vec<u8>>) {
+        if self.is_demo.get() {
+            let Some(poll) = self
+                .demo_messages
+                .borrow()
+                .get(&chat)
+                .and_then(|messages| messages.iter().find(|message| message.id == id))
+                .and_then(|message| message.poll.clone())
+                .filter(|poll| poll.id == expected && poll.accepts(&options))
+            else {
+                self.toast("Этот голос больше недоступен");
+                return;
+            };
+            let total = poll.total.unwrap_or(0) - i32::from(poll.has_vote())
+                + i32::from(!options.is_empty());
+            let results = poll
+                .choices
+                .iter()
+                .enumerate()
+                .map(|(index, choice)| {
+                    let chosen = options.contains(&choice.option);
+                    let votes =
+                        choice.votes.unwrap_or(0) - i32::from(choice.chosen) + i32::from(chosen);
+                    PollVoteCount {
+                        option: choice.option.clone(),
+                        votes: Some(votes.max(0)),
+                        chosen,
+                        correct: poll.quiz && index == 0,
+                    }
+                })
+                .collect();
+            self.apply_poll_update(PollUpdate {
+                id: expected,
+                target: None,
+                definition: None,
+                results: Some(results),
+                total: Some(total.max(0)),
+                solution: poll.quiz.then_some("Первый вариант правильный.".into()),
+                partial: false,
+            });
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        if !self.voting.borrow_mut().insert((chat, id)) {
+            return;
+        }
+        self.render_poll_change();
+        self.job(
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    client.vote(chat, id, expected, options),
+                )
+                .await
+                .context("Telegram не подтвердил голос вовремя")?
+            },
+            move |ui, result| {
+                ui.voting.borrow_mut().remove(&(chat, id));
+                match result {
+                    Ok(Some(update)) => ui.apply_poll_update(update),
+                    Ok(None) => {
+                        ui.toast(
+                            "Telegram принял голос. Результаты обновятся после синхронизации.",
+                        );
+                        if ui.selection.get() == Some(chat) {
+                            ui.load_history(None, false);
+                        }
+                    }
+                    Err(error) => ui.toast(&format!("Не удалось отправить голос. {error}")),
+                }
+                if ui.selection.get() == Some(chat) {
+                    ui.render_poll_change();
+                }
+            },
+        );
+    }
+
+    fn apply_poll_update(self: &Rc<Self>, update: PollUpdate) {
+        self.history_cache
+            .borrow_mut()
+            .update_polls(|chat, id, poll| {
+                update.apply(chat, id, poll);
+            });
+        if self.is_demo.get() {
+            for (&chat, messages) in &mut *self.demo_messages.borrow_mut() {
+                for message in messages {
+                    if let Some(poll) = &mut message.poll {
+                        update.apply(chat, message.id, poll);
+                    }
+                }
+            }
+        }
+        let Some(chat) = self.selection.get() else {
+            return;
+        };
+        let mut changed = false;
+        for message in self.messages.borrow_mut().values_mut() {
+            if let Some(poll) = &mut message.poll {
+                changed |= update.apply(chat, message.id, poll);
+            }
+        }
+        let revision = self.poll_revision.get() + 1;
+        self.poll_revision.set(revision);
+        let mut recent = self.recent_polls.borrow_mut();
+        if recent.len() >= 64 {
+            recent.pop_front();
+        }
+        recent.push_back((revision, update));
+        drop(recent);
+        if changed {
+            self.render_poll_change();
+        }
+    }
+
+    fn render_poll_change(self: &Rc<Self>) {
+        let adjustment = self.scroll.vadjustment();
+        self.render_history_position(false, Some((adjustment.upper(), adjustment.value())));
+    }
+
     fn send_message(self: &Rc<Self>) {
         if !self.send.is_sensitive() {
             return;
@@ -4149,6 +4424,7 @@ impl Ui {
                 photo_preview: false,
                 playback: None,
                 thumbnail: None,
+                poll: None,
                 reply_to,
                 reply_preview: reply.map(|reply| reply.preview),
                 can_reply: true,
@@ -4390,7 +4666,7 @@ impl Ui {
         {
             chat.preview = messages
                 .iter()
-                .find(|message| !message.text.is_empty())
+                .find(|message| !message.text.is_empty() || message.poll.is_some())
                 .map(|message| message.preview_text().into_owned())
                 .unwrap_or_else(|| "Вложение".into());
             chat.last_activity = last.timestamp;

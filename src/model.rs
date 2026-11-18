@@ -676,6 +676,7 @@ pub struct Message {
     pub photo_preview: bool,
     pub playback: Option<PlayableMedia>,
     pub thumbnail: Option<AttachmentThumbnail>,
+    pub poll: Option<Poll>,
     pub reply_to: Option<i32>,
     pub reply_preview: Option<ReplyPreview>,
     pub can_reply: bool,
@@ -688,6 +689,176 @@ pub struct Message {
     pub edited: bool,
     pub ephemeral: bool,
     pub album: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Poll {
+    pub id: i64,
+    pub question: String,
+    pub choices: Vec<PollChoice>,
+    pub closed: bool,
+    pub public: bool,
+    pub multiple: bool,
+    pub quiz: bool,
+    pub revoting_disabled: bool,
+    pub total: Option<i32>,
+    pub solution: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollChoice {
+    pub option: Vec<u8>,
+    pub label: String,
+    pub votes: Option<i32>,
+    pub chosen: bool,
+    pub correct: bool,
+}
+
+impl Poll {
+    pub fn has_vote(&self) -> bool {
+        self.choices.iter().any(|choice| choice.chosen)
+    }
+
+    pub fn can_vote(&self) -> bool {
+        !self.closed && (!self.revoting_disabled || !self.has_vote()) && self.choices.len() >= 2
+    }
+
+    pub fn accepts(&self, options: &[Vec<u8>]) -> bool {
+        self.can_vote()
+            && (!options.is_empty() || self.has_vote())
+            && (self.multiple || options.len() <= 1)
+            && options.iter().enumerate().all(|(index, option)| {
+                !options[..index].contains(option)
+                    && self.choices.iter().any(|choice| &choice.option == option)
+            })
+    }
+}
+
+#[derive(Clone)]
+pub struct PollUpdate {
+    pub id: i64,
+    pub target: Option<(i64, i32)>,
+    pub definition: Option<Poll>,
+    pub results: Option<Vec<PollVoteCount>>,
+    pub total: Option<i32>,
+    pub solution: Option<String>,
+    pub partial: bool,
+}
+
+#[derive(Clone)]
+pub struct PollVoteCount {
+    pub option: Vec<u8>,
+    pub votes: Option<i32>,
+    pub chosen: bool,
+    pub correct: bool,
+}
+
+impl PollUpdate {
+    pub fn apply(&self, chat: i64, message: i32, poll: &mut Poll) -> bool {
+        if poll.id != self.id || self.target.is_some_and(|target| target != (chat, message)) {
+            return false;
+        }
+        let mut next = self.definition.clone().unwrap_or_else(|| poll.clone());
+        next.closed |= poll.closed;
+        for choice in &mut next.choices {
+            if let Some(old) = poll.choices.iter().find(|old| old.option == choice.option) {
+                choice.chosen = old.chosen;
+                choice.correct = old.correct;
+                choice.votes = old.votes;
+            }
+            if let Some(results) = &self.results {
+                let result = results.iter().find(|result| result.option == choice.option);
+                if let Some(count) = result.and_then(|result| result.votes) {
+                    choice.votes = Some(count);
+                }
+                if !self.partial {
+                    choice.chosen = result.is_some_and(|result| result.chosen);
+                    choice.correct = result.is_some_and(|result| result.correct);
+                }
+            }
+        }
+        next.total = self.total.or(poll.total);
+        next.solution = self.solution.clone().or_else(|| poll.solution.clone());
+        if next == *poll {
+            return false;
+        }
+        *poll = next;
+        true
+    }
+}
+
+pub const MAX_POLL_CHOICES: usize = 12;
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PollDraft {
+    pub question: String,
+    pub choices: Vec<String>,
+    pub multiple: bool,
+    pub public: bool,
+}
+
+impl PollDraft {
+    pub fn validate(self) -> anyhow::Result<Self> {
+        let question = self.question.trim().to_owned();
+        anyhow::ensure!(!question.is_empty(), "Введите вопрос");
+        anyhow::ensure!(
+            question.chars().count() <= 300,
+            "Вопрос должен быть до 300 символов"
+        );
+        let choices: Vec<_> = self
+            .choices
+            .iter()
+            .map(|choice| choice.trim())
+            .filter(|choice| !choice.is_empty())
+            .map(str::to_owned)
+            .collect();
+        anyhow::ensure!(
+            (2..=MAX_POLL_CHOICES).contains(&choices.len()),
+            "Добавьте от 2 до {MAX_POLL_CHOICES} вариантов"
+        );
+        anyhow::ensure!(
+            choices.iter().all(|choice| choice.chars().count() <= 100),
+            "Вариант должен быть до 100 символов"
+        );
+        anyhow::ensure!(
+            choices
+                .iter()
+                .enumerate()
+                .all(|(index, choice)| !choices[..index].contains(choice)),
+            "Варианты должны различаться"
+        );
+        Ok(Self {
+            question,
+            choices,
+            ..self
+        })
+    }
+
+    pub fn into_poll(self, id: i64) -> Poll {
+        Poll {
+            id,
+            question: self.question,
+            choices: self
+                .choices
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| PollChoice {
+                    option: vec![index as u8],
+                    label,
+                    votes: None,
+                    chosen: false,
+                    correct: false,
+                })
+                .collect(),
+            closed: false,
+            public: self.public,
+            multiple: self.multiple,
+            quiz: false,
+            revoting_disabled: false,
+            total: None,
+            solution: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -752,6 +923,14 @@ impl Message {
     }
 
     pub fn preview_text(&self) -> Cow<'_, str> {
+        if let Some(poll) = &self.poll {
+            let kind = if poll.quiz {
+                "Викторина"
+            } else {
+                "Опрос"
+            };
+            return Cow::Owned(format!("{kind} · {}", poll.question));
+        }
         redact_spoilers(&self.text, &self.styles)
     }
 }
@@ -804,6 +983,16 @@ pub struct CachedHistory {
 }
 
 impl HistoryCache {
+    pub fn update_polls(&mut self, mut update: impl FnMut(i64, i32, &mut Poll)) {
+        for (&chat, history) in &mut self.chats {
+            for (&id, message) in &mut history.messages {
+                if let Some(poll) = &mut message.poll {
+                    update(chat, id, poll);
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, chat: i64) {
         self.chats.remove(&chat);
     }
@@ -1150,6 +1339,7 @@ mod tests {
                 photo_preview: false,
                 playback: None,
                 thumbnail: None,
+                poll: None,
                 reply_to: None,
                 reply_preview: None,
                 can_reply: true,
@@ -1188,6 +1378,71 @@ mod tests {
         ));
         cache.store(1, cached.messages, true, revision, now, now);
         assert!(cache.restore(1, now + CACHE_RETENTION).is_none());
+    }
+
+    #[test]
+    fn poll_draft_validates_visible_choices_and_maps_distinct_options() {
+        let draft = PollDraft {
+            question: "  Когда? ".into(),
+            choices: vec!["Сейчас".into(), " ".into(), "Завтра ".into()],
+            multiple: true,
+            public: false,
+        };
+        let mut invalid = draft.clone();
+        invalid.choices.push(" Завтра".into());
+        assert!(invalid.validate().is_err());
+        let poll = draft.validate().unwrap().into_poll(20);
+        assert_eq!(poll.question, "Когда?");
+        assert_eq!(
+            (&*poll.choices[1].label, &*poll.choices[1].option),
+            ("Завтра", &[1][..])
+        );
+        assert!(poll.accepts(&[vec![0], vec![1]]));
+        assert!(!poll.accepts(&[vec![0], vec![0]]));
+        assert!(!poll.accepts(&[vec![2]]));
+        assert!(!poll.accepts(&[]));
+    }
+
+    #[test]
+    fn poll_partial_updates_preserve_vote_and_explicit_targets_do_not_leak() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            ..PollDraft::default()
+        }
+        .into_poll(26);
+        poll.choices[1].chosen = true;
+        poll.choices[1].votes = Some(1);
+        let mut update = PollUpdate {
+            id: 26,
+            target: Some((-100, 10)),
+            definition: None,
+            results: Some(vec![PollVoteCount {
+                option: vec![1],
+                votes: Some(2),
+                chosen: false,
+                correct: false,
+            }]),
+            total: Some(3),
+            solution: None,
+            partial: true,
+        };
+        assert!(!update.apply(-101, 10, &mut poll));
+        assert!(!update.apply(-100, 11, &mut poll));
+        assert!(update.apply(-100, 10, &mut poll));
+        assert!(poll.choices[1].chosen);
+        assert_eq!(poll.choices[1].votes, Some(2));
+        update.partial = false;
+        assert!(update.apply(-100, 10, &mut poll));
+        assert!(!poll.has_vote());
+        let mut closed = poll.clone();
+        closed.closed = true;
+        update.definition = Some(closed);
+        update.total = None;
+        update.results = None;
+        assert!(update.apply(-100, 10, &mut poll));
+        assert_eq!(poll.total, Some(3));
+        assert!(!poll.can_vote());
     }
 
     #[test]

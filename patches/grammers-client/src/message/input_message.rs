@@ -25,6 +25,7 @@ pub struct InputMessage {
     pub(crate) entities: Vec<tl::enums::MessageEntity>,
     pub(crate) invert_media: bool,
     pub(crate) link_preview: bool,
+    pub(crate) random_id: Option<i64>,
     pub(crate) reply_markup: Option<tl::enums::ReplyMarkup>,
     pub(crate) reply_to: Option<i32>,
     pub(crate) schedule_date: Option<i32>,
@@ -40,6 +41,13 @@ impl InputMessage {
     /// Creates a new empty message for input.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Provide a stable Telegram random ID when retrying the same send operation.
+    /// Different messages must use different IDs.
+    pub fn random_id(mut self, random_id: i64) -> Self {
+        self.random_id = Some(random_id);
+        self
     }
 
     /// Whether to "send this message as a background message".
