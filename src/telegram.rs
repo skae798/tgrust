@@ -20,16 +20,17 @@ use grammers_session::{
     storages::SqliteSession,
     types::{PeerId, PeerKind, PeerRef},
 };
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, watch};
 
 use crate::model::{
     AttachmentThumbnail, Avatar, BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer, Chat, ChatFolder,
     ChatImage, ChatKind, Contact, DeviceChange, DeviceSession, DeviceSessions, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, OwnProfile,
-    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PrivacyAudience, PrivacyChange,
-    PrivacyKey, PrivacySetting, ProfileDetails, ProfileEdit, ProfileEditResult, Reaction,
-    ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan,
-    TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
+    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, Poll, PollChoice, PollDraft,
+    PollUpdate, PollVoteCount, PrivacyAudience, PrivacyChange, PrivacyKey, PrivacySetting,
+    ProfileDetails, ProfileEdit, ProfileEditResult, Reaction, ReadRequest, ReplyPreview,
+    SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
+    UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -97,6 +98,7 @@ pub struct Telegram {
     dialog_settings: Mutex<()>,
     privacy_settings: Mutex<()>,
     blocked_changes: watch::Sender<u64>,
+    poll_updates: broadcast::Sender<PollUpdate>,
     read_state: crate::read_state::ReadState,
 }
 
@@ -185,6 +187,7 @@ impl Telegram {
                 dialog_settings: Mutex::new(()),
                 privacy_settings: Mutex::new(()),
                 blocked_changes: watch::channel(0).0,
+                poll_updates: broadcast::channel(64).0,
                 read_state: crate::read_state::ReadState::default(),
             }),
             step,
@@ -406,6 +409,10 @@ impl Telegram {
         self.blocked_changes.subscribe()
     }
 
+    pub fn poll_updates(&self) -> broadcast::Receiver<PollUpdate> {
+        self.poll_updates.subscribe()
+    }
+
     fn invalidate_blocked(&self) {
         self.blocked_changes
             .send_modify(|value| *value = value.wrapping_add(1));
@@ -435,6 +442,9 @@ impl Telegram {
                 Ok(update) => {
                     retry_delay = Duration::from_secs(1);
                     self.record_history_change(&update);
+                    if let enums::Update::MessagePoll(update) = update.raw() {
+                        let _ = self.poll_updates.send(poll_update(update));
+                    }
                     if matches!(update.raw(), enums::Update::PeerBlocked(_)) {
                         self.invalidate_blocked();
                     }
@@ -1616,6 +1626,137 @@ impl Telegram {
         Ok(vec![message_view(&message, self_id, profile)])
     }
 
+    pub async fn send_poll(
+        &self,
+        chat: i64,
+        draft: PollDraft,
+        random_id: i64,
+    ) -> Result<Option<Message>> {
+        let poll = draft.validate()?;
+        let text = |text| {
+            types::TextWithEntities {
+                text,
+                entities: Vec::new(),
+            }
+            .into()
+        };
+        let media = types::InputMediaPoll {
+            poll: types::Poll {
+                id: random_id,
+                closed: false,
+                public_voters: poll.public,
+                multiple_choice: poll.multiple,
+                quiz: false,
+                open_answers: false,
+                revoting_disabled: false,
+                shuffle_answers: false,
+                hide_results_until_close: false,
+                creator: false,
+                subscribers_only: false,
+                question: text(poll.question),
+                answers: poll
+                    .choices
+                    .into_iter()
+                    .map(|choice| {
+                        types::InputPollAnswer {
+                            text: text(choice),
+                            media: None,
+                        }
+                        .into()
+                    })
+                    .collect(),
+                close_period: None,
+                close_date: None,
+                countries_iso2: None,
+                hash: 0,
+            }
+            .into(),
+            correct_answers: None,
+            attached_media: None,
+            solution: None,
+            solution_entities: None,
+            solution_media: None,
+        };
+        let peer = self.peer(chat).await?;
+        let self_id = self.self_id().await?;
+        let profile = self.profile().await;
+        let message = self
+            .client
+            .send_message(peer, InputMessage::new().media(media).random_id(random_id))
+            .await;
+        match message {
+            Ok(message) => Ok(Some(message_view(&message, self_id, profile.as_deref()))),
+            Err(error) if error.is("RANDOM_ID_DUPLICATE") => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn vote(
+        &self,
+        chat: i64,
+        id: i32,
+        expected: i64,
+        options: Vec<Vec<u8>>,
+    ) -> Result<Option<PollUpdate>> {
+        use grammers_client::tl::functions::messages::SendVote;
+        let peer = self.peer(chat).await?;
+        let message = self
+            .message_by_id(peer, id)
+            .await?
+            .context("Опрос больше недоступен")?;
+        let Some(Media::Poll(raw)) = message.media() else {
+            bail!("Опрос больше недоступен")
+        };
+        let poll = poll_view(&raw);
+        ensure!(
+            poll.id == expected && poll.accepts(&options),
+            "Этот голос больше недоступен"
+        );
+        let response = self
+            .client
+            .invoke(&SendVote {
+                peer: peer.into(),
+                msg_id: id,
+                options,
+            })
+            .await?;
+        let updates = match response {
+            enums::Updates::Updates(updates) => updates.updates,
+            enums::Updates::Combined(updates) => updates.updates,
+            enums::Updates::UpdateShort(update) => vec![update.update],
+            _ => Vec::new(),
+        };
+        for item in updates {
+            if let enums::Update::MessagePoll(raw) = item
+                && raw.poll_id == expected
+            {
+                let mut update = poll_update(&raw);
+                if !raw_results(&raw.results).min
+                    && update.results.is_some()
+                    && update.target.is_none_or(|target| target == (chat, id))
+                {
+                    update.target = Some((chat, id));
+                    update.partial = false;
+                    return Ok(Some(update));
+                }
+            }
+        }
+        let refreshed =
+            tokio::time::timeout(Duration::from_secs(6), self.message_by_id(peer, id)).await;
+        Ok(match refreshed {
+            Ok(Ok(Some(message))) => match message.media() {
+                Some(Media::Poll(raw)) if raw.raw.id == expected => Some(poll_results(
+                    expected,
+                    Some((chat, id)),
+                    Some(poll_definition(&raw.raw)),
+                    &raw.raw_results,
+                )),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     async fn upload_file(&self, upload: Upload) -> Result<Uploaded> {
         use tokio::io::AsyncReadExt;
 
@@ -2474,6 +2615,10 @@ fn message_view(
         .as_ref()
         .and_then(|(media, _)| playable_media(media));
     let thumbnail = attachment.as_ref().and_then(|(media, _)| thumbnail(media));
+    let poll = match message.media() {
+        Some(Media::Poll(raw)) => Some(poll_view(&raw)),
+        _ => None,
+    };
     let (reply_to, reply_preview) = match &message.raw {
         enums::Message::Message(raw) => match &raw.reply_to {
             Some(enums::MessageReplyHeader::Header(header)) if !header.reply_to_ephemeral => {
@@ -2517,7 +2662,7 @@ fn message_view(
                 .is_some_and(|id| Some(id) == self_id || profile.is_some_and(|own| own.id() == id))
             || (outgoing && !message.post() && message.sender_id().is_none()),
         timestamp: message.date().as_second(),
-        text: if attachment.is_some() {
+        text: if attachment.is_some() || poll.is_some() {
             message.text().to_owned()
         } else {
             message_text(message)
@@ -2528,6 +2673,7 @@ fn message_view(
         photo_preview,
         playback,
         thumbnail,
+        poll,
         reply_to,
         reply_preview,
         can_reply: matches!(message.raw, enums::Message::Message(_)),
@@ -2546,6 +2692,109 @@ fn message_view(
                 _ => false,
             },
     }
+}
+
+fn poll_question(text: &enums::TextWithEntities) -> String {
+    let enums::TextWithEntities::Entities(text) = text;
+    quote_preview(&text.text, &text.entities)
+}
+
+fn poll_definition(raw: &types::Poll) -> Poll {
+    Poll {
+        id: raw.id,
+        question: poll_question(&raw.question),
+        choices: raw
+            .answers
+            .iter()
+            .filter_map(|answer| {
+                let enums::PollAnswer::Answer(answer) = answer else {
+                    return None;
+                };
+                Some(PollChoice {
+                    option: answer.option.clone(),
+                    label: poll_question(&answer.text),
+                    votes: None,
+                    chosen: false,
+                    correct: false,
+                })
+            })
+            .collect(),
+        closed: raw.closed
+            || raw.close_date.is_some_and(|date| {
+                u64::try_from(date).is_ok_and(|date| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        >= date
+                })
+            }),
+        public: raw.public_voters,
+        multiple: raw.multiple_choice,
+        quiz: raw.quiz,
+        revoting_disabled: raw.revoting_disabled,
+        total: None,
+        solution: None,
+    }
+}
+
+fn raw_results(results: &enums::PollResults) -> &types::PollResults {
+    let enums::PollResults::Results(results) = results;
+    results
+}
+
+fn poll_results(
+    id: i64,
+    target: Option<(i64, i32)>,
+    definition: Option<Poll>,
+    raw: &types::PollResults,
+) -> PollUpdate {
+    PollUpdate {
+        id,
+        target,
+        definition,
+        results: raw.results.as_ref().map(|results| {
+            results
+                .iter()
+                .map(|entry| {
+                    let enums::PollAnswerVoters::Voters(entry) = entry;
+                    PollVoteCount {
+                        option: entry.option.clone(),
+                        votes: entry.voters.map(|count| count.max(0)),
+                        chosen: entry.chosen,
+                        correct: entry.correct,
+                    }
+                })
+                .collect()
+        }),
+        total: raw.total_voters.map(|count| count.max(0)),
+        solution: raw
+            .solution
+            .as_ref()
+            .map(|text| quote_preview(text, raw.solution_entities.as_deref().unwrap_or_default())),
+        partial: raw.min,
+    }
+}
+
+fn poll_view(raw: &grammers_client::media::Poll) -> Poll {
+    let mut poll = poll_definition(&raw.raw);
+    poll_results(poll.id, None, None, &raw.raw_results).apply(0, 0, &mut poll);
+    poll
+}
+
+fn poll_update(raw: &types::UpdateMessagePoll) -> PollUpdate {
+    let target = raw
+        .peer
+        .clone()
+        .and_then(|peer| PeerId::from(peer).bot_api_dialog_id())
+        .zip(raw.msg_id);
+    let definition = raw
+        .poll
+        .as_ref()
+        .map(|enums::Poll::Poll(poll)| poll_definition(poll));
+    let mut update = poll_results(raw.poll_id, target, definition, raw_results(&raw.results));
+    update.partial |= target.is_none();
+    update
 }
 
 fn author_peer<'a>(message: &'a TelegramMessage, profile: Option<&'a Peer>) -> Option<&'a Peer> {
@@ -2776,6 +3025,13 @@ fn message_text(message: &TelegramMessage) -> String {
         message.text().to_owned()
     } else if message.action().is_some() {
         "Событие в чате".to_owned()
+    } else if let Some(Media::Poll(raw)) = message.media() {
+        let kind = if raw.raw.quiz {
+            "Викторина"
+        } else {
+            "Опрос"
+        };
+        format!("{kind} · {}", poll_question(&raw.raw.question))
     } else if message.media().is_some() {
         "Вложение".to_owned()
     } else {

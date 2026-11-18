@@ -605,7 +605,7 @@ impl Client {
     ) -> Result<Message, InvocationError> {
         let peer = peer.into();
         let message = message.into();
-        let random_id = generate_random_id();
+        let random_id = message.random_id.unwrap_or_else(generate_random_id);
         let entities = parse_mention_entities(self, message.entities.clone()).await;
         let updates = if let Some(media) = message.media.clone() {
             self.invoke(&tl::functions::messages::SendMedia {

@@ -8,6 +8,7 @@ mod media_viewer;
 mod model;
 mod own_profile;
 mod playback_controls;
+mod poll_dialog;
 mod privacy;
 mod privacy_rules;
 mod profile;

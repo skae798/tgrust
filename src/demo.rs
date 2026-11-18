@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
     AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, Message,
-    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress,
+    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PollDraft,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -24,6 +24,7 @@ pub fn chats() -> Vec<Chat> {
         (2, "Избранное", "Проверить сборку на ноутбуке", 0, false),
         (3, "Новости проекта", "Опубликован план на неделю", 0, true),
         (5, "Демомедиа", "Видео и аудио", 0, false),
+        (6, "Демоопросы", "Опрос · Когда провести встречу?", 0, false),
     ]
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
@@ -32,13 +33,13 @@ pub fn chats() -> Vec<Chat> {
         last_activity: now() - id,
         title: title.to_owned(),
         preview: preview.to_owned(),
-        preview_sender: (id == 1).then(|| "Анна".to_owned()),
+        preview_sender: matches!(id, 1 | 6).then(|| "Анна".to_owned()),
         preview_image: history(id).last().and_then(|message| {
             message
                 .thumbnail
                 .map(|media| ChatImage::attachment(id, message.id, media))
         }),
-        group: id == 1,
+        group: matches!(id, 1 | 6),
         unread,
         unread_mark: false,
         last_message_id: history(id).last().map_or(0, |message| message.id),
@@ -51,7 +52,7 @@ pub fn chats() -> Vec<Chat> {
         }),
         archived: id == 3,
         kind: match id {
-            1 => ChatKind::Group,
+            1 | 6 => ChatKind::Group,
             3 => ChatKind::Broadcast,
             _ => ChatKind::User,
         },
@@ -128,6 +129,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         about: match id {
             1 => "Обсуждаем макеты, сроки и материалы проекта. Демонстрационная группа.",
             2 => "Демонстрационные данные аккаунта.",
+            6 => "Демонстрационная группа с опросами и викториной.",
             _ => "Объявления и новости проекта. Демонстрационный канал.",
         }
         .to_owned(),
@@ -135,13 +137,14 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             match id {
                 1 => "@demo_tgrust_team",
                 2 => "@demo_tgrust_account",
+                6 => "@demo_tgrust_polls",
                 _ => "@demo_tgrust_news",
             }
             .to_owned(),
         ],
         phone: chat.saved_messages.then(|| "+00000000000".to_owned()),
-        members: (id != 2).then_some(if id == 1 { 8 } else { 120 }),
-        online_members: (id == 1).then_some(2),
+        members: (id != 2).then_some(if matches!(id, 1 | 6) { 8 } else { 120 }),
+        online_members: matches!(id, 1 | 6).then_some(2),
         verified: id == 3,
         scam: false,
         fake: false,
@@ -216,6 +219,41 @@ pub fn blocked_page(ids: &[i64], offset: i32) -> crate::model::BlockedPage {
 }
 
 pub fn history(chat: i64) -> Vec<Message> {
+    if chat == 6 {
+        let mut meeting = poll_message(
+            2,
+            PollDraft {
+                question: "Когда провести встречу?".into(),
+                choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
+                multiple: true,
+                public: false,
+            },
+        );
+        let mut quiz = poll_message(
+            1,
+            PollDraft {
+                question: "Какой день идёт после вторника?".into(),
+                choices: vec!["Среда".into(), "Воскресенье".into()],
+                ..PollDraft::default()
+            },
+        );
+        if let Some(poll) = &mut quiz.poll {
+            poll.quiz = true;
+            poll.revoting_disabled = true;
+        }
+        for message in [&mut meeting, &mut quiz] {
+            message.sender = "Анна".into();
+            message.sender_avatar = Some(Avatar {
+                peer: 6,
+                photo: 6,
+                dc: 0,
+            });
+            message.self_authored = false;
+            message.outgoing = false;
+            message.can_delete = false;
+        }
+        return vec![quiz, meeting];
+    }
     let today = now();
     let samples = match chat {
         1 => vec![
@@ -285,6 +323,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             } else {
                 ((chat == 1 && index == 3) || chat == 3).then_some(AttachmentThumbnail::Photo(chat))
             },
+            poll: None,
             reply_to: (chat == 1 && index == 1).then_some(81),
             reply_preview: None,
             can_reply: true,
@@ -311,6 +350,36 @@ pub fn history(chat: i64) -> Vec<Message> {
         messages.splice(..0, older);
     }
     messages
+}
+
+pub fn poll_message(id: i32, draft: PollDraft) -> Message {
+    Message {
+        id,
+        sender: OWN_NAME.into(),
+        sender_avatar: Some(OWN_AVATAR),
+        self_authored: true,
+        timestamp: now(),
+        text: String::new(),
+        styles: Vec::new(),
+        outgoing: true,
+        attachment: None,
+        photo_preview: false,
+        playback: None,
+        thumbnail: None,
+        poll: Some(draft.into_poll(i64::from(id))),
+        reply_to: None,
+        reply_preview: None,
+        can_reply: true,
+        can_edit: false,
+        can_delete: true,
+        can_forward: true,
+        forwarded: false,
+        pinned: false,
+        reactions: Vec::new(),
+        edited: false,
+        ephemeral: false,
+        album: None,
+    }
 }
 
 pub fn preview_pixels() -> Vec<u8> {
