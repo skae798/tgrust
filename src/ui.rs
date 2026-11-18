@@ -78,6 +78,7 @@ struct Ui {
     devices_dialog: glib::WeakRef<adw::Dialog>,
     demo_devices: Rc<RefCell<crate::model::DeviceSessions>>,
     privacy_dialog: glib::WeakRef<adw::Dialog>,
+    proxy_dialog: glib::WeakRef<adw::Dialog>,
     demo_privacy: Rc<RefCell<HashMap<crate::model::PrivacyKey, crate::model::PrivacySetting>>>,
     blocked_dialog: glib::WeakRef<adw::Dialog>,
     demo_blocked: Rc<RefCell<Vec<i64>>>,
@@ -193,6 +194,8 @@ pub fn open(
     connect_retry.set_visible(false);
     let login_accounts = gtk::Button::with_label("Аккаунты");
     login_accounts.add_css_class("flat");
+    let login_proxy = gtk::Button::with_label("Прокси");
+    login_proxy.add_css_class("flat");
     let demo_button = gtk::Button::with_label("Открыть деморежим");
     demo_button.add_css_class("flat");
     for widget in [
@@ -204,6 +207,7 @@ pub fn open(
         api_hash_input.upcast_ref(),
         connect_retry.upcast_ref(),
         login_accounts.upcast_ref(),
+        login_proxy.upcast_ref(),
         demo_button.upcast_ref(),
     ] {
         login_box.append(widget);
@@ -237,6 +241,9 @@ pub fn open(
     let blocked_button = gtk::Button::with_label("Заблокированные");
     blocked_button.add_css_class("flat");
     menu_body.append(&blocked_button);
+    let proxy_button = gtk::Button::with_label("Прокси");
+    proxy_button.add_css_class("flat");
+    menu_body.append(&proxy_button);
     let logout = gtk::Button::with_label("Выйти из аккаунта");
     logout.add_css_class("flat");
     logout.add_css_class("destructive-action");
@@ -476,6 +483,7 @@ pub fn open(
         devices_dialog: glib::WeakRef::new(),
         demo_devices: Rc::new(RefCell::new(demo::device_sessions())),
         privacy_dialog: glib::WeakRef::new(),
+        proxy_dialog: glib::WeakRef::new(),
         demo_privacy: Rc::new(RefCell::new(demo::privacy_settings())),
         blocked_dialog: glib::WeakRef::new(),
         demo_blocked: Rc::new(RefCell::new(
@@ -680,6 +688,18 @@ pub fn open(
             ui.open_privacy();
         }
     ));
+    for button in [&login_proxy, &proxy_button] {
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            ui,
+            #[weak]
+            menu_popup,
+            move |_| {
+                menu_popup.popdown();
+                ui.open_proxy();
+            }
+        ));
+    }
     blocked_button.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -1889,6 +1909,7 @@ impl Ui {
             &self.contacts_dialog,
             &self.devices_dialog,
             &self.privacy_dialog,
+            &self.proxy_dialog,
             &self.blocked_dialog,
             &self.logout_dialog,
             &self.accounts_dialog,
@@ -1996,6 +2017,26 @@ impl Ui {
                 }
             });
         });
+    }
+
+    fn open_proxy(self: &Rc<Self>) {
+        if self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo = self.is_demo.get().then(|| self.accounts.demo_proxy.clone());
+        let dialog = crate::proxy_dialog::open(&window, demo);
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.proxy_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
+        self.proxy_dialog.set(Some(&dialog));
     }
 
     fn open_privacy(self: &Rc<Self>) {

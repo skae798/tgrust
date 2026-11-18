@@ -10,6 +10,8 @@ mod playback_controls;
 mod privacy;
 mod privacy_rules;
 mod profile;
+mod proxy;
+mod proxy_dialog;
 mod read_state;
 mod search;
 mod session_runner;
