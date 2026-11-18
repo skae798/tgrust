@@ -12,6 +12,7 @@ mod privacy;
 mod privacy_rules;
 mod profile;
 mod profile_edit;
+mod profile_photo;
 mod proxy;
 mod proxy_dialog;
 mod qr_login;

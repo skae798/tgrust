@@ -2,21 +2,26 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
 use anyhow::{Context, Result};
-use gtk::glib;
+use gtk::{gio, glib};
 use tokio::runtime::Handle;
 
 use crate::model::{OwnProfile, ProfileDetails, ProfileEdit, ProfileEditResult};
+use crate::profile::AvatarLoader;
 
 type Request<T> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
+type PhotoRequest = Box<dyn Fn(OwnProfile, Arc<[u8]>) -> Request<ProfileEditResult>>;
 
 pub struct ProfileContext {
     pub runtime: Handle,
     pub load: Box<dyn Fn() -> Request<OwnProfile>>,
     pub save: Box<dyn Fn(OwnProfile, ProfileEdit) -> Request<ProfileEditResult>>,
+    pub set_photo: PhotoRequest,
+    pub load_avatar: AvatarLoader,
     pub changed: Box<dyn Fn(&OwnProfile)>,
 }
 
@@ -24,10 +29,14 @@ pub struct ProfileContext {
 enum Section {
     Details,
     Username,
+    Photo,
 }
 
 struct Editor {
     context: Rc<ProfileContext>,
+    avatar: adw::Bin,
+    photo_button: gtk::Button,
+    photo_status: gtk::Label,
     first: adw::EntryRow,
     last: adw::EntryRow,
     about: gtk::TextView,
@@ -46,7 +55,7 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
     let dialog = adw::Dialog::builder()
         .title("Мой профиль")
         .content_width(475)
-        .content_height(560)
+        .content_height(620)
         .build();
     let header = adw::HeaderBar::new();
     let refresh = gtk::Button::builder()
@@ -61,6 +70,23 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
     content.set_margin_bottom(16);
     content.set_margin_start(12);
     content.set_margin_end(12);
+
+    let photo = gtk::Box::builder()
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .build();
+    let avatar = adw::Bin::new();
+    avatar.set_child(Some(&adw::Avatar::new(64, None, false)));
+    let photo_button = gtk::Button::builder()
+        .label("Изменить фото")
+        .valign(gtk::Align::Center)
+        .build();
+    photo.append(&avatar);
+    photo.append(&photo_button);
+    content.append(&photo);
+    let photo_status = status_label();
+    photo_status.set_visible(false);
+    content.append(&photo_status);
 
     let name = adw::PreferencesGroup::new();
     let first = adw::EntryRow::builder().title("Имя").build();
@@ -100,12 +126,7 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
     content.append(&public);
     let username_button = save_button("Сохранить имя пользователя");
     content.append(&username_button);
-    let status = gtk::Label::builder()
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .xalign(0.0)
-        .css_classes(["dim-label"])
-        .build();
+    let status = status_label();
     content.append(&status);
 
     let scroll = gtk::ScrolledWindow::builder()
@@ -117,6 +138,9 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
     dialog.set_focus(Some(&refresh));
     let editor = Rc::new(Editor {
         context: Rc::new(context),
+        avatar,
+        photo_button,
+        photo_status,
         first,
         last,
         about,
@@ -130,20 +154,27 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
         closed: Cell::new(false),
         read: RefCell::new(None),
     });
-    for (button, section) in [
-        (&editor.details_button, Section::Details),
-        (&editor.username_button, Section::Username),
-    ] {
-        button.connect_clicked(glib::clone!(
-            #[weak]
-            editor,
-            move |_| editor.save(section)
-        ));
-    }
+    editor.details_button.connect_clicked(glib::clone!(
+        #[weak]
+        editor,
+        move |_| editor.save(ProfileEdit::Details(editor.details()))
+    ));
+    editor.username_button.connect_clicked(glib::clone!(
+        #[weak]
+        editor,
+        move |_| editor.save(ProfileEdit::Username(editor.username.text().into()))
+    ));
     editor.refresh.connect_clicked(glib::clone!(
         #[weak]
         editor,
         move |_| editor.load()
+    ));
+    editor.photo_button.connect_clicked(glib::clone!(
+        #[weak]
+        editor,
+        #[weak]
+        window,
+        move |_| editor.choose_photo(&window)
     ));
     editor.load();
     dialog.connect_closed(move |_| {
@@ -164,7 +195,25 @@ fn save_button(text: &str) -> gtk::Button {
         .build()
 }
 
+fn status_label() -> gtk::Label {
+    gtk::Label::builder()
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build()
+}
+
 impl Editor {
+    fn set_save_status(&self, section: Section, message: &str) {
+        if section == Section::Photo {
+            self.photo_status.set_text(message);
+            self.photo_status.set_visible(!message.is_empty());
+        } else {
+            self.status.set_text(message);
+        }
+    }
+
     fn set_busy(&self, busy: bool) {
         self.busy.set(busy);
         let ready = !busy && self.current.borrow().is_some();
@@ -175,6 +224,7 @@ impl Editor {
             self.username.upcast_ref(),
             self.details_button.upcast_ref(),
             self.username_button.upcast_ref(),
+            self.photo_button.upcast_ref(),
         ] {
             widget.set_sensitive(ready);
         }
@@ -191,8 +241,14 @@ impl Editor {
     }
 
     fn show(&self, mut snapshot: OwnProfile, section: Option<Section>) {
+        let name = snapshot.details.display_name();
+        let avatar = adw::Avatar::new(64, Some(&name), true);
+        if let Some(photo) = snapshot.avatar {
+            (self.context.load_avatar)(&avatar, photo);
+        }
+        self.avatar.set_child(Some(&avatar));
         let baseline = self.current.borrow();
-        if section != Some(Section::Username)
+        if matches!(section, None | Some(Section::Details))
             || baseline
                 .as_ref()
                 .is_none_or(|old| self.details() == old.details)
@@ -203,7 +259,7 @@ impl Editor {
         } else if let Some(old) = baseline.as_ref() {
             snapshot.details = old.details.clone();
         }
-        if section != Some(Section::Details)
+        if matches!(section, None | Some(Section::Username))
             || baseline
                 .as_ref()
                 .is_none_or(|old| self.username.text().as_str() == old.username)
@@ -214,6 +270,86 @@ impl Editor {
         }
         drop(baseline);
         self.current.replace(Some(snapshot));
+    }
+
+    fn choose_photo(self: &Rc<Self>, window: &adw::ApplicationWindow) {
+        if self.closed.get() || self.busy.get() {
+            return;
+        }
+        let Some(baseline) = self.current.borrow().clone() else {
+            return;
+        };
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("JPEG и PNG"));
+        filter.add_mime_type("image/jpeg");
+        filter.add_mime_type("image/png");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let picker = gtk::FileDialog::builder()
+            .title("Выберите фото профиля")
+            .filters(&filters)
+            .build();
+        let choice = picker.open_future(Some(window));
+        let window = window.downgrade();
+        let weak = Rc::downgrade(self);
+        self.set_save_status(Section::Photo, "");
+        self.set_busy(true);
+        glib::MainContext::default().spawn_local(async move {
+            let result = async {
+                let file = match choice.await {
+                    Ok(file) => file,
+                    Err(error) if error.matches(gtk::DialogError::Dismissed) => return Ok(None),
+                    Err(error) => return Err(error.into()),
+                };
+                let path = file.path().context("Выберите локальный файл")?;
+                let jpeg: Arc<[u8]> =
+                    gio::spawn_blocking(move || crate::profile_photo::prepare(&path))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Не удалось подготовить фотографию"))??
+                        .into();
+                let texture =
+                    gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(jpeg.clone()))?;
+                Ok::<_, anyhow::Error>(Some((jpeg, texture)))
+            }
+            .await;
+            let Some(editor) = weak.upgrade().filter(|editor| !editor.closed.get()) else {
+                return;
+            };
+            match result {
+                Ok(Some((jpeg, texture))) if let Some(window) = window.upgrade() => {
+                    let image = adw::Avatar::new(166, None, false);
+                    image.set_custom_image(Some(&texture));
+                    image.update_property(&[gtk::accessible::Property::Label("Предпросмотр фото")]);
+                    image.set_halign(gtk::Align::Center);
+                    let preview = adw::AlertDialog::builder()
+                        .heading("Фото профиля")
+                        .extra_child(&image)
+                        .close_response("cancel")
+                        .default_response("cancel")
+                        .build();
+                    preview.add_response("cancel", "Отмена");
+                    preview.add_response("save", "Установить фото");
+                    preview.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+                    let response = preview.choose_future(Some(&window));
+                    drop(editor);
+                    if response.await == "save" {
+                        if let Some(editor) = weak.upgrade().filter(|editor| !editor.closed.get()) {
+                            let request = (editor.context.set_photo)(baseline, jpeg);
+                            editor.submit(Section::Photo, request);
+                        }
+                        return;
+                    }
+                }
+                Err(error) => {
+                    editor.set_save_status(Section::Photo, &format!("Фото не открыто. {error}"));
+                }
+                Ok(_) => {}
+            }
+            if let Some(editor) = weak.upgrade().filter(|editor| !editor.closed.get()) {
+                editor.set_busy(false);
+                editor.photo_button.grab_focus();
+            }
+        });
     }
 
     fn load(self: &Rc<Self>) {
@@ -243,6 +379,7 @@ impl Editor {
                 Ok(snapshot) => {
                     (editor.context.changed)(&snapshot);
                     editor.show(snapshot, None);
+                    editor.set_save_status(Section::Photo, "");
                     editor.status.set_text("");
                 }
                 Err(error) => editor
@@ -253,16 +390,16 @@ impl Editor {
         });
     }
 
-    fn save(self: &Rc<Self>, section: Section) {
+    fn save(self: &Rc<Self>, edit: ProfileEdit) {
         if self.closed.get() || self.busy.get() {
             return;
         }
         let Some(baseline) = self.current.borrow().clone() else {
             return;
         };
-        let edit = match section {
-            Section::Details => ProfileEdit::Details(self.details()),
-            Section::Username => ProfileEdit::Username(self.username.text().into()),
+        let section = match edit {
+            ProfileEdit::Details(_) => Section::Details,
+            ProfileEdit::Username(_) => Section::Username,
         };
         match crate::profile_edit::prepare(&baseline, &baseline, &edit) {
             Err(error) => {
@@ -275,10 +412,22 @@ impl Editor {
             }
             _ => {}
         }
+        let save = (self.context.save)(baseline, edit);
+        self.submit(section, save);
+    }
+
+    fn submit(self: &Rc<Self>, section: Section, save: Request<ProfileEditResult>) {
+        let photo = section == Section::Photo;
         self.refresh.grab_focus();
         self.set_busy(true);
-        self.status.set_text("Сохранение…");
-        let save = (self.context.save)(baseline, edit);
+        self.set_save_status(
+            section,
+            if photo {
+                "Загрузка фото…"
+            } else {
+                "Сохранение…"
+            },
+        );
         let task = self.context.runtime.spawn(async move {
             tokio::time::timeout(Duration::from_secs(35), save)
                 .await
@@ -305,10 +454,21 @@ impl Editor {
             match result {
                 Ok(result) => {
                     let (snapshot, message) = match result {
+                        ProfileEditResult::Saved(snapshot) if photo => {
+                            (snapshot, "Фото обновлено.")
+                        }
                         ProfileEditResult::Saved(snapshot) => (snapshot, "Сохранено."),
+                        ProfileEditResult::Conflict(snapshot) if photo => (
+                            snapshot,
+                            "Фото уже изменилось в другом клиенте. Проверьте новое фото.",
+                        ),
                         ProfileEditResult::Conflict(snapshot) => (
                             snapshot,
                             "Это поле уже изменилось в другом клиенте. Проверьте новое значение.",
+                        ),
+                        ProfileEditResult::Confirmed(snapshot) if photo => (
+                            snapshot,
+                            "Telegram принял фото. Обновите профиль, чтобы сверить его.",
                         ),
                         ProfileEditResult::Confirmed(snapshot) => (
                             snapshot,
@@ -316,11 +476,12 @@ impl Editor {
                         ),
                     };
                     editor.show(snapshot, Some(section));
-                    editor.status.set_text(message);
+                    editor.set_save_status(section, message);
                 }
-                Err(error) => editor
-                    .status
-                    .set_text(&format!("Не удалось подтвердить сохранение. {error}")),
+                Err(error) => editor.set_save_status(
+                    section,
+                    &format!("Не удалось подтвердить сохранение. {error}"),
+                ),
             }
             editor.set_busy(false);
         });
