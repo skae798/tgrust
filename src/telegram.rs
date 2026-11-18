@@ -128,6 +128,8 @@ impl Telegram {
         profile: crate::model::AccountProfile,
         api_hash: Option<String>,
     ) -> Result<(Arc<Self>, LoginStep)> {
+        let settings = tokio::task::spawn_blocking(crate::proxy::load).await??;
+        let configuration = crate::proxy::configuration(&settings)?;
         let (path, lock) = open_session_file(&profile, api_hash.is_some())?;
         let session = Arc::new(
             SqliteSession::open(&path)
@@ -138,7 +140,7 @@ impl Telegram {
             runner,
             updates,
             handle,
-        } = SenderPool::new(session.clone(), profile.api_id);
+        } = SenderPool::with_configuration(session.clone(), profile.api_id, configuration);
         let sender = (*handle).clone();
         let client = Client::new(handle);
         let session_removal = SessionRemoval::new(path, lock);

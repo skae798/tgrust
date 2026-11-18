@@ -149,6 +149,15 @@ pub struct AccountProfile {
     name: Option<String>,
 }
 
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ProxySettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: String,
+    pub username: String,
+    pub password: String,
+}
+
 impl AccountProfile {
     pub fn legacy(api_id: i32) -> Self {
         Self { api_id, name: None }

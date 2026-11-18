@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use gtk::{gio, glib};
 use tokio::runtime::Runtime;
 
-use crate::model::AccountProfile;
+use crate::model::{AccountProfile, ProxySettings};
 use crate::storage::SessionRemoval;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -40,6 +40,7 @@ pub struct Accounts {
     credentials: Result<Option<(i32, String)>>,
     app: glib::WeakRef<adw::Application>,
     windows: RefCell<HashMap<Account, WindowState>>,
+    pub demo_proxy: Rc<RefCell<ProxySettings>>,
 }
 
 enum WindowState {
@@ -54,6 +55,7 @@ impl Accounts {
             credentials: environment_credentials(),
             app: app.downgrade(),
             windows: RefCell::new(HashMap::new()),
+            demo_proxy: Rc::new(RefCell::new(ProxySettings::default())),
         })
     }
 
