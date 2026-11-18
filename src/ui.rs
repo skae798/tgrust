@@ -77,6 +77,8 @@ struct Ui {
     contacts_dialog: glib::WeakRef<adw::Dialog>,
     devices_dialog: glib::WeakRef<adw::Dialog>,
     demo_devices: Rc<RefCell<crate::model::DeviceSessions>>,
+    privacy_dialog: glib::WeakRef<adw::Dialog>,
+    demo_privacy: Rc<RefCell<HashMap<crate::model::PrivacyKey, crate::model::PrivacySetting>>>,
     history: gtk::Box,
     message_menu: gtk::Popover,
     menu_message: Cell<Option<i32>>,
@@ -227,6 +229,9 @@ pub fn open(
     menu_body.set_margin_top(6);
     menu_body.set_margin_bottom(6);
     menu_body.append(&devices_button);
+    let privacy_button = gtk::Button::with_label("Конфиденциальность");
+    privacy_button.add_css_class("flat");
+    menu_body.append(&privacy_button);
     let logout = gtk::Button::with_label("Выйти из аккаунта");
     logout.add_css_class("flat");
     logout.add_css_class("destructive-action");
@@ -465,6 +470,8 @@ pub fn open(
         contacts_dialog: glib::WeakRef::new(),
         devices_dialog: glib::WeakRef::new(),
         demo_devices: Rc::new(RefCell::new(demo::device_sessions())),
+        privacy_dialog: glib::WeakRef::new(),
+        demo_privacy: Rc::new(RefCell::new(demo::privacy_settings())),
         history,
         message_menu,
         menu_message: Cell::new(None),
@@ -654,6 +661,16 @@ pub fn open(
             }
         ));
     }
+    privacy_button.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        #[weak]
+        menu_popup,
+        move |_| {
+            menu_popup.popdown();
+            ui.open_privacy();
+        }
+    ));
     let devices_action = gtk::gio::SimpleAction::new("devices", None);
     devices_action.connect_activate(glib::clone!(
         #[weak]
@@ -1852,6 +1869,7 @@ impl Ui {
             &self.profile_dialog,
             &self.contacts_dialog,
             &self.devices_dialog,
+            &self.privacy_dialog,
             &self.logout_dialog,
             &self.accounts_dialog,
         ]
@@ -1958,6 +1976,81 @@ impl Ui {
                 }
             });
         });
+    }
+
+    fn open_privacy(self: &Rc<Self>) {
+        if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
+            || self.chat_dialog_open()
+        {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo_mode = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let load_client = client.clone();
+        let demo_load = self.demo_privacy.clone();
+        let demo_save = self.demo_privacy.clone();
+        let dialog = crate::privacy::open(
+            &window,
+            crate::privacy::PrivacyContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |key| {
+                    let local = demo_mode
+                        .then(|| demo_load.borrow().get(&key).cloned())
+                        .flatten();
+                    let client = load_client.clone();
+                    Box::pin(async move {
+                        if let Some(setting) = local {
+                            return Ok(setting);
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .privacy_setting(key)
+                            .await
+                    })
+                }),
+                save: Box::new(move |key, baseline, audience| {
+                    let local = demo_mode.then(|| {
+                        use crate::model::PrivacyChange;
+                        let mut settings = demo_save.borrow_mut();
+                        let setting = settings.get_mut(&key).context("Правило отсутствует")?;
+                        if *setting != baseline {
+                            return Ok(PrivacyChange::Conflict(setting.clone()));
+                        }
+                        anyhow::ensure!(
+                            setting.editable && key.audiences().contains(&audience),
+                            "Недоступная аудитория"
+                        );
+                        setting.audience = Some(audience);
+                        Ok(PrivacyChange::Saved {
+                            setting: setting.clone(),
+                            exceptions_changed: false,
+                        })
+                    });
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if let Some(result) = local {
+                            return result;
+                        };
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .set_privacy_setting(key, &baseline, audience)
+                            .await
+                    })
+                }),
+            },
+        );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.privacy_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
+        self.privacy_dialog.set(Some(&dialog));
     }
 
     fn open_devices(self: &Rc<Self>) {

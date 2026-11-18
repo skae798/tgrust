@@ -223,6 +223,82 @@ impl DeviceSession {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrivacyKey {
+    PhoneNumber,
+    AddedByPhone,
+    LastSeen,
+    ProfilePhoto,
+}
+
+impl PrivacyKey {
+    pub const ALL: [Self; 4] = [
+        Self::PhoneNumber,
+        Self::AddedByPhone,
+        Self::LastSeen,
+        Self::ProfilePhoto,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::PhoneNumber => "Номер телефона",
+            Self::AddedByPhone => "Поиск по номеру",
+            Self::LastSeen => "Время последней активности",
+            Self::ProfilePhoto => "Фото профиля",
+        }
+    }
+
+    pub fn question(self) -> &'static str {
+        match self {
+            Self::PhoneNumber => "Кто видит мой номер",
+            Self::AddedByPhone => "Кто может найти меня по номеру",
+            Self::LastSeen => "Кто видит точное время",
+            Self::ProfilePhoto => "Кто видит мои фотографии",
+        }
+    }
+
+    pub fn audiences(self) -> &'static [PrivacyAudience] {
+        use PrivacyAudience::*;
+        match self {
+            Self::AddedByPhone => &[Everyone, Contacts],
+            _ => &[Everyone, Contacts, Nobody],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivacyAudience {
+    Everyone,
+    Contacts,
+    Nobody,
+}
+
+impl PrivacyAudience {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Everyone => "Все",
+            Self::Contacts => "Мои контакты",
+            Self::Nobody => "Никто",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivacySetting {
+    pub audience: Option<PrivacyAudience>,
+    pub exception_rules: usize,
+    pub editable: bool,
+    pub(crate) revision: Vec<u8>,
+}
+
+pub enum PrivacyChange {
+    Saved {
+        setting: PrivacySetting,
+        exceptions_changed: bool,
+    },
+    Conflict(PrivacySetting),
+}
+
 pub const SESSION_TTL_DAYS: [i32; 5] = [7, 30, 90, 180, 365];
 
 #[derive(Clone, Copy)]

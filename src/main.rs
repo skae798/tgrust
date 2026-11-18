@@ -6,6 +6,8 @@ mod formatting;
 mod media_viewer;
 mod model;
 mod playback_controls;
+mod privacy;
+mod privacy_rules;
 mod profile;
 mod read_state;
 mod search;
