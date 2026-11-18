@@ -20,7 +20,7 @@ mod messages;
 mod net;
 mod updates;
 
-pub use auth::{LoginToken, PasswordToken, SignInError};
+pub use auth::{LoginToken, PasswordToken, PhoneLogin, QrLogin, SignInError};
 pub use bots::{InlineResult, InlineResultIter};
 pub use chats::{ParticipantIter, ParticipantPermissions, ProfilePhotoIter};
 pub(crate) use client::ClientInner;

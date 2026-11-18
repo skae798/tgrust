@@ -353,6 +353,51 @@ pub struct PeerProfile {
     pub fake: bool,
 }
 
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct ProfileDetails {
+    pub first_name: String,
+    pub last_name: String,
+    pub about: String,
+}
+
+impl ProfileDetails {
+    pub fn display_name(&self) -> String {
+        if self.last_name.is_empty() {
+            self.first_name.clone()
+        } else if self.first_name.is_empty() {
+            self.last_name.clone()
+        } else {
+            format!("{} {}", self.first_name, self.last_name)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnProfile {
+    pub id: i64,
+    pub details: ProfileDetails,
+    pub username: String,
+    pub avatar: Option<Avatar>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountIdentity {
+    pub user_id: i64,
+    pub name: String,
+    pub username: String,
+}
+
+pub enum ProfileEdit {
+    Details(ProfileDetails),
+    Username(String),
+}
+
+pub enum ProfileEditResult {
+    Saved(OwnProfile),
+    Conflict(OwnProfile),
+    Confirmed(OwnProfile),
+}
+
 pub const BLOCKED_PAGE_SIZE: i32 = 40;
 
 pub struct BlockedPeer {
@@ -622,6 +667,7 @@ pub struct Message {
     pub id: i32,
     pub sender: String,
     pub sender_avatar: Option<Avatar>,
+    pub self_authored: bool,
     pub timestamp: i64,
     pub text: String,
     pub styles: Vec<TextSpan>,
@@ -663,9 +709,19 @@ pub struct Reply {
 pub struct ReplyPreview {
     pub sender: Option<String>,
     pub text: String,
+    pub self_authored: bool,
 }
 
 impl Message {
+    pub fn displayed_sender<'a>(&'a self, own_name: Option<&'a str>) -> &'a str {
+        if self.self_authored
+            && let Some(name) = own_name
+        {
+            return name;
+        }
+        &self.sender
+    }
+
     pub fn formatted_text(&self) -> FormattedText {
         FormattedText {
             text: self.text.clone(),
@@ -678,6 +734,7 @@ impl Message {
         let text = preview.lines().find(|line| !line.trim().is_empty());
         ReplyPreview {
             sender: Some(self.sender.clone()),
+            self_authored: self.self_authored,
             text: text
                 .or(self.attachment.as_deref())
                 .unwrap_or("Сообщение")
@@ -696,6 +753,16 @@ impl Message {
 
     pub fn preview_text(&self) -> Cow<'_, str> {
         redact_spoilers(&self.text, &self.styles)
+    }
+}
+
+impl ReplyPreview {
+    pub fn displayed_sender<'a>(&'a self, own_name: Option<&'a str>) -> Option<&'a str> {
+        if self.self_authored && own_name.is_some() {
+            own_name
+        } else {
+            self.sender.as_deref()
+        }
     }
 }
 
@@ -1074,6 +1141,7 @@ mod tests {
                 id,
                 sender: "Тест".into(),
                 sender_avatar: None,
+                self_authored: false,
                 timestamp: 0,
                 text: String::new(),
                 styles: Vec::new(),

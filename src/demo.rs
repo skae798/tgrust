@@ -148,6 +148,19 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
     })
 }
 
+pub fn own_profile() -> crate::model::OwnProfile {
+    crate::model::OwnProfile {
+        id: 2,
+        details: crate::model::ProfileDetails {
+            first_name: OWN_NAME.into(),
+            last_name: String::new(),
+            about: "Демонстрационные данные аккаунта.".into(),
+        },
+        username: "demo_tgrust_account".into(),
+        avatar: Some(OWN_AVATAR),
+    }
+}
+
 pub fn contacts() -> Vec<Contact> {
     [
         (10, "Анна Соколова", "@demo_anna"),
@@ -252,6 +265,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                     dc: 0,
                 })
             },
+            self_authored: outgoing,
             timestamp: today - 60 * (5 - index as i64),
             text: text.to_owned(),
             styles: Vec::new(),
