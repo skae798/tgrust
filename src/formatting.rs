@@ -230,7 +230,9 @@ fn message_markup(
         visible += range.start - original;
         if let Some(link) = link {
             let target = glib::markup_escape_text(link);
-            markup.push_str(&format!("<a href=\"{target}\" title=\"{target}\">"));
+            // GTK parses the decoded title again when showing the tooltip.
+            let title = glib::markup_escape_text(&target);
+            markup.push_str(&format!("<a href=\"{target}\" title=\"{title}\">"));
             markup.push_str(&glib::markup_escape_text(&message.text[range.clone()]));
             markup.push_str("</a>");
             add_spans(range.start, range.end, visible);
@@ -274,7 +276,11 @@ mod tests {
         assert!(concealed.contains(SPOILER_PLACEHOLDER));
         assert!(!concealed.contains("private"));
         assert!(!concealed.contains("скрыто"));
-        assert!(concealed.contains("https://example.org/?a=1&amp;b=2"));
+        assert!(concealed.contains(concat!(
+            "<a href=\"https://example.org/?a=1&amp;b=2\" ",
+            "title=\"https://example.org/?a=1&amp;amp;b=2\">",
+            "https://example.org/?a=1&amp;b=2</a>"
+        )));
         let (revealed, _) = message_markup(&message, &links, false);
         assert!(revealed.contains("https://example.org/private"));
         assert!(revealed.contains("скрыто"));
