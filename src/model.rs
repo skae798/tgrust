@@ -584,6 +584,12 @@ pub struct TextSpan {
     pub style: TextStyle,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextLink {
+    pub range: Range<usize>,
+    pub uri: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormattedText {
     pub text: String,
@@ -618,6 +624,7 @@ impl FormattedText {
 pub enum PlayableMedia {
     Video { width: i32, height: i32 },
     Audio,
+    Voice,
 }
 
 impl PlayableMedia {
@@ -625,13 +632,15 @@ impl PlayableMedia {
         match self {
             Self::Video { .. } => "Видео",
             Self::Audio => "Аудио",
+            Self::Voice => "Голосовое сообщение",
         }
     }
 
     pub fn open_label(self) -> &'static str {
         match self {
             Self::Video { .. } => "Открыть видео",
-            Self::Audio => "Открыть аудио",
+            Self::Audio => "Воспроизвести аудио",
+            Self::Voice => "Воспроизвести голосовое сообщение",
         }
     }
 
@@ -639,9 +648,17 @@ impl PlayableMedia {
         match self {
             Self::Video { width, height } if width > 0 && height > 0 => (width, height),
             Self::Video { .. } => (640, 360),
-            Self::Audio => (360, 96),
+            Self::Audio | Self::Voice => (360, 96),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AudioInfo {
+    pub title: Option<String>,
+    pub performer: Option<String>,
+    pub duration: Option<u32>,
+    pub waveform: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -671,10 +688,12 @@ pub struct Message {
     pub timestamp: i64,
     pub text: String,
     pub styles: Vec<TextSpan>,
+    pub links: Vec<TextLink>,
     pub outgoing: bool,
     pub attachment: Option<String>,
     pub photo_preview: bool,
     pub playback: Option<PlayableMedia>,
+    pub audio: Option<AudioInfo>,
     pub thumbnail: Option<AttachmentThumbnail>,
     pub poll: Option<Poll>,
     pub reply_to: Option<i32>,
@@ -930,6 +949,21 @@ impl Message {
                 "Опрос"
             };
             return Cow::Owned(format!("{kind} · {}", poll.question));
+        }
+        if self.text.is_empty() && !self.ephemeral {
+            match self.playback {
+                Some(PlayableMedia::Voice) => return Cow::Borrowed("Голосовое сообщение"),
+                Some(PlayableMedia::Audio) => {
+                    return Cow::Borrowed(
+                        self.audio
+                            .as_ref()
+                            .and_then(|audio| audio.title.as_deref())
+                            .or(self.attachment.as_deref())
+                            .unwrap_or("Аудиозапись"),
+                    );
+                }
+                _ => {}
+            }
         }
         redact_spoilers(&self.text, &self.styles)
     }
@@ -1334,10 +1368,12 @@ mod tests {
                 timestamp: 0,
                 text: String::new(),
                 styles: Vec::new(),
+                links: Vec::new(),
                 outgoing: false,
                 attachment: None,
                 photo_preview: false,
                 playback: None,
+                audio: None,
                 thumbnail: None,
                 poll: None,
                 reply_to: None,

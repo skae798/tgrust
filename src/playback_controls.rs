@@ -66,19 +66,7 @@ impl PlaybackControls {
         controls.play.connect_clicked(glib::clone!(
             #[weak]
             controls,
-            move |_| {
-                let stream = controls.stream.borrow().clone();
-                if let Some(stream) = stream {
-                    if stream.is_playing() {
-                        stream.pause();
-                    } else {
-                        if stream.is_ended() && stream.is_seekable() {
-                            stream.seek(0);
-                        }
-                        stream.play();
-                    }
-                }
-            }
+            move |_| controls.toggle()
         ));
         controls.position.connect_value_changed(glib::clone!(
             #[weak]
@@ -91,9 +79,11 @@ impl PlaybackControls {
                 if let Some(stream) =
                     stream.filter(|stream| stream.is_seekable() && stream.duration() > 0)
                 {
-                    stream.seek(
-                        ((position.value() * 1_000_000.0) as i64).clamp(0, stream.duration()),
-                    );
+                    let target =
+                        ((position.value() * 1_000_000.0) as i64).clamp(0, stream.duration());
+                    if target.abs_diff(stream.timestamp()) > 1 {
+                        stream.seek(target);
+                    }
                 }
             }
         ));
@@ -115,6 +105,20 @@ impl PlaybackControls {
         ));
         controls.update();
         controls
+    }
+
+    pub fn toggle(&self) {
+        let Some(stream) = self.stream.borrow().clone() else {
+            return;
+        };
+        if stream.is_playing() {
+            stream.pause();
+        } else {
+            if stream.is_ended() && stream.is_seekable() {
+                stream.seek(0);
+            }
+            stream.play();
+        }
     }
 
     pub fn set_media_stream(self: &Rc<Self>, stream: Option<&gtk::MediaFile>) {
@@ -159,7 +163,9 @@ impl PlaybackControls {
                 .set_text(&format!("−{}", time_label((duration - timestamp).max(0))));
             self.position
                 .set_range(0.0, (duration as f64 / 1_000_000.0).max(1.0));
-            self.position.set_value(timestamp as f64 / 1_000_000.0);
+            if !stream.is_seeking() {
+                self.position.set_value(timestamp as f64 / 1_000_000.0);
+            }
             self.position
                 .set_sensitive(stream.is_seekable() && duration > 0);
             self.volume_button.set_sensitive(stream.has_audio());

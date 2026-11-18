@@ -1,7 +1,9 @@
 use adw::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 
-use crate::model::{FormattedText, SPOILER_PLACEHOLDER, TextSpan, TextStyle, spoiler_ranges};
+use crate::model::{
+    FormattedText, SPOILER_PLACEHOLDER, TextLink, TextSpan, TextStyle, spoiler_ranges,
+};
 
 const STYLES: [(TextStyle, &str, &str, gdk::Key); 6] = [
     (TextStyle::Bold, "bold", "Полужирный", gdk::Key::b),
@@ -134,7 +136,7 @@ pub fn set_editor_text(buffer: &gtk::TextBuffer, formatted: &FormattedText) {
     }
 }
 
-pub fn message_attributes(spans: &[TextSpan]) -> pango::AttrList {
+fn message_attributes(spans: &[TextSpan]) -> pango::AttrList {
     let attributes = pango::AttrList::new();
     for span in spans {
         let mut attribute: pango::Attribute = match span.style {
@@ -152,33 +154,129 @@ pub fn message_attributes(spans: &[TextSpan]) -> pango::AttrList {
     attributes
 }
 
-pub fn concealed_message(label: &gtk::Label, message: &FormattedText) {
+pub const SPOILER_LINK: &str = "tgrust-spoiler";
+
+pub fn render_message(
+    label: &gtk::Label,
+    message: &FormattedText,
+    explicit: &[TextLink],
+    concealed: bool,
+) {
+    let (markup, spans) = message_markup(message, explicit, concealed);
+    label.set_markup(&markup);
+    label.set_attributes(Some(&message_attributes(&spans)));
+}
+
+fn message_markup(
+    message: &FormattedText,
+    explicit: &[TextLink],
+    concealed: bool,
+) -> (String, Vec<TextSpan>) {
+    let overlaps =
+        |a: &std::ops::Range<usize>, b: &std::ops::Range<usize>| a.start < b.end && b.start < a.end;
+    let spoilers = if concealed {
+        spoiler_ranges(&message.spans)
+    } else {
+        Vec::new()
+    };
+    let mut links = explicit.to_vec();
+    links.extend(
+        crate::links::in_text(&message.text)
+            .into_iter()
+            .filter(|link| {
+                !explicit
+                    .iter()
+                    .any(|item| overlaps(&item.range, &link.range))
+                    && !message.spans.iter().any(|style| {
+                        style.style == TextStyle::Code && overlaps(&style.range, &link.range)
+                    })
+            }),
+    );
+    let mut segments: Vec<_> = links
+        .iter()
+        .filter(|link| {
+            !spoilers.iter().any(|span| overlaps(span, &link.range))
+                && message
+                    .text
+                    .get(link.range.clone())
+                    .is_some_and(|text| !text.is_empty())
+        })
+        .map(|link| (link.range.clone(), Some(link.uri.as_str())))
+        .collect();
+    segments.extend(spoilers.into_iter().map(|range| (range, None)));
+    segments.sort_by_key(|(range, _)| (range.start, range.end));
     let mut markup = String::new();
     let mut spans = Vec::new();
     let mut original = 0;
     let mut visible = 0;
-    for range in spoiler_ranges(&message.spans)
-        .into_iter()
-        .chain(std::iter::once(message.text.len()..message.text.len()))
-    {
-        let chunk = &message.text[original..range.start];
-        markup.push_str(&glib::markup_escape_text(chunk));
+    let mut add_spans = |from, to, offset| {
         spans.extend(message.spans.iter().filter_map(|span| {
-            let start = span.range.start.max(original);
-            let end = span.range.end.min(range.start);
+            let start = span.range.start.max(from);
+            let end = span.range.end.min(to);
             (start < end).then(|| TextSpan {
-                range: visible + start - original..visible + end - original,
+                range: offset + start - from..offset + end - from,
                 style: span.style,
             })
         }));
-        if !range.is_empty() {
-            markup.push_str("<a href=\"tgrust-spoiler\" title=\"Показать спойлер\">");
+    };
+    for (range, link) in segments {
+        if range.start < original {
+            continue;
+        }
+        markup.push_str(&glib::markup_escape_text(
+            &message.text[original..range.start],
+        ));
+        add_spans(original, range.start, visible);
+        visible += range.start - original;
+        if let Some(link) = link {
+            let target = glib::markup_escape_text(link);
+            markup.push_str(&format!("<a href=\"{target}\" title=\"{target}\">"));
+            markup.push_str(&glib::markup_escape_text(&message.text[range.clone()]));
+            markup.push_str("</a>");
+            add_spans(range.start, range.end, visible);
+            visible += range.len();
+        } else {
+            markup.push_str(&format!(
+                "<a href=\"{SPOILER_LINK}\" title=\"Показать спойлер\">"
+            ));
             markup.push_str(SPOILER_PLACEHOLDER);
             markup.push_str("</a>");
-            visible += chunk.len() + SPOILER_PLACEHOLDER.len();
+            visible += SPOILER_PLACEHOLDER.len();
         }
         original = range.end;
     }
-    label.set_markup(&markup);
-    label.set_attributes(Some(&message_attributes(&spans)));
+    markup.push_str(&glib::markup_escape_text(&message.text[original..]));
+    add_spans(original, message.text.len(), visible);
+    (markup, spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spoilers_hide_link_targets_and_render_other_links() {
+        let text = "😀 скрыто и https://example.org/?a=1&b=2";
+        let start = text.find("скрыто").unwrap();
+        let end = start + "скрыто".len();
+        let message = FormattedText {
+            text: text.into(),
+            spans: vec![TextSpan {
+                range: start..end,
+                style: TextStyle::Spoiler,
+            }],
+        };
+        let links = [TextLink {
+            range: start..end,
+            uri: "https://example.org/private".into(),
+        }];
+        let (concealed, _) = message_markup(&message, &links, true);
+        assert!(concealed.contains(SPOILER_PLACEHOLDER));
+        assert!(!concealed.contains("private"));
+        assert!(!concealed.contains("скрыто"));
+        assert!(concealed.contains("https://example.org/?a=1&amp;b=2"));
+        let (revealed, _) = message_markup(&message, &links, false);
+        assert!(revealed.contains("https://example.org/private"));
+        assert!(revealed.contains("скрыто"));
+    }
 }

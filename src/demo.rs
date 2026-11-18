@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, Message,
-    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PollDraft,
+    AttachmentThumbnail, AudioInfo, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact,
+    Message, PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -285,6 +285,12 @@ pub fn history(chat: i64) -> Vec<Message> {
         5 => vec![
             ("Анна", "", false, Some("demo-audio.wav")),
             (OWN_NAME, "", true, Some("demo-video.webm")),
+            (
+                "Анна",
+                "Подробности по ссылке и текст для копирования. https://example.org/?source=demo&mode=chat",
+                false,
+                Some("demo-voice.ogg"),
+            ),
         ],
         _ => Vec::new(),
     };
@@ -307,19 +313,47 @@ pub fn history(chat: i64) -> Vec<Message> {
             timestamp: today - 60 * (5 - index as i64),
             text: text.to_owned(),
             styles: Vec::new(),
+            links: if chat == 5 && index == 2 {
+                let link = "по ссылке";
+                let start = text.find(link).unwrap_or_default();
+                vec![TextLink {
+                    range: start..start + link.len(),
+                    uri: "https://example.org/details".into(),
+                }]
+            } else {
+                Vec::new()
+            },
             outgoing,
             attachment: attachment.map(str::to_owned),
-            playback: (chat == 5).then_some(if index == 0 {
-                PlayableMedia::Audio
-            } else {
-                PlayableMedia::Video {
+            playback: (chat == 5).then_some(match index {
+                0 => PlayableMedia::Audio,
+                1 => PlayableMedia::Video {
                     width: 960,
                     height: 540,
-                }
+                },
+                _ => PlayableMedia::Voice,
             }),
+            audio: match (chat, index) {
+                (5, 0) => Some(AudioInfo {
+                    title: Some("Пробный тон".into()),
+                    performer: Some("Демозапись".into()),
+                    duration: Some(8),
+                    waveform: Vec::new(),
+                }),
+                (5, 2) => Some(AudioInfo {
+                    duration: Some(4),
+                    waveform: vec![
+                        31, 17, 24, 22, 11, 20, 23, 21, 21, 22, 23, 21, 21, 21, 21, 22, 2, 29, 17,
+                        21, 23, 3, 0, 0, 0, 3, 8, 20, 22, 28, 3, 21, 22, 4, 8, 24, 2, 3, 26, 21,
+                        29, 23, 16, 13, 0, 0, 0, 0,
+                    ],
+                    ..AudioInfo::default()
+                }),
+                _ => None,
+            },
             photo_preview: (chat == 1 && index == 3) || chat == 3,
-            thumbnail: if chat == 5 && index == 1 {
-                Some(AttachmentThumbnail::Document(5))
+            thumbnail: if chat == 5 && index < 2 {
+                Some(AttachmentThumbnail::Document(50 + index as i64))
             } else {
                 ((chat == 1 && index == 3) || chat == 3).then_some(AttachmentThumbnail::Photo(chat))
             },
@@ -361,10 +395,12 @@ pub fn poll_message(id: i32, draft: PollDraft) -> Message {
         timestamp: now(),
         text: String::new(),
         styles: Vec::new(),
+        links: Vec::new(),
         outgoing: true,
         attachment: None,
         photo_preview: false,
         playback: None,
+        audio: None,
         thumbnail: None,
         poll: Some(draft.into_poll(i64::from(id))),
         reply_to: None,
@@ -413,6 +449,7 @@ pub async fn playback_preview(
 ) -> anyhow::Result<PlaybackFile> {
     let bytes: &[u8] = match media {
         PlayableMedia::Audio => include_bytes!("../data/demo-audio.wav"),
+        PlayableMedia::Voice => include_bytes!("../data/demo-voice.ogg"),
         PlayableMedia::Video { .. } => include_bytes!("../data/demo-video.webm"),
     };
     let mut output = crate::storage::PlaybackDownload::new(bytes.len() as u64)?;
