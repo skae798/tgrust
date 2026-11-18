@@ -13,9 +13,7 @@ use tokio::sync::{oneshot, watch};
 
 use crate::accounts::{Account, Accounts};
 use crate::demo;
-use crate::formatting::{
-    concealed_message, editor_text, message_attributes, set_editor_text, setup_editor,
-};
+use crate::formatting::{SPOILER_LINK, editor_text, render_message, set_editor_text, setup_editor};
 use crate::media_viewer::fit_viewport as photo_viewport;
 use crate::model::PlayableMedia;
 use crate::model::{
@@ -3655,6 +3653,39 @@ impl Ui {
     ) -> Option<gtk::Widget> {
         let id = message.id;
         let playback = message.playback.filter(|_| !message.ephemeral);
+        if let Some(media @ (PlayableMedia::Audio | PlayableMedia::Voice)) = playback {
+            let (content, cover) = crate::audio::content(
+                media,
+                message.audio.as_ref().unwrap_or(&Default::default()),
+                message.attachment.as_deref(),
+            );
+            let play = gtk::Image::from_icon_name("media-playback-start-symbolic");
+            play.set_valign(gtk::Align::Center);
+            content.append(&play);
+            if media == PlayableMedia::Audio
+                && let Some(thumbnail) = message.thumbnail
+            {
+                self.load_chat_image(
+                    ChatImage::attachment(chat, id, thumbnail),
+                    glib::clone!(
+                        #[weak]
+                        cover,
+                        move |texture: &gtk::gdk::Texture| cover.set_paintable(Some(texture))
+                    ),
+                );
+            }
+            let button = gtk::Button::builder().child(&content).build();
+            button.add_css_class("flat");
+            button.add_css_class("audio-attachment");
+            button.set_widget_name(&format!("attachment-{id}"));
+            button.update_property(&[gtk::accessible::Property::Label(media.open_label())]);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move |_| ui.open_playback(chat, id, media)
+            ));
+            return Some(button.upcast());
+        }
         let visual = message.photo_preview || matches!(playback, Some(PlayableMedia::Video { .. }));
         let preview = gtk::Stack::new();
         preview.set_vexpand(false);
@@ -3840,13 +3871,14 @@ impl Ui {
             #[weak]
             bubble,
             move |_, _, x, y| {
-                let item = attachment_message_id(bubble.pick(x, y, gtk::PickFlags::DEFAULT));
+                let item = bubble_item_id(bubble.pick(x, y, gtk::PickFlags::DEFAULT));
                 ui.open_message_menu(&bubble, chat, item.unwrap_or(id), x, y);
             }
         ));
         bubble.add_controller(click);
 
         let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed(glib::clone!(
             #[weak(rename_to = ui)]
             self,
@@ -3862,7 +3894,7 @@ impl Ui {
                     let focused = bubble
                         .root()
                         .and_then(|root| gtk::prelude::RootExt::focus(&root));
-                    let item = attachment_message_id(focused.clone());
+                    let item = bubble_item_id(focused.clone());
                     let (x, y) = focused
                         .and_then(|widget| widget.compute_bounds(&bubble))
                         .map(|bounds| {
@@ -3900,7 +3932,10 @@ impl Ui {
         else {
             return;
         };
-        let Some(menu) = self.message_menu_content(chat, &message) else {
+        let text = (!message.ephemeral)
+            .then(|| message_copy_text(bubble, id))
+            .flatten();
+        let Some(menu) = self.message_menu_content(chat, &message, text) else {
             return;
         };
         self.menu_message.set(Some(id));
@@ -3917,9 +3952,33 @@ impl Ui {
             .child_focus(gtk::DirectionType::TabForward);
     }
 
-    fn message_menu_content(self: &Rc<Self>, chat: i64, message: &Message) -> Option<gtk::Box> {
+    fn message_menu_content(
+        self: &Rc<Self>,
+        chat: i64,
+        message: &Message,
+        copy: Option<(String, bool)>,
+    ) -> Option<gtk::Box> {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let id = message.id;
+        if let Some((text, selected)) = copy {
+            add_menu_button(
+                &menu,
+                if selected {
+                    "Копировать выделение"
+                } else {
+                    "Копировать текст"
+                },
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || {
+                        if let Some(window) = ui.window.upgrade() {
+                            window.clipboard().set_text(&text);
+                        }
+                    }
+                ),
+            );
+        }
         if message.can_reply {
             if self.input.is_sensitive() {
                 let reply = Reply {
@@ -4415,6 +4474,7 @@ impl Ui {
                 id,
                 text: text.text,
                 styles: text.spans,
+                links: Vec::new(),
                 sender: demo::OWN_NAME.into(),
                 sender_avatar: Some(demo::OWN_AVATAR),
                 self_authored: true,
@@ -4423,6 +4483,7 @@ impl Ui {
                 attachment: None,
                 photo_preview: false,
                 playback: None,
+                audio: None,
                 thumbnail: None,
                 poll: None,
                 reply_to,
@@ -4804,6 +4865,7 @@ impl Ui {
             {
                 message.text.clone_from(&text.text);
                 message.styles.clone_from(&text.spans);
+                message.links.clear();
                 message.edited = true;
                 if messages.last().is_some_and(|message| message.id == id)
                     && let Some(chat) = self
@@ -4822,6 +4884,7 @@ impl Ui {
         {
             message.text = text.text;
             message.styles = text.spans;
+            message.links.clear();
             message.edited = true;
         }
         if self.selection.get() == Some(chat) {
@@ -5096,11 +5159,34 @@ impl Ui {
         self.begin_media_preview();
         let demo = self.is_demo.get();
         let client = self.client.borrow().clone();
+        let (audio, filename, cover) = self
+            .messages
+            .borrow()
+            .get(&id)
+            .filter(|_| self.selection.get() == Some(chat))
+            .map(|message| {
+                let cover = message
+                    .thumbnail
+                    .map(|thumbnail| ChatImage::attachment(chat, id, thumbnail))
+                    .and_then(|key| match self.images.borrow().get(&key) {
+                        Some(ImageCacheEntry::Ready(texture)) => Some(texture.clone()),
+                        _ => None,
+                    });
+                (
+                    message.audio.clone().unwrap_or_default(),
+                    message.attachment.clone(),
+                    cover,
+                )
+            })
+            .unwrap_or_default();
         let viewer = crate::media_viewer::open(
             &window,
             crate::media_viewer::PlaybackContext {
                 runtime: self.runtime.clone(),
                 media,
+                audio,
+                filename,
+                cover,
                 muted: demo,
                 load: Box::new(move |progress| {
                     let client = client.clone();
@@ -5228,49 +5314,68 @@ impl Ui {
             return;
         }
         let label = label("", "");
+        label.set_widget_name(&format!("message-text-{}", message.id));
+        label.set_selectable(!message.ephemeral);
         let formatted = message.formatted_text();
         let hidden = formatted
             .spans
             .iter()
             .any(|span| span.style == TextStyle::Spoiler)
             && self.revealed_spoilers.borrow().get(&message.id) != Some(&formatted);
-        if hidden {
-            concealed_message(&label, &formatted);
-            let id = message.id;
-            let generation = self.generation.get();
-            label.connect_activate_link(glib::clone!(
-                #[weak(rename_to = ui)]
-                self,
-                #[upgrade_or]
-                glib::Propagation::Stop,
-                move |label, _| {
-                    let formatted = formatted.clone();
-                    glib::idle_add_local_once(glib::clone!(
-                        #[weak]
-                        ui,
-                        #[weak]
-                        label,
-                        move || {
-                            if ui.generation.get() == generation && label.is_mapped() {
-                                label.set_text(&formatted.text);
-                                label.set_attributes(Some(&message_attributes(&formatted.spans)));
-                                ui.revealed_spoilers.borrow_mut().insert(id, formatted);
-                            }
-                        }
-                    ));
-                    glib::Propagation::Stop
+        let links = message.links.clone();
+        render_message(&label, &formatted, &links, hidden);
+        let id = message.id;
+        let generation = self.generation.get();
+        label.connect_activate_link(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Stop,
+            move |label, uri| {
+                if uri != SPOILER_LINK {
+                    ui.open_message_link(uri);
+                    return glib::Propagation::Stop;
                 }
-            ));
-        } else {
-            label.set_text(&formatted.text);
-            if !formatted.spans.is_empty() {
-                label.set_attributes(Some(&message_attributes(&formatted.spans)));
+                let formatted = formatted.clone();
+                let links = links.clone();
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    ui,
+                    #[weak]
+                    label,
+                    move || {
+                        if ui.generation.get() == generation && label.is_mapped() {
+                            render_message(&label, &formatted, &links, false);
+                            ui.revealed_spoilers.borrow_mut().insert(id, formatted);
+                        }
+                    }
+                ));
+                glib::Propagation::Stop
             }
-        }
+        ));
         label.set_wrap(true);
         label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
         label.set_max_width_chars(64);
         bubble.append(&label);
+    }
+
+    fn open_message_link(self: &Rc<Self>, uri: &str) {
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let Some(uri) = crate::links::normalize(uri) else {
+            return;
+        };
+        let request = gtk::UriLauncher::new(&uri).launch_future(Some(&window));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if let Err(error) = request.await
+                && !error.matches(gtk::DialogError::Dismissed)
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.toast(&format!("Не удалось открыть ссылку. {error}"));
+            }
+        });
     }
 
     fn toast(&self, message: &str) {
@@ -5278,14 +5383,40 @@ impl Ui {
     }
 }
 
-fn attachment_message_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
+fn bubble_item_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
     while let Some(item) = widget {
-        if let Some(id) = item.widget_name().strip_prefix("attachment-") {
+        let name = item.widget_name();
+        if let Some(id) = name
+            .strip_prefix("attachment-")
+            .or_else(|| name.strip_prefix("message-text-"))
+        {
             return id.parse().ok();
         }
         widget = item.parent();
     }
     None
+}
+
+fn message_copy_text(bubble: &gtk::Box, id: i32) -> Option<(String, bool)> {
+    let name = format!("message-text-{id}");
+    let label = bubble
+        .observe_children()
+        .iter::<gtk::Widget>()
+        .filter_map(Result::ok)
+        .find(|child| child.widget_name() == name)?
+        .downcast::<gtk::Label>()
+        .ok()?;
+    let text = label.text();
+    if let Some((from, to)) = label.selection_bounds() {
+        return Some((
+            text.chars()
+                .skip(from as usize)
+                .take((to - from) as usize)
+                .collect(),
+            true,
+        ));
+    }
+    (!text.is_empty()).then(|| (text.into(), false))
 }
 
 fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {

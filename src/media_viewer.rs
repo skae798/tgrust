@@ -16,6 +16,9 @@ type PlaybackFuture = Pin<Box<dyn Future<Output = Result<PlaybackFile>> + Send>>
 pub struct PlaybackContext {
     pub runtime: Handle,
     pub media: PlayableMedia,
+    pub audio: crate::model::AudioInfo,
+    pub filename: Option<String>,
+    pub cover: Option<gtk::gdk::Texture>,
     pub muted: bool,
     pub load: Box<dyn Fn(watch::Sender<PlaybackProgress>) -> PlaybackFuture>,
 }
@@ -118,9 +121,13 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
     visual.set_hhomogeneous(false);
     visual.set_vhomogeneous(false);
     visual.add_named(&picture, Some("video"));
-    let audio = gtk::Image::from_icon_name("audio-x-generic-symbolic");
-    audio.set_pixel_size(56);
-    audio.update_property(&[gtk::accessible::Property::Label("Воспроизведение аудио")]);
+    let (audio, cover) =
+        crate::audio::content(context.media, &context.audio, context.filename.as_deref());
+    audio.set_margin_start(8);
+    audio.set_margin_end(8);
+    audio.set_halign(gtk::Align::Center);
+    audio.set_valign(gtk::Align::Center);
+    cover.set_paintable(context.cover.as_ref());
     visual.add_named(&audio, Some("audio"));
     stack.add_named(&visual, Some("player"));
     let controls = crate::playback_controls::PlaybackControls::new();
@@ -216,6 +223,10 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
 }
 
 impl Viewer {
+    fn show_video(&self, media: &gtk::MediaFile) -> bool {
+        matches!(self.context.media, PlayableMedia::Video { .. }) && media.has_video()
+    }
+
     fn current(&self, media: &gtk::MediaFile) -> bool {
         !self.closed.get() && self.media.borrow().as_ref() == Some(media)
     }
@@ -229,11 +240,13 @@ impl Viewer {
                 if !state.current(media) || !media.is_prepared() || media.error().is_some() {
                     return;
                 }
-                state.visual.set_visible_child_name(if media.has_video() {
-                    "video"
-                } else {
-                    "audio"
-                });
+                state
+                    .visual
+                    .set_visible_child_name(if state.show_video(media) {
+                        "video"
+                    } else {
+                        "audio"
+                    });
                 state.stack.set_visible_child_name("player");
                 state.controls.set_media_stream(Some(media));
                 state.controls.set_visible(true);
@@ -374,23 +387,24 @@ impl Viewer {
             .visible_child_name()
             .is_some_and(|name| name == "player");
         let media = self.media.borrow().clone();
-        let dimensions = if let Some(media) = media.filter(|media| playing && media.has_video()) {
-            let width = media.intrinsic_width();
-            let height = media.intrinsic_height();
-            if width > 0 && height > 0 {
-                (width, height)
+        let dimensions =
+            if let Some(media) = media.filter(|media| playing && self.show_video(media)) {
+                let width = media.intrinsic_width();
+                let height = media.intrinsic_height();
+                if width > 0 && height > 0 {
+                    (width, height)
+                } else {
+                    self.file
+                        .borrow()
+                        .as_ref()
+                        .map_or(self.context.media, |file| file.media)
+                        .dimensions()
+                }
+            } else if playing {
+                PlayableMedia::Audio.dimensions()
             } else {
-                self.file
-                    .borrow()
-                    .as_ref()
-                    .map_or(self.context.media, |file| file.media)
-                    .dimensions()
-            }
-        } else if playing {
-            PlayableMedia::Audio.dimensions()
-        } else {
-            (360, 144)
-        };
+                (360, 144)
+            };
         let (header_width, _, _, _) = self.header.measure(gtk::Orientation::Horizontal, -1);
         let (header_height, _, _, _) = self.header.measure(gtk::Orientation::Vertical, -1);
         let (control_width, _, _, _) = self.controls.measure(gtk::Orientation::Horizontal, -1);

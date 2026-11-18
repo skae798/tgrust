@@ -1,9 +1,11 @@
 mod accounts;
+mod audio;
 mod blocked;
 mod contacts;
 mod demo;
 mod devices;
 mod formatting;
+mod links;
 mod media_viewer;
 mod model;
 mod own_profile;

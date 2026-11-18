@@ -32,6 +32,7 @@ use crate::model::{
     SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
     UploadKind, redact_spoilers,
 };
+use crate::model::{AudioInfo, TextLink};
 use crate::session_runner::SessionRunner;
 use crate::storage::{
     PendingSave, PlaybackDownload, SessionRemoval, attachment_name, open_session_file,
@@ -2614,6 +2615,7 @@ fn message_view(
     let playback = attachment
         .as_ref()
         .and_then(|(media, _)| playable_media(media));
+    let audio = attachment.as_ref().and_then(|(media, _)| audio_info(media));
     let thumbnail = attachment.as_ref().and_then(|(media, _)| thumbnail(media));
     let poll = match message.media() {
         Some(Media::Poll(raw)) => Some(poll_view(&raw)),
@@ -2668,10 +2670,15 @@ fn message_view(
             message_text(message)
         },
         styles: message_styles(message),
+        links: incoming_links(
+            message.text(),
+            message.fmt_entities().map_or(&[], Vec::as_slice),
+        ),
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
         playback,
+        audio,
         thumbnail,
         poll,
         reply_to,
@@ -2879,22 +2886,30 @@ fn can_forward(message: &TelegramMessage) -> bool {
         }
 }
 
-fn incoming_styles(text: &str, entities: &[enums::MessageEntity]) -> Vec<TextSpan> {
-    use enums::MessageEntity as Entity;
-
-    if entities.is_empty() {
-        return Vec::new();
-    }
+fn entity_ranges<'a>(
+    text: &str,
+    entities: &'a [enums::MessageEntity],
+) -> impl Iterator<Item = (std::ops::Range<usize>, &'a enums::MessageEntity)> {
     let mut utf16 = 0;
     let mut boundaries = HashMap::new();
-    for (byte, ch) in text.char_indices() {
-        boundaries.insert(utf16, byte);
-        utf16 += ch.len_utf16() as i32;
+    if !entities.is_empty() {
+        for (byte, ch) in text.char_indices() {
+            boundaries.insert(utf16, byte);
+            utf16 += ch.len_utf16() as i32;
+        }
+        boundaries.insert(utf16, text.len());
     }
-    boundaries.insert(utf16, text.len());
-    let mut spans: Vec<_> = entities
-        .iter()
-        .filter_map(|entity| {
+    entities.iter().filter_map(move |entity| {
+        let start = *boundaries.get(&entity.offset())?;
+        let end = *boundaries.get(&entity.offset().checked_add(entity.length())?)?;
+        (start < end).then_some((start..end, entity))
+    })
+}
+
+fn incoming_styles(text: &str, entities: &[enums::MessageEntity]) -> Vec<TextSpan> {
+    use enums::MessageEntity as Entity;
+    let mut spans: Vec<_> = entity_ranges(text, entities)
+        .filter_map(|(range, entity)| {
             let style = match entity {
                 Entity::Bold(_) => TextStyle::Bold,
                 Entity::Italic(_) => TextStyle::Italic,
@@ -2904,16 +2919,28 @@ fn incoming_styles(text: &str, entities: &[enums::MessageEntity]) -> Vec<TextSpa
                 Entity::Spoiler(_) => TextStyle::Spoiler,
                 _ => return None,
             };
-            let start = *boundaries.get(&entity.offset())?;
-            let end = *boundaries.get(&entity.offset().checked_add(entity.length())?)?;
-            (start < end).then_some(TextSpan {
-                range: start..end,
-                style,
-            })
+            Some(TextSpan { range, style })
         })
         .collect();
     spans.sort_by_key(|span| (span.range.start, span.range.end, span.style));
     spans
+}
+
+fn incoming_links(text: &str, entities: &[enums::MessageEntity]) -> Vec<TextLink> {
+    use enums::MessageEntity as Entity;
+    entity_ranges(text, entities)
+        .filter_map(|(range, entity)| {
+            let uri = match entity {
+                Entity::Url(_) => crate::links::normalize(&text[range.clone()]),
+                Entity::TextUrl(link) => crate::links::normalize(&link.url),
+                Entity::Email(_) => {
+                    crate::links::normalize(&format!("mailto:{}", &text[range.clone()]))
+                }
+                _ => None,
+            }?;
+            Some(TextLink { range, uri })
+        })
+        .collect()
 }
 
 fn outgoing_entities(formatted: &FormattedText) -> Vec<enums::MessageEntity> {
@@ -3032,6 +3059,16 @@ fn message_text(message: &TelegramMessage) -> String {
             "Опрос"
         };
         format!("{kind} · {}", poll_question(&raw.raw.question))
+    } else if let Some((media, filename)) = attachment(message)
+        && let Some(kind @ (PlayableMedia::Audio | PlayableMedia::Voice)) = playable_media(&media)
+    {
+        if kind == PlayableMedia::Voice {
+            kind.title().to_owned()
+        } else {
+            audio_info(&media)
+                .and_then(|info| info.title)
+                .unwrap_or(filename)
+        }
     } else if message.media().is_some() {
         "Вложение".to_owned()
     } else {
@@ -3106,6 +3143,9 @@ fn playable_media(media: &Media) -> Option<PlayableMedia> {
     let Some(enums::Document::Document(raw)) = &document.raw.document else {
         return None;
     };
+    if document.raw.voice {
+        return Some(PlayableMedia::Voice);
+    }
     raw.attributes
         .iter()
         .find_map(|attribute| match attribute {
@@ -3113,7 +3153,11 @@ fn playable_media(media: &Media) -> Option<PlayableMedia> {
                 width: video.w,
                 height: video.h,
             }),
-            enums::DocumentAttribute::Audio(_) => Some(PlayableMedia::Audio),
+            enums::DocumentAttribute::Audio(audio) => Some(if audio.voice {
+                PlayableMedia::Voice
+            } else {
+                PlayableMedia::Audio
+            }),
             _ => None,
         })
         .or_else(|| {
@@ -3147,6 +3191,34 @@ fn playable_media(media: &Media) -> Option<PlayableMedia> {
                 None
             }
         })
+}
+
+fn audio_info(media: &Media) -> Option<AudioInfo> {
+    let Media::Document(document) = media else {
+        return None;
+    };
+    let Some(enums::Document::Document(raw)) = &document.raw.document else {
+        return None;
+    };
+    raw.attributes.iter().find_map(|attribute| {
+        let enums::DocumentAttribute::Audio(audio) = attribute else {
+            return None;
+        };
+        let nonempty = |text: &Option<String>| {
+            text.as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        };
+        Some(AudioInfo {
+            title: nonempty(&audio.title),
+            performer: nonempty(&audio.performer),
+            duration: u32::try_from(audio.duration)
+                .ok()
+                .filter(|seconds| *seconds > 0),
+            waveform: crate::audio::waveform(audio.waveform.as_deref().unwrap_or_default()),
+        })
+    })
 }
 
 fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
@@ -3571,6 +3643,24 @@ mod tests {
             playable_media(&media("audio/ogg", vec![], None)),
             Some(PlayableMedia::Audio)
         );
+        let voice = media(
+            "application/ogg",
+            vec![
+                types::DocumentAttributeAudio {
+                    voice: true,
+                    duration: 35,
+                    title: None,
+                    performer: None,
+                    waveform: Some(vec![0xc1, 0xff, 0x07]),
+                }
+                .into(),
+            ],
+            None,
+        );
+        assert_eq!(playable_media(&voice), Some(PlayableMedia::Voice));
+        let audio = audio_info(&voice).unwrap();
+        assert_eq!(audio.duration, Some(35));
+        assert_eq!(audio.waveform, [1, 30, 31, 15]);
         assert_eq!(
             playable_media(&media(
                 "application/octet-stream",
@@ -3614,6 +3704,31 @@ mod tests {
             None
         );
         assert_eq!(playable_media(&media("text/plain", vec![], None)), None);
+    }
+
+    #[test]
+    fn telegram_link_ranges_follow_utf16_and_preserve_explicit_targets() {
+        let text = "😀 ссылка";
+        let links = incoming_links(
+            text,
+            &[
+                types::MessageEntityTextUrl {
+                    offset: 3,
+                    length: 6,
+                    url: "https://example.org/note".into(),
+                }
+                .into(),
+                types::MessageEntityTextUrl {
+                    offset: 1,
+                    length: 1,
+                    url: "https://example.org/invalid-offset".into(),
+                }
+                .into(),
+            ],
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(&text[links[0].range.clone()], "ссылка");
+        assert_eq!(links[0].uri, "https://example.org/note");
     }
 
     #[test]
