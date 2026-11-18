@@ -66,19 +66,7 @@ impl PlaybackControls {
         controls.play.connect_clicked(glib::clone!(
             #[weak]
             controls,
-            move |_| {
-                let stream = controls.stream.borrow().clone();
-                if let Some(stream) = stream {
-                    if stream.is_playing() {
-                        stream.pause();
-                    } else {
-                        if stream.is_ended() && stream.is_seekable() {
-                            stream.seek(0);
-                        }
-                        stream.play();
-                    }
-                }
-            }
+            move |_| controls.toggle()
         ));
         controls.position.connect_value_changed(glib::clone!(
             #[weak]
@@ -115,6 +103,20 @@ impl PlaybackControls {
         ));
         controls.update();
         controls
+    }
+
+    pub fn toggle(&self) {
+        let Some(stream) = self.stream.borrow().clone() else {
+            return;
+        };
+        if stream.is_playing() {
+            stream.pause();
+        } else {
+            if stream.is_ended() && stream.is_seekable() {
+                stream.seek(0);
+            }
+            stream.play();
+        }
     }
 
     pub fn set_media_stream(self: &Rc<Self>, stream: Option<&gtk::MediaFile>) {

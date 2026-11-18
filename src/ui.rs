@@ -33,6 +33,13 @@ enum ImageCacheEntry {
     Unavailable(Instant),
 }
 
+struct InlineAudio {
+    chat: i64,
+    id: i32,
+    media: PlayableMedia,
+    player: Rc<crate::audio::InlinePlayer>,
+}
+
 struct Ui {
     runtime: Handle,
     stop: watch::Receiver<bool>,
@@ -152,6 +159,7 @@ struct Ui {
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
+    inline_audio: RefCell<Option<InlineAudio>>,
     media_generation: Cell<u64>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
@@ -613,6 +621,7 @@ pub fn open(
         images: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
+        inline_audio: RefCell::new(None),
         media_generation: Cell::new(0),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
@@ -684,6 +693,15 @@ pub fn open(
             ui.folder_picker.set_sensitive(!ui.archive.is_active());
             ui.render_chats();
             ui.split.set_show_content(false);
+        }
+    ));
+    ui.split.connect_show_content_notify(glib::clone!(
+        #[weak]
+        ui,
+        move |split| {
+            if split.is_collapsed() && !split.shows_content() {
+                ui.inline_audio.take();
+            }
         }
     ));
     ui.folder_picker.connect_selected_notify(glib::clone!(
@@ -1037,6 +1055,7 @@ pub fn open(
             if let Some(viewer) = ui.media_viewer.upgrade() {
                 viewer.close();
             }
+            ui.inline_audio.take();
             ui.window.set(None);
             if let Some(cancel) = ui.qr_cancel.take() {
                 cancel.send_replace(true);
@@ -2905,6 +2924,9 @@ impl Ui {
             return;
         };
         self.withdraw_chat_notification(id);
+        if self.selection.get() != Some(id) || anchor.is_some() {
+            self.inline_audio.take();
+        }
         if self.chats.borrow().iter().any(|item| item.id == id) {
             let in_folder = !self.archive.is_active()
                 && self
@@ -3362,6 +3384,14 @@ impl Ui {
         bottom: bool,
         previous_position: Option<(f64, f64)>,
     ) {
+        if self.inline_audio.borrow().as_ref().is_some_and(|audio| {
+            self.messages
+                .borrow()
+                .get(&audio.id)
+                .is_none_or(|message| message.ephemeral || message.playback != Some(audio.media))
+        }) {
+            self.inline_audio.take();
+        }
         self.adjusting_history.set(true);
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
@@ -3677,14 +3707,23 @@ impl Ui {
             let button = gtk::Button::builder().child(&content).build();
             button.add_css_class("flat");
             button.add_css_class("audio-attachment");
-            button.set_widget_name(&format!("attachment-{id}"));
             button.update_property(&[gtk::accessible::Property::Label(media.open_label())]);
             button.connect_clicked(glib::clone!(
                 #[weak(rename_to = ui)]
                 self,
                 move |_| ui.open_playback(chat, id, media)
             ));
-            return Some(button.upcast());
+            let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            card.set_widget_name(&format!("attachment-{id}"));
+            card.append(&button);
+            if let Some(audio) = self.inline_audio.borrow().as_ref()
+                && audio.chat == chat
+                && audio.id == id
+            {
+                audio.player.detach();
+                card.append(&audio.player.widget);
+            }
+            return Some(card.upcast());
         }
         let visual = message.photo_preview || matches!(playback, Some(PlayableMedia::Video { .. }));
         let preview = gtk::Stack::new();
@@ -5156,54 +5195,59 @@ impl Ui {
         let Some(window) = self.window.upgrade() else {
             return;
         };
+        if matches!(media, PlayableMedia::Audio | PlayableMedia::Voice) {
+            if self.selection.get() != Some(chat) {
+                return;
+            }
+            if let Some(audio) = self.inline_audio.borrow().as_ref()
+                && audio.chat == chat
+                && audio.id == id
+            {
+                audio.player.toggle();
+                return;
+            }
+        }
+        self.inline_audio.take();
         self.begin_media_preview();
         let demo = self.is_demo.get();
         let client = self.client.borrow().clone();
-        let (audio, filename, cover) = self
-            .messages
-            .borrow()
-            .get(&id)
-            .filter(|_| self.selection.get() == Some(chat))
-            .map(|message| {
-                let cover = message
-                    .thumbnail
-                    .map(|thumbnail| ChatImage::attachment(chat, id, thumbnail))
-                    .and_then(|key| match self.images.borrow().get(&key) {
-                        Some(ImageCacheEntry::Ready(texture)) => Some(texture.clone()),
-                        _ => None,
-                    });
-                (
-                    message.audio.clone().unwrap_or_default(),
-                    message.attachment.clone(),
-                    cover,
-                )
-            })
-            .unwrap_or_default();
-        let viewer = crate::media_viewer::open(
-            &window,
-            crate::media_viewer::PlaybackContext {
-                runtime: self.runtime.clone(),
+        let context = crate::media_viewer::PlaybackContext {
+            runtime: self.runtime.clone(),
+            media,
+            muted: demo,
+            load: Box::new(move |progress| {
+                let client = client.clone();
+                Box::pin(async move {
+                    if demo {
+                        demo::playback_preview(media, progress).await
+                    } else {
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .playback_preview(chat, id, progress)
+                            .await
+                    }
+                })
+            }),
+        };
+        if matches!(media, PlayableMedia::Audio | PlayableMedia::Voice) {
+            let player = crate::audio::InlinePlayer::open(context);
+            if let Some(card) = self
+                .message_bubble(id)
+                .and_then(|bubble| named_child(&bubble, &format!("attachment-{id}")))
+                .and_downcast::<gtk::Box>()
+            {
+                card.append(&player.widget);
+            }
+            self.inline_audio.replace(Some(InlineAudio {
+                chat,
+                id,
                 media,
-                audio,
-                filename,
-                cover,
-                muted: demo,
-                load: Box::new(move |progress| {
-                    let client = client.clone();
-                    Box::pin(async move {
-                        if demo {
-                            demo::playback_preview(media, progress).await
-                        } else {
-                            client
-                                .context("Нет подключения к Telegram")?
-                                .playback_preview(chat, id, progress)
-                                .await
-                        }
-                    })
-                }),
-            },
-        );
-        self.media_viewer.set(Some(&viewer));
+                player,
+            }));
+        } else {
+            let viewer = crate::media_viewer::open(&window, context);
+            self.media_viewer.set(Some(&viewer));
+        }
     }
 
     fn open_photo_preview(self: &Rc<Self>, chat: i64, id: i32) {
@@ -5399,10 +5443,7 @@ fn bubble_item_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
 
 fn message_copy_text(bubble: &gtk::Box, id: i32) -> Option<(String, bool)> {
     let name = format!("message-text-{id}");
-    let label = std::iter::successors(bubble.first_child(), |child| child.next_sibling())
-        .find(|child| child.widget_name() == name)?
-        .downcast::<gtk::Label>()
-        .ok()?;
+    let label = named_child(bubble, &name).and_downcast::<gtk::Label>()?;
     let text = label.text();
     if let Some((from, to)) = label.selection_bounds() {
         return Some((
@@ -5414,6 +5455,11 @@ fn message_copy_text(bubble: &gtk::Box, id: i32) -> Option<(String, bool)> {
         ));
     }
     (!text.is_empty()).then(|| (text.into(), false))
+}
+
+fn named_child(parent: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
+    std::iter::successors(parent.first_child(), |child| child.next_sibling())
+        .find(|child| child.widget_name() == name)
 }
 
 fn reply_quote() -> (gtk::Box, gtk::Label, gtk::Label) {

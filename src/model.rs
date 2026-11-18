@@ -639,8 +639,8 @@ impl PlayableMedia {
     pub fn open_label(self) -> &'static str {
         match self {
             Self::Video { .. } => "Открыть видео",
-            Self::Audio => "Открыть аудио",
-            Self::Voice => "Открыть голосовое сообщение",
+            Self::Audio => "Воспроизвести аудио",
+            Self::Voice => "Воспроизвести голосовое сообщение",
         }
     }
 
