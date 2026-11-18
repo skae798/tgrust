@@ -1792,11 +1792,10 @@ impl Ui {
         self.logout_dialog.set(Some(confirm.upcast_ref()));
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
-            if confirm.choose_future(Some(&window)).await != "logout" {
-                return;
-            }
+            let response = confirm.choose_future(Some(&window)).await;
             let Some(ui) = weak.upgrade() else { return };
-            if ui.window.upgrade().is_none() {
+            ui.logout_dialog.set(None);
+            if response != "logout" || ui.window.upgrade().is_none() {
                 return;
             }
             if demo {
@@ -1819,6 +1818,7 @@ impl Ui {
             ui.job(async move { client.logout().await }, move |ui, result| {
                 ui.logging_out.set(false);
                 progress.force_close();
+                ui.logout_dialog.set(None);
                 match result {
                     Ok(removal) => {
                         ui.session_removal.replace(Some(removal));
@@ -1841,6 +1841,11 @@ impl Ui {
                         failure.add_response("close", "Закрыть");
                         failure.set_close_response("close");
                         failure.set_default_response(Some("close"));
+                        failure.connect_closed(glib::clone!(
+                            #[weak]
+                            ui,
+                            move |_| ui.logout_dialog.set(None)
+                        ));
                         ui.logout_dialog.set(Some(failure.upcast_ref()));
                         failure.present(ui.window.upgrade().as_ref());
                     }
