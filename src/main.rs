@@ -13,8 +13,10 @@ mod storage;
 mod telegram;
 mod ui;
 
+use std::cell::RefCell;
 use std::env;
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use anyhow::{Context, Result, ensure};
@@ -76,18 +78,38 @@ fn main() -> ExitCode {
         }
     });
     app.add_action(&open_chat);
+    let session_removal = Rc::new(RefCell::new(None));
     app.connect_activate({
+        let session_removal = session_removal.clone();
         let handle = runtime.handle().clone();
         move |app| {
             if let Some(window) = app.active_window() {
                 window.present();
                 return;
             }
-            ui::open(app, handle.clone(), stop_rx.clone(), demo);
+            ui::open(
+                app,
+                handle.clone(),
+                stop_rx.clone(),
+                demo,
+                session_removal.clone(),
+            );
         }
     });
     let result = app.run_with_args(&["tgrust"]);
     stop.send_replace(true);
-    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    if let Some(removal) = session_removal.take() {
+        // Logout must finish any remaining database work before removing SQLite files.
+        drop(runtime);
+        drop(app);
+        if let Err(error) = removal.remove() {
+            eprintln!(
+                "Сеанс завершён в Telegram. Не удалось удалить локальный файл сессии: {error:#}"
+            );
+            return ExitCode::FAILURE;
+        }
+    } else {
+        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    }
     ExitCode::from(result)
 }

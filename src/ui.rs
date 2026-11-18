@@ -23,7 +23,7 @@ use crate::model::{
     ReadRequest, Reply, SearchHit, TextStyle, UpdateStatus, Upload, UploadKind,
     merge_latest_history, order_chats, redact_spoilers,
 };
-use crate::storage::{PendingSave, attachment_name};
+use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
 type ImageTarget = Box<dyn FnOnce(&gtk::gdk::Texture)>;
@@ -37,6 +37,9 @@ enum ImageCacheEntry {
 struct Ui {
     runtime: Handle,
     stop: watch::Receiver<bool>,
+    session_removal: Rc<RefCell<Option<SessionRemoval>>>,
+    logging_out: Cell<bool>,
+    logout_dialog: glib::WeakRef<adw::Dialog>,
     window: glib::WeakRef<adw::ApplicationWindow>,
     root: gtk::Stack,
     login_title: gtk::Label,
@@ -126,7 +129,13 @@ struct Ui {
     has_older: Cell<bool>,
 }
 
-pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>, demo: bool) {
+pub fn open(
+    app: &adw::Application,
+    runtime: Handle,
+    stop: watch::Receiver<bool>,
+    demo: bool,
+    session_removal: Rc<RefCell<Option<SessionRemoval>>>,
+) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("tgrust")
@@ -205,6 +214,10 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     menu_body.set_margin_top(6);
     menu_body.set_margin_bottom(6);
     menu_body.append(&devices_button);
+    let logout = gtk::Button::with_label("Выйти из аккаунта");
+    logout.add_css_class("flat");
+    logout.add_css_class("destructive-action");
+    menu_body.append(&logout);
     let menu_popup = gtk::Popover::builder().child(&menu_body).build();
     menu_popup.set_default_widget(Some(&devices_button));
     let app_menu = gtk::MenuButton::builder()
@@ -387,6 +400,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     let ui = Rc::new(Ui {
         runtime,
         stop,
+        session_removal,
+        logging_out: Cell::new(false),
+        logout_dialog: glib::WeakRef::new(),
         window: window.downgrade(),
         root,
         login_title,
@@ -573,6 +589,16 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
         move |_| {
             menu_popup.popdown();
             ui.open_devices();
+        }
+    ));
+    logout.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        #[weak]
+        menu_popup,
+        move |_| {
+            menu_popup.popdown();
+            ui.confirm_logout();
         }
     ));
     let devices_action = gtk::gio::SimpleAction::new("devices", None);
@@ -786,6 +812,9 @@ pub fn open(app: &adw::Application, runtime: Handle, stop: watch::Receiver<bool>
     window.connect_close_request({
         let ui = Rc::clone(&ui);
         move |_| {
+            if ui.logging_out.get() {
+                return glib::Propagation::Stop;
+            }
             if let Some(app) = ui.window.upgrade().and_then(|window| window.application()) {
                 for id in ui.notified_messages.borrow().keys() {
                     app.withdraw_notification(&notification_id(*id));
@@ -1115,6 +1144,9 @@ impl Ui {
     }
 
     fn open_notified_chat(self: &Rc<Self>, id: i64) {
+        if self.logging_out.get() {
+            return;
+        }
         self.begin_media_preview();
         if let Some(window) = self.window.upgrade() {
             window.present();
@@ -1726,9 +1758,95 @@ impl Ui {
             &self.profile_dialog,
             &self.contacts_dialog,
             &self.devices_dialog,
+            &self.logout_dialog,
         ]
         .iter()
         .any(|dialog| dialog.upgrade().is_some_and(|dialog| dialog.is_visible()))
+    }
+
+    fn confirm_logout(self: &Rc<Self>) {
+        if self.logging_out.get() || self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        if !demo && (client.is_none() || self.login_step.get() != LoginStep::Authorized) {
+            return;
+        }
+        let confirm = adw::AlertDialog::builder()
+            .heading("Выйти из аккаунта?")
+            .body(if demo {
+                "Деморежим закроется. Демонстрационные черновики будут удалены."
+            } else {
+                "Сеанс на этом устройстве завершится. tgrust закроется и удалит локальный файл сессии и черновики. При следующем входе понадобятся ключи приложения и код Telegram."
+            })
+            .close_response("cancel")
+            .default_response("cancel")
+            .build();
+        confirm.add_response("cancel", "Отмена");
+        confirm.add_response("logout", "Выйти");
+        confirm.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
+        self.logout_dialog.set(Some(confirm.upcast_ref()));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            if confirm.choose_future(Some(&window)).await != "logout" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.window.upgrade().is_none() {
+                return;
+            }
+            if demo {
+                window.close();
+                return;
+            }
+            let Some(client) = client else { return };
+            if ui.logging_out.replace(true) {
+                return;
+            }
+            let spinner = gtk::Spinner::new();
+            spinner.start();
+            let progress = adw::AlertDialog::builder()
+                .heading("Выходим из аккаунта…")
+                .extra_child(&spinner)
+                .can_close(false)
+                .build();
+            ui.logout_dialog.set(Some(progress.upcast_ref()));
+            progress.present(Some(&window));
+            ui.job(async move { client.logout().await }, move |ui, result| {
+                ui.logging_out.set(false);
+                progress.force_close();
+                match result {
+                    Ok(removal) => {
+                        ui.session_removal.replace(Some(removal));
+                        if let Some(window) = ui.window.upgrade() {
+                            if let Some(app) = window.application() {
+                                window.close();
+                                app.quit();
+                            } else {
+                                window.close();
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let failure = adw::AlertDialog::builder()
+                            .heading("Не удалось подтвердить выход")
+                            .body(format!(
+                                "{error}. Проверьте подключение и попробуйте снова."
+                            ))
+                            .build();
+                        failure.add_response("close", "Закрыть");
+                        failure.set_close_response("close");
+                        failure.set_default_response(Some("close"));
+                        ui.logout_dialog.set(Some(failure.upcast_ref()));
+                        failure.present(ui.window.upgrade().as_ref());
+                    }
+                }
+            });
+        });
     }
 
     fn open_devices(self: &Rc<Self>) {

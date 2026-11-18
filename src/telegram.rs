@@ -28,7 +28,9 @@ use crate::model::{
     SearchPage, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
-use crate::storage::{PendingSave, PlaybackDownload, attachment_name, open_session_file};
+use crate::storage::{
+    PendingSave, PlaybackDownload, SessionRemoval, attachment_name, open_session_file,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginStep {
@@ -76,6 +78,7 @@ pub struct Telegram {
     session: Arc<SqliteSession>,
     sender: SenderPoolHandle,
     runner: SessionRunner,
+    session_removal: SessionRemoval,
     updates: Mutex<Option<mpsc::Receiver<grammers_session::updates::UpdatesLike>>>,
     api_hash: Option<String>,
     state: Mutex<LoginState>,
@@ -121,7 +124,7 @@ impl Telegram {
     pub async fn connect(api_id: i32, api_hash: Option<String>) -> Result<(Arc<Self>, LoginStep)> {
         let (path, lock) = open_session_file(api_id, api_hash.is_some())?;
         let session = Arc::new(
-            SqliteSession::open(path)
+            SqliteSession::open(&path)
                 .await
                 .context("Не удалось открыть базу сессии")?,
         );
@@ -132,8 +135,10 @@ impl Telegram {
         } = SenderPool::new(session.clone(), api_id);
         let sender = (*handle).clone();
         let client = Client::new(handle);
+        let session_removal = SessionRemoval::new(path, lock);
+        let runner_lock = session_removal.clone();
         let runner = SessionRunner::spawn(async move {
-            let _lock = lock;
+            let _lock = runner_lock;
             runner.run().await;
         });
         let (runner, state) = runner
@@ -153,6 +158,7 @@ impl Telegram {
                 session,
                 sender,
                 runner,
+                session_removal,
                 updates: Mutex::new(Some(updates)),
                 api_hash,
                 state: Mutex::new(state),
@@ -168,6 +174,19 @@ impl Telegram {
             }),
             step,
         ))
+    }
+
+    pub async fn logout(&self) -> Result<SessionRemoval> {
+        let result = tokio::time::timeout(Duration::from_secs(25), self.client.sign_out())
+            .await
+            .context("Telegram не подтвердил выход вовремя")?;
+        match result {
+            Ok(_) => {}
+            Err(error) if authorization_already_ended(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.client.disconnect();
+        Ok(self.session_removal.clone())
     }
 
     pub async fn device_sessions(&self) -> Result<DeviceSessions> {
@@ -1953,6 +1972,16 @@ fn expired_file_reference(error: &InvocationError) -> bool {
     error.is("FILE_REFERENCE_EXPIRED") || error.is("FILE_REFERENCE_INVALID")
 }
 
+fn authorization_already_ended(error: &InvocationError) -> bool {
+    [
+        "AUTH_KEY_UNREGISTERED",
+        "SESSION_REVOKED",
+        "SESSION_EXPIRED",
+    ]
+    .iter()
+    .any(|name| error.is(name))
+}
+
 fn retry_update_error(error: &InvocationError) -> bool {
     match error {
         InvocationError::Io(_) | InvocationError::Dropped(_) | InvocationError::Transport(_) => {
@@ -3133,6 +3162,29 @@ mod tests {
             });
             assert_eq!(expired_file_reference(&error), should_retry);
         }
+    }
+
+    #[test]
+    fn logout_only_accepts_explicit_ended_session_errors_as_confirmation() {
+        for (code, name, ended) in [
+            (401, "AUTH_KEY_UNREGISTERED", true),
+            (401, "SESSION_EXPIRED", true),
+            (401, "SESSION_REVOKED", true),
+            (401, "AUTH_KEY_PERM_EMPTY", false),
+            (500, "INTERNAL_SERVER_ERROR", false),
+            (420, "FLOOD_WAIT", false),
+        ] {
+            let error = InvocationError::Rpc(RpcError {
+                code,
+                name: name.into(),
+                value: None,
+                caused_by: None,
+            });
+            assert_eq!(authorization_already_ended(&error), ended, "{name}");
+        }
+        assert!(!authorization_already_ended(&InvocationError::Io(
+            std::io::ErrorKind::ConnectionReset.into()
+        )));
     }
 
     #[test]
