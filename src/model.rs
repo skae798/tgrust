@@ -143,6 +143,61 @@ pub fn order_chats(chats: &mut [&Chat], folder: Option<&ChatFolder>) {
     });
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccountProfile {
+    pub api_id: i32,
+    name: Option<String>,
+}
+
+impl AccountProfile {
+    pub fn legacy(api_id: i32) -> Self {
+        Self { api_id, name: None }
+    }
+
+    pub fn named(api_id: i32, name: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(api_id > 0, "API ID должен быть положительным");
+        anyhow::ensure!(
+            !name.is_empty()
+                && name.len() <= 24
+                && name.bytes().all(|c| c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || matches!(c, b'-' | b'_')),
+            "Метка аккаунта должна содержать от 1 до 24 строчных латинских букв, цифр, дефисов или подчёркиваний"
+        );
+        Ok(Self {
+            api_id,
+            name: Some(name.to_owned()),
+        })
+    }
+
+    pub fn parse(key: &str) -> Option<Self> {
+        let (id, name) = key
+            .split_once('-')
+            .map_or((key, None), |(id, name)| (id, Some(name)));
+        let api_id: i32 = id.parse().ok()?;
+        if api_id <= 0 || id != api_id.to_string() {
+            return None;
+        }
+        match name {
+            Some(name) => Self::named(api_id, name).ok(),
+            None => Some(Self::legacy(api_id)),
+        }
+    }
+
+    pub fn key(&self) -> String {
+        match &self.name {
+            Some(name) => format!("{}-{name}", self.api_id),
+            None => self.api_id.to_string(),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| format!("API {}", self.api_id))
+    }
+}
+
 #[derive(Clone)]
 pub struct DeviceSession {
     pub id: i64,

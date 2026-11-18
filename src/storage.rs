@@ -4,7 +4,7 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// Preview data has no directory entry, including after a crash. It is never a saved attachment.
@@ -157,15 +157,25 @@ fn session_directory() -> Result<PathBuf> {
     Ok(base.join("tgrust"))
 }
 
-pub fn open_session_file(api_id: i32, create: bool) -> Result<(PathBuf, SessionLock)> {
-    let directory = session_directory()?;
+pub fn open_session_file(
+    profile: &crate::model::AccountProfile,
+    create: bool,
+) -> Result<(PathBuf, SessionLock)> {
+    open_profile_in(&session_directory()?, profile, create)
+}
+
+fn open_profile_in(
+    directory: &Path,
+    profile: &crate::model::AccountProfile,
+    create: bool,
+) -> Result<(PathBuf, SessionLock)> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&directory)
+        .create(directory)
         .context("Не удалось создать каталог сессии")?;
-    check_session_directory(&directory)?;
-    let path = directory.join(format!("{api_id}.session"));
+    check_session_directory(directory)?;
+    let path = directory.join(format!("{}.session", profile.key()));
     let file = lock_session_file(&path, create)?;
     Ok((path, file))
 }
@@ -180,44 +190,42 @@ fn check_session_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn saved_session_api_id() -> Result<Option<i32>> {
-    find_saved_session(&session_directory()?)
+pub fn saved_accounts() -> Result<Vec<crate::model::AccountProfile>> {
+    find_saved_accounts(&session_directory()?)
 }
 
-fn find_saved_session(directory: &Path) -> Result<Option<i32>> {
+fn find_saved_accounts(directory: &Path) -> Result<Vec<crate::model::AccountProfile>> {
     if let Err(error) = check_session_directory(directory) {
         if error
             .downcast_ref::<std::io::Error>()
-            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         return Err(error);
     }
-
-    let mut selected = None;
+    let mut profiles = Vec::new();
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        let name = entry.file_name();
-        let Some(id) = name
+        let Some(profile) = entry
+            .file_name()
             .to_str()
             .and_then(|name| name.strip_suffix(".session"))
-            .and_then(|stem| {
-                stem.parse::<i32>()
-                    .ok()
-                    .filter(|id| *id > 0 && stem == id.to_string())
-            })
+            .and_then(crate::model::AccountProfile::parse)
         else {
             continue;
         };
-        if !entry.file_type()?.is_file() || entry.metadata()?.len() == 0 {
-            continue;
-        }
-        if selected.replace(id).is_some() {
-            bail!("Найдено несколько сессий. Укажите TGRUST_API_ID и TGRUST_API_HASH при запуске.");
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_file() && metadata.nlink() == 1 && metadata.len() != 0 {
+            profiles.push(profile);
         }
     }
-    Ok(selected)
+    profiles.sort();
+    Ok(profiles)
 }
 
 pub(crate) fn lock_session_file(path: &Path, create: bool) -> Result<SessionLock> {
@@ -388,20 +396,88 @@ mod tests {
     }
 
     #[test]
-    fn launcher_selects_only_a_single_existing_session() -> Result<()> {
+    fn account_discovery_keeps_legacy_and_named_sessions_separate() -> Result<()> {
+        use crate::model::AccountProfile;
         let root = tempfile::tempdir()?;
         let directory = root.path().join("tgrust");
-        assert_eq!(find_saved_session(&directory)?, None);
+        assert!(find_saved_accounts(&directory)?.is_empty());
         DirBuilder::new().mode(0o700).create(&directory)?;
         fs::write(directory.join("123.session-wal"), b"sidecar")?;
         fs::write(directory.join("456.session"), [])?;
         std::os::unix::fs::symlink("123.session-wal", directory.join("789.session"))?;
         fs::write(directory.join("0123.session"), b"invalid name")?;
-        assert_eq!(find_saved_session(&directory)?, None);
-        fs::write(directory.join("123.session"), b"session")?;
-        assert_eq!(find_saved_session(&directory)?, Some(123));
-        fs::write(directory.join("321.session"), b"another session")?;
-        assert!(find_saved_session(&directory).is_err());
+        fs::write(directory.join("123-Upper.session"), b"invalid name")?;
+        assert!(find_saved_accounts(&directory)?.is_empty());
+        for name in ["123.session", "123-home.session", "123-work.session"] {
+            fs::write(directory.join(name), b"fictional session")?;
+        }
+        fs::hard_link(
+            directory.join("123.session-wal"),
+            directory.join("123-link.session"),
+        )?;
+        assert_eq!(
+            find_saved_accounts(&directory)?,
+            [
+                AccountProfile::legacy(123),
+                AccountProfile::named(123, "home")?,
+                AccountProfile::named(123, "work")?,
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profiles_with_the_same_api_id_hold_independent_databases_and_logout_targets() -> Result<()> {
+        use crate::model::AccountProfile;
+        use grammers_session::{Session, storages::SqliteSession, types::UpdateState};
+        let root = tempfile::tempdir()?;
+        let dir = root.path().join("tgrust");
+        let home = AccountProfile::named(100, "home")?;
+        let work = AccountProfile::named(100, "work")?;
+        let (home_path, home_lock) = open_profile_in(&dir, &home, true)?;
+        let (work_path, work_lock) = open_profile_in(&dir, &work, true)?;
+        assert_ne!(home_path, work_path);
+        assert!(open_profile_in(&dir, &home, true).is_err());
+        assert!(open_profile_in(&dir, &work, true).is_err());
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(async {
+            let home_db = SqliteSession::open(&home_path).await?;
+            let work_db = SqliteSession::open(&work_path).await?;
+            home_db
+                .set_update_state(UpdateState::Primary {
+                    pts: 10,
+                    date: 10,
+                    seq: 10,
+                })
+                .await?;
+            work_db
+                .set_update_state(UpdateState::Primary {
+                    pts: 20,
+                    date: 20,
+                    seq: 20,
+                })
+                .await?;
+            assert_eq!(home_db.updates_state().await.unwrap().pts, 10);
+            assert_eq!(work_db.updates_state().await.unwrap().pts, 20);
+            Ok::<(), anyhow::Error>(())
+        })?;
+        SessionRemoval::new(work_path, work_lock).remove()?;
+        assert_eq!(find_saved_accounts(&dir)?, std::slice::from_ref(&home));
+        assert!(open_profile_in(&dir, &home, false).is_err());
+        drop(home_lock);
+        let (_, _reopened) = open_profile_in(&dir, &home, false)?;
+        assert_eq!(
+            runtime.block_on(async {
+                SqliteSession::open(home_path)
+                    .await
+                    .unwrap()
+                    .updates_state()
+                    .await
+                    .unwrap()
+                    .pts
+            }),
+            10
+        );
         Ok(())
     }
 
@@ -488,7 +564,10 @@ mod tests {
         for name in ["123.session-wal", "123.session-shm", "123.session-journal"] {
             assert!(!directory.path().join(name).exists());
         }
-        assert_eq!(find_saved_session(directory.path())?, Some(456));
+        assert_eq!(
+            find_saved_accounts(directory.path())?,
+            vec![crate::model::AccountProfile::legacy(456)]
+        );
         assert_eq!(fs::read(directory.path().join("saved.png"))?, b"fictional");
         assert!(lock_session_file(&path, true).is_ok());
         Ok(())

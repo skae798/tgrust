@@ -1,3 +1,4 @@
+mod accounts;
 mod contacts;
 mod demo;
 mod devices;
@@ -13,36 +14,13 @@ mod storage;
 mod telegram;
 mod ui;
 
-use std::cell::RefCell;
 use std::env;
 use std::process::ExitCode;
-use std::rc::Rc;
 
 use adw::prelude::*;
-use anyhow::{Context, Result, ensure};
 use gtk::glib;
 
 const APP_ID: &str = "io.github.skae798.tgrust";
-
-fn credentials() -> Result<Option<(i32, Option<String>)>> {
-    let id = env::var("TGRUST_API_ID").ok();
-    let hash = env::var("TGRUST_API_HASH").ok();
-    match (id, hash) {
-        (None, None) => Ok(storage::saved_session_api_id()?.map(|id| (id, None))),
-        (Some(id), Some(hash)) => {
-            let id: i32 = id
-                .parse()
-                .context("TGRUST_API_ID должен быть целым числом")?;
-            ensure!(id > 0, "TGRUST_API_ID должен быть положительным");
-            ensure!(
-                hash.len() == 32 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "TGRUST_API_HASH должен содержать 32 шестнадцатеричных символа"
-            );
-            Ok(Some((id, Some(hash))))
-        }
-        _ => anyhow::bail!("Укажите TGRUST_API_ID и TGRUST_API_HASH вместе"),
-    }
-}
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().skip(1).collect();
@@ -58,58 +36,25 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let runtime = tokio::runtime::Runtime::new().expect("Не удалось запустить Tokio");
-    let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| gtk::Window::set_default_icon_name(APP_ID));
-    let open_chat = gtk::gio::SimpleAction::new("open-chat", Some(glib::VariantTy::INT64));
+    let accounts = accounts::Accounts::new(&app, demo);
+    let target_type = <(String, i64)>::static_variant_type();
+    let open_chat = gtk::gio::SimpleAction::new("open-account-chat", Some(target_type.as_ref()));
     open_chat.connect_activate({
-        let app = app.downgrade();
+        let accounts = accounts.clone();
         move |_, target| {
-            let Some(app) = app.upgrade() else { return };
-            app.activate();
-            if let Some(window) = app
-                .windows()
-                .into_iter()
-                .find(|window| window.is::<adw::ApplicationWindow>())
-            {
-                let _ = gtk::prelude::WidgetExt::activate_action(&window, "win.open-chat", target);
+            if let Some((key, chat)) = target.and_then(glib::Variant::get::<(String, i64)>) {
+                accounts.open_chat(&key, chat);
             }
         }
     });
     app.add_action(&open_chat);
-    let session_removal = Rc::new(RefCell::new(None));
-    app.connect_activate({
-        let session_removal = session_removal.clone();
-        let handle = runtime.handle().clone();
-        move |app| {
-            if let Some(window) = app.active_window() {
-                window.present();
-                return;
-            }
-            ui::open(
-                app,
-                handle.clone(),
-                stop_rx.clone(),
-                demo,
-                session_removal.clone(),
-            );
+    app.connect_activate(move |app| {
+        if let Err(error) = accounts.activate() {
+            eprintln!("{error:#}");
+            app.quit();
         }
     });
-    let result = app.run_with_args(&["tgrust"]);
-    stop.send_replace(true);
-    if let Some(removal) = session_removal.take() {
-        // Logout must finish any remaining database work before removing SQLite files.
-        drop(runtime);
-        drop(app);
-        if let Err(error) = removal.remove() {
-            eprintln!(
-                "Сеанс завершён в Telegram. Не удалось удалить локальный файл сессии: {error:#}"
-            );
-            return ExitCode::FAILURE;
-        }
-    } else {
-        runtime.shutdown_timeout(std::time::Duration::from_secs(2));
-    }
-    ExitCode::from(result)
+    ExitCode::from(app.run_with_args(&["tgrust"]))
 }
