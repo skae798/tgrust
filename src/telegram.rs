@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use grammers_client::client::{GlobalSearchIter, LoginToken, PasswordToken, SearchIter};
+use grammers_client::client::{
+    GlobalSearchIter, LoginToken, PasswordToken, PhoneLogin, QrLogin, SearchIter,
+};
 use grammers_client::media::{Downloadable, InputMedia, Media, PhotoSize, Uploaded};
 use grammers_client::message::{InputMessage, Message as TelegramMessage};
 use grammers_client::peer::Peer;
@@ -18,15 +20,16 @@ use grammers_session::{
     storages::SqliteSession,
     types::{PeerId, PeerKind, PeerRef},
 };
-use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
     AttachmentThumbnail, Avatar, BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer, Chat, ChatFolder,
     ChatImage, ChatKind, Contact, DeviceChange, DeviceSession, DeviceSessions, FormattedText,
-    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
-    PlayableMedia, PlaybackFile, PlaybackProgress, PrivacyAudience, PrivacyChange, PrivacyKey,
-    PrivacySetting, Reaction, ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit,
-    SearchPage, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
+    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, OwnProfile,
+    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PrivacyAudience, PrivacyChange,
+    PrivacyKey, PrivacySetting, ProfileDetails, ProfileEdit, ProfileEditResult, Reaction,
+    ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan,
+    TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -87,7 +90,8 @@ pub struct Telegram {
     changes: watch::Sender<UpdateStatus>,
     history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
-    profile: OnceCell<Peer>,
+    profile: RwLock<Option<Arc<Peer>>>,
+    profile_edit: Mutex<()>,
     contacts_cache: Mutex<Option<ContactSnapshot>>,
     contacts_revision: AtomicU64,
     dialog_settings: Mutex<()>,
@@ -174,7 +178,8 @@ impl Telegram {
                 changes,
                 history_changes: StdMutex::default(),
                 image_downloads: Semaphore::new(4),
-                profile: OnceCell::new(),
+                profile: RwLock::new(None),
+                profile_edit: Mutex::new(()),
                 contacts_cache: Mutex::new(None),
                 contacts_revision: AtomicU64::new(0),
                 dialog_settings: Mutex::new(()),
@@ -278,27 +283,80 @@ impl Telegram {
         self.state.lock().await.step()
     }
 
+    pub async fn login_by_qr(
+        &self,
+        except_ids: Vec<i64>,
+        mut cancel: watch::Receiver<bool>,
+        tokens: mpsc::Sender<Vec<u8>>,
+    ) -> Result<LoginStep> {
+        let mut state = self.state.lock().await;
+        if !matches!(*state, LoginState::Phone) {
+            return Ok(state.step());
+        }
+        let hash = self
+            .api_hash
+            .as_deref()
+            .context("Для входа нужны ключи приложения")?;
+        let mut updates = self.updates.lock().await;
+        let updates = updates.as_mut().context("Поток входа уже закрыт")?;
+        while !*cancel.borrow() {
+            let result = tokio::time::timeout(
+                Duration::from_secs(18),
+                self.client.export_qr_login(hash, except_ids.clone()),
+            )
+            .await
+            .context("Telegram не выдал QR-код вовремя")?;
+            match result {
+                Ok(QrLogin::Pending { token, expires }) => {
+                    tokio::select! {
+                        _ = cancel.changed() => break,
+                        result = tokens.send(token) => if result.is_err() { break; },
+                    }
+                    if !crate::qr_login::wait(updates, &mut cancel, expires).await? {
+                        break;
+                    }
+                }
+                Ok(QrLogin::Authorized(user)) => {
+                    self.remember_profile(*user).await;
+                    *state = LoginState::Authorized;
+                    break;
+                }
+                Ok(QrLogin::PasswordRequired(token)) => {
+                    *state = LoginState::Password(token);
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(state.step())
+    }
+
     pub async fn login(&self, value: &str) -> Result<LoginStep> {
         let mut state = self.state.lock().await;
         match &*state {
             LoginState::Phone => {
-                ensure!(
-                    value.starts_with('+')
-                        && value.len() > 1
-                        && value[1..].bytes().all(|c| c.is_ascii_digit()),
-                    "Введите номер в международном формате, например +380…"
-                );
+                let number = normalize_phone(value)?;
                 let api_hash = self
                     .api_hash
                     .as_deref()
                     .context("Для входа нужен API hash")?;
-                let token = self.client.request_login_code(value, api_hash).await?;
-                *state = LoginState::Code(token);
-                Ok(LoginStep::Code)
+                match self.client.request_phone_login(&number, api_hash).await? {
+                    PhoneLogin::Code(token) => *state = LoginState::Code(token),
+                    PhoneLogin::Authorized(user) => {
+                        self.remember_profile(*user).await;
+                        *state = LoginState::Authorized;
+                    }
+                    PhoneLogin::PaymentRequired => {
+                        bail!(
+                            "Для этого номера Telegram требует дополнительный шаг оплаты. Воспользуйтесь QR-кодом с уже подключённого устройства."
+                        )
+                    }
+                }
+                Ok(state.step())
             }
             LoginState::Code(token) => match self.client.sign_in(token, value).await {
                 Ok(user) => {
-                    let _ = self.profile.set(Peer::User(user));
+                    self.remember_profile(user).await;
                     *state = LoginState::Authorized;
                     Ok(LoginStep::Authorized)
                 }
@@ -318,7 +376,7 @@ impl Telegram {
                 };
                 match self.client.check_password(token, value).await {
                     Ok(user) => {
-                        let _ = self.profile.set(Peer::User(user));
+                        self.remember_profile(user).await;
                         *state = LoginState::Authorized;
                         Ok(LoginStep::Authorized)
                     }
@@ -541,6 +599,7 @@ impl Telegram {
 
     pub async fn chats(&self) -> Result<Vec<Chat>> {
         let profile = self.profile().await;
+        let profile = profile.as_deref();
         let now = SystemTime::now();
         let mut chats = Vec::new();
         let mut peers = HashMap::new();
@@ -1002,15 +1061,112 @@ impl Telegram {
             .map(|peer| peer.id()))
     }
 
-    async fn profile(&self) -> Option<&Peer> {
+    async fn profile(&self) -> Option<Arc<Peer>> {
+        if let Some(peer) = self.profile.read().await.as_ref() {
+            return Some(peer.clone());
+        }
+        let mut cached = self.profile.write().await;
+        if cached.is_none() {
+            let user = tokio::time::timeout(Duration::from_secs(5), self.client.get_me())
+                .await
+                .ok()?
+                .ok()?;
+            *cached = Some(Arc::new(Peer::User(user)));
+        }
+        cached.clone()
+    }
+
+    async fn remember_profile(&self, user: grammers_client::peer::User) {
         self.profile
-            .get_or_try_init(|| async {
-                let user =
-                    tokio::time::timeout(Duration::from_secs(5), self.client.get_me()).await??;
-                Ok::<_, anyhow::Error>(Peer::User(user))
-            })
+            .write()
             .await
-            .ok()
+            .replace(Arc::new(Peer::User(user)));
+    }
+
+    pub async fn own_profile(&self) -> Result<OwnProfile> {
+        let _edit = self.profile_edit.lock().await;
+        self.read_own_profile().await
+    }
+
+    async fn read_own_profile(&self) -> Result<OwnProfile> {
+        let enums::users::UserFull::Full(result) = self
+            .client
+            .invoke(&grammers_client::tl::functions::users::GetFullUser {
+                id: enums::InputUser::UserSelf,
+            })
+            .await?;
+        let enums::UserFull::Full(full) = result.full_user;
+        let raw = result
+            .users
+            .into_iter()
+            .find(|user| user.id() == full.id)
+            .context("Профиль аккаунта недоступен")?;
+        let user = grammers_client::peer::User::from_raw(&self.client, raw);
+        let snapshot = own_profile_view(&user, full.about.unwrap_or_default())?;
+        self.remember_profile(user).await;
+        Ok(snapshot)
+    }
+
+    pub async fn edit_own_profile(
+        &self,
+        original: &OwnProfile,
+        edit: ProfileEdit,
+    ) -> Result<ProfileEditResult> {
+        use crate::profile_edit::{Patch, Plan, prepare};
+        use grammers_client::tl::functions::account::{UpdateProfile, UpdateUsername};
+
+        let _edit = self.profile_edit.lock().await;
+        let mut current = self.read_own_profile().await?;
+        let patch = match prepare(original, &current, &edit)? {
+            Plan::Current => return Ok(ProfileEditResult::Saved(current)),
+            Plan::Conflict => return Ok(ProfileEditResult::Conflict(current)),
+            Plan::Write(patch) => patch,
+        };
+        let (updated, verify_about) = match patch {
+            Patch::Details {
+                first_name,
+                last_name,
+                about,
+            } => {
+                let updated = self
+                    .client
+                    .invoke(&UpdateProfile {
+                        first_name,
+                        last_name,
+                        about: about.clone(),
+                    })
+                    .await
+                    .map_err(profile_rpc_error)?;
+                let check = about.is_some();
+                if let Some(about) = about {
+                    current.details.about = about;
+                }
+                (updated, check)
+            }
+            Patch::Username(username) => {
+                match self.client.invoke(&UpdateUsername { username }).await {
+                    Ok(user) => (user, false),
+                    Err(error) if error.is("USERNAME_NOT_MODIFIED") => {
+                        return self.read_own_profile().await.map(ProfileEditResult::Saved);
+                    }
+                    Err(error) => return Err(profile_rpc_error(error)),
+                }
+            }
+        };
+        let user = grammers_client::peer::User::from_raw(&self.client, updated);
+        let next = own_profile_view(&user, current.details.about)?;
+        ensure!(next.id == current.id, "Telegram вернул другой аккаунт");
+        self.remember_profile(user).await;
+        self.invalidate_views();
+        if verify_about {
+            return Ok(
+                match tokio::time::timeout(Duration::from_secs(6), self.read_own_profile()).await {
+                    Ok(Ok(current)) => ProfileEditResult::Saved(current),
+                    _ => ProfileEditResult::Confirmed(next),
+                },
+            );
+        }
+        Ok(ProfileEditResult::Saved(next))
     }
 
     pub async fn search(self: &Arc<Self>, query: &str, chat: Option<i64>) -> Result<SearchHandle> {
@@ -1051,6 +1207,7 @@ impl Telegram {
     ) -> Result<SearchPage> {
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let profile = profile.as_deref();
         while buffer.needs_more() {
             if pending.is_none() {
                 *pending = messages.next().await?;
@@ -1120,6 +1277,7 @@ impl Telegram {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let profile = profile.as_deref();
         let mut iter = self
             .client
             .iter_messages(peer)
@@ -1263,6 +1421,7 @@ impl Telegram {
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let profile = profile.as_deref();
         let original = self
             .message_by_id(peer, anchor)
             .await?
@@ -1336,6 +1495,7 @@ impl Telegram {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let profile = profile.as_deref();
         let entities = outgoing_entities(&text);
         if uploads.len() > 1 {
             ensure!(
@@ -1735,6 +1895,7 @@ impl Telegram {
     pub async fn forward_message(&self, source: i64, id: i32, destination: i64) -> Result<Message> {
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let profile = profile.as_deref();
         let source = self.peer(source).await?;
         let destination = self.peer(destination).await?;
         let original = self
@@ -1997,6 +2158,59 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     Ok(profile)
 }
 
+fn own_profile_view(user: &grammers_client::peer::User, about: String) -> Result<OwnProfile> {
+    ensure!(
+        user.is_self() && !user.deleted(),
+        "Telegram вернул другой аккаунт"
+    );
+    Ok(OwnProfile {
+        id: user
+            .id()
+            .bot_api_dialog_id()
+            .context("Профиль аккаунта недоступен")?,
+        details: ProfileDetails {
+            first_name: user.first_name().unwrap_or_default().to_owned(),
+            last_name: user.last_name().unwrap_or_default().to_owned(),
+            about,
+        },
+        username: user.username().unwrap_or_default().to_owned(),
+        avatar: peer_avatar(&Peer::User(user.clone())),
+    })
+}
+
+fn profile_rpc_error(error: InvocationError) -> anyhow::Error {
+    match error {
+        error if error.is("ABOUT_TOO_LONG") => {
+            anyhow::anyhow!("Telegram отклонил слишком длинное описание")
+        }
+        error if error.is("FIRSTNAME_INVALID") => anyhow::anyhow!("Telegram отклонил имя"),
+        error if error.is("USERNAME_OCCUPIED") => {
+            anyhow::anyhow!("Это имя пользователя уже занято")
+        }
+        error if error.is("USERNAME_PURCHASE_AVAILABLE") => {
+            anyhow::anyhow!("Telegram предлагает это имя пользователя на Fragment")
+        }
+        error if error.is("USERNAME_INVALID") => {
+            anyhow::anyhow!("Telegram отклонил имя пользователя")
+        }
+        error => error.into(),
+    }
+}
+
+fn normalize_phone(value: &str) -> Result<String> {
+    let number: String = value
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '(' | ')' | '-'))
+        .collect();
+    ensure!(
+        number.strip_prefix('+').is_some_and(|digits| {
+            (5..=15).contains(&digits.len()) && digits.bytes().all(|digit| digit.is_ascii_digit())
+        }),
+        "Введите номер с кодом страны, например +380…"
+    );
+    Ok(number)
+}
+
 fn peer_avatar(peer: &Peer) -> Option<Avatar> {
     let (photo, dc) = match peer {
         Peer::User(user) => {
@@ -2204,6 +2418,7 @@ fn message_view(
                     .filter(|text| !text.trim().is_empty())
                     .map(|text| ReplyPreview {
                         sender: None,
+                        self_authored: false,
                         text: quote_preview(
                             text,
                             header.quote_entities.as_deref().unwrap_or_default(),
@@ -2226,6 +2441,11 @@ fn message_view(
             .to_owned()
         }),
         sender_avatar: author_peer(message, profile).and_then(peer_avatar),
+        self_authored: matches!(message.sender(), Some(Peer::User(user)) if user.is_self())
+            || message
+                .sender_id()
+                .is_some_and(|id| Some(id) == self_id || profile.is_some_and(|own| own.id() == id))
+            || (outgoing && !message.post() && message.sender_id().is_none()),
         timestamp: message.date().as_second(),
         text: if attachment.is_some() {
             message.text().to_owned()
@@ -2259,6 +2479,12 @@ fn message_view(
 }
 
 fn author_peer<'a>(message: &'a TelegramMessage, profile: Option<&'a Peer>) -> Option<&'a Peer> {
+    if let Some(profile) = profile
+        && (message.sender_id() == Some(profile.id())
+            || matches!(message.sender(), Some(Peer::User(user)) if user.is_self()))
+    {
+        return Some(profile);
+    }
     message.sender().or_else(|| {
         let sender = message.sender_id();
         if sender == Some(message.peer_id()) || (sender.is_none() && message.post()) {
@@ -2624,6 +2850,23 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn phone_login_accepts_international_formatting_and_rejects_other_characters() {
+        assert_eq!(
+            normalize_phone("+1 (202) 555-0100").unwrap(),
+            "+12025550100"
+        );
+        for invalid in [
+            "2025550100",
+            "+x5550100",
+            "+1+2025550100",
+            "+1234",
+            "+1234567890123456",
+        ] {
+            assert!(normalize_phone(invalid).is_err());
+        }
+    }
 
     #[test]
     fn blocked_list_offsets_count_raw_entries_and_stop_on_complete_empty_or_final_pages() {

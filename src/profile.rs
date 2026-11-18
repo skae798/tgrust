@@ -19,6 +19,7 @@ pub struct ProfileContext {
     pub load: Box<dyn Fn() -> ProfileFuture>,
     pub avatar: AvatarLoader,
     pub set_blocked: BlockAction,
+    pub edit: Box<dyn Fn()>,
 }
 
 struct ProfileDialog {
@@ -29,6 +30,8 @@ struct ProfileDialog {
     scroll: gtk::ScrolledWindow,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     closed: Cell<bool>,
+    edit_requested: Cell<bool>,
+    dialog: glib::WeakRef<adw::Dialog>,
 }
 
 pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Dialog {
@@ -69,6 +72,8 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
         scroll,
         task: RefCell::new(None),
         closed: Cell::new(false),
+        edit_requested: Cell::new(false),
+        dialog: dialog.downgrade(),
     });
     state.retry.connect_clicked(glib::clone!(
         #[weak]
@@ -80,6 +85,9 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
         state.closed.set(true);
         if let Some(task) = state.task.take() {
             task.abort();
+        }
+        if state.edit_requested.get() {
+            (state.context.edit)();
         }
     });
     dialog.present(Some(window));
@@ -198,6 +206,21 @@ impl ProfileDialog {
             }
         }
         self.body.append(&details);
+        if profile.is_self {
+            let edit = gtk::Button::builder()
+                .label("Редактировать профиль")
+                .halign(gtk::Align::Center)
+                .build();
+            edit.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |_| if let Some(dialog) = state.dialog.upgrade() {
+                    state.edit_requested.set(true);
+                    dialog.close();
+                }
+            ));
+            self.body.append(&edit);
+        }
         if let Some(value) = profile.blocked {
             self.add_block_controls(profile.id, profile.title, value);
         }

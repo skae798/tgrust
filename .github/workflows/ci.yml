@@ -31,8 +31,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Test GTK startup styles
-        run: GTK_A11Y=none xvfb-run -a cargo test --locked startup_registers_ui_styles -- --ignored
+      - name: Test GTK startup styles and QR rendering
+        run: GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored
       - name: Test patched search pagination
         run: cargo test --locked -p grammers-client --lib --no-default-features
       - name: Validate desktop entry

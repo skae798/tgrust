@@ -60,6 +60,26 @@ pub struct LoginToken {
     pub(crate) phone_code_hash: String,
 }
 
+/// Result of requesting or confirming a Telegram QR login.
+pub enum QrLogin {
+    /// An expiring QR payload, before server authorization.
+    Pending { token: Vec<u8>, expires: i32 },
+    /// The account authorized by the other Telegram client.
+    Authorized(Box<User>),
+    /// The account requires its cloud password after scanning.
+    PasswordRequired(PasswordToken),
+}
+
+/// Result of starting phone-number authorization.
+pub enum PhoneLogin {
+    /// Waiting for the verification code.
+    Code(LoginToken),
+    /// A still-valid authorization was returned by Telegram.
+    Authorized(Box<User>),
+    /// Telegram requires an additional paid code delivery step.
+    PaymentRequired,
+}
+
 /// Password token needed to complete a 2FA login.
 #[derive(Debug)]
 pub struct PasswordToken {
@@ -83,6 +103,63 @@ impl PasswordToken {
 /// Most requests to the API require the user to have authorized their key, stored in the session,
 /// before being able to use them.
 impl Client {
+    /// Export a QR login token or complete an already accepted login.
+    pub async fn export_qr_login(
+        &self,
+        api_hash: &str,
+        except_ids: Vec<i64>,
+    ) -> Result<QrLogin, SignInError> {
+        use tl::enums::auth::{Authorization, LoginToken as Token};
+        let request = tl::functions::auth::ExportLoginToken {
+            api_id: self.0.api_id,
+            api_hash: api_hash.to_owned(),
+            except_ids,
+        };
+        let mut result = self.invoke(&request).await;
+        if let Ok(Token::MigrateTo(migrate)) = result {
+            let old_dc = self
+                .0
+                .session
+                .home_dc_id()
+                .map_err(InvocationError::from)
+                .map_err(SignInError::Other)?;
+            self.0
+                .session
+                .set_home_dc_id(migrate.dc_id)
+                .await
+                .map_err(InvocationError::from)
+                .map_err(SignInError::Other)?;
+            if old_dc != migrate.dc_id {
+                self.0.handle.disconnect_from_dc(old_dc);
+            }
+            result = self
+                .invoke(&tl::functions::auth::ImportLoginToken {
+                    token: migrate.token,
+                })
+                .await;
+        }
+        match result {
+            Ok(Token::Token(token)) => Ok(QrLogin::Pending {
+                token: token.token,
+                expires: token.expires,
+            }),
+            Ok(Token::Success(success)) => match success.authorization {
+                Authorization::Authorization(auth) => self
+                    .complete_login(auth)
+                    .await
+                    .map(|user| QrLogin::Authorized(Box::new(user)))
+                    .map_err(SignInError::Other),
+                Authorization::SignUpRequired(_) => Err(SignInError::SignUpRequired),
+            },
+            Ok(Token::MigrateTo(_)) => Err(SignInError::Other(InvocationError::InvalidDc)),
+            Err(error) if error.is("SESSION_PASSWORD_NEEDED") => self
+                .get_password_information()
+                .await
+                .map(QrLogin::PasswordRequired)
+                .map_err(SignInError::Other),
+            Err(error) => Err(SignInError::Other(error)),
+        }
+    }
     /// Returns `true` if the current account is authorized. Otherwise,
     /// logging in will be required before being able to invoke requests.
     ///
@@ -244,6 +321,50 @@ impl Client {
         phone: &str,
         api_hash: &str,
     ) -> Result<LoginToken, InvocationError> {
+        match self.send_phone_code(phone, api_hash).await? {
+            tl::enums::auth::SentCode::Code(sent) => Ok(LoginToken {
+                phone: phone.to_owned(),
+                phone_code_hash: sent.phone_code_hash,
+            }),
+            _ => Err(InvocationError::Dropped(
+                "Telegram did not provide a phone verification code",
+            )),
+        }
+    }
+
+    /// Start phone login, including non-code responses such as existing authorization.
+    pub async fn request_phone_login(
+        &self,
+        phone: &str,
+        api_hash: &str,
+    ) -> Result<PhoneLogin, SignInError> {
+        use tl::enums::auth::{Authorization, SentCode};
+        match self
+            .send_phone_code(phone, api_hash)
+            .await
+            .map_err(SignInError::Other)?
+        {
+            SentCode::Code(sent) => Ok(PhoneLogin::Code(LoginToken {
+                phone: phone.to_owned(),
+                phone_code_hash: sent.phone_code_hash,
+            })),
+            SentCode::Success(success) => match success.authorization {
+                Authorization::Authorization(auth) => self
+                    .complete_login(auth)
+                    .await
+                    .map(|user| PhoneLogin::Authorized(Box::new(user)))
+                    .map_err(SignInError::Other),
+                Authorization::SignUpRequired(_) => Err(SignInError::SignUpRequired),
+            },
+            SentCode::PaymentRequired(_) => Ok(PhoneLogin::PaymentRequired),
+        }
+    }
+
+    async fn send_phone_code(
+        &self,
+        phone: &str,
+        api_hash: &str,
+    ) -> Result<tl::enums::auth::SentCode, InvocationError> {
         let request = tl::functions::auth::SendCode {
             phone_number: phone.to_string(),
             api_id: self.0.api_id,
@@ -262,35 +383,20 @@ impl Client {
             .into(),
         };
 
-        use tl::enums::auth::SentCode as SC;
-
-        let sent_code: tl::types::auth::SentCode = match self.invoke(&request).await {
-            Ok(x) => match x {
-                SC::Code(code) => code,
-                SC::Success(_) => panic!("should not have logged in yet"),
-                SC::PaymentRequired(_) => unimplemented!(),
-            },
-            Err(InvocationError::Rpc(err)) if err.code == 303 => {
+        match self.invoke(&request).await {
+            Err(InvocationError::Rpc(error)) if error.code == 303 => {
+                let new_dc_id = error
+                    .value
+                    .and_then(|value| i32::try_from(value).ok())
+                    .filter(|id| *id > 0)
+                    .ok_or(InvocationError::InvalidDc)?;
                 let old_dc_id = self.0.session.home_dc_id()?;
-                let new_dc_id = err.value.unwrap() as i32;
-                // Disconnect from current DC to cull the now-unused connection.
-                // This also gives a chance for the new home DC to export its authorization
-                // if there's a need to connect back to the old DC after having logged in.
                 self.0.handle.disconnect_from_dc(old_dc_id);
                 self.0.session.set_home_dc_id(new_dc_id).await?;
-                match self.invoke(&request).await? {
-                    SC::Code(code) => code,
-                    SC::Success(_) => panic!("should not have logged in yet"),
-                    SC::PaymentRequired(_) => unimplemented!(),
-                }
+                self.invoke(&request).await
             }
-            Err(e) => return Err(e),
-        };
-
-        Ok(LoginToken {
-            phone: phone.to_string(),
-            phone_code_hash: sent_code.phone_code_hash,
-        })
+            result => result,
+        }
     }
 
     /// Signs in to the user account.

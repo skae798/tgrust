@@ -10,9 +10,11 @@ publish = false
 [dependencies]
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
 anyhow = "1"
+base64 = "0.22"
 grammers-client = { version = "0.12", default-features = false, features = ["proxy"] }
 grammers-session = "0.12"
 gtk = { package = "gtk4", version = "0.10", features = ["v4_16"] }
+qrcodegen = "1.8"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "rt-multi-thread", "sync", "time"] }
 url = "2.5.8"

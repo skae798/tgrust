@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use gtk::{gio, glib};
 use tokio::runtime::Runtime;
 
-use crate::model::{AccountProfile, ProxySettings};
+use crate::model::{AccountIdentity, AccountProfile, ProxySettings};
 use crate::storage::SessionRemoval;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -37,9 +37,9 @@ impl Account {
 
 pub struct Accounts {
     demo: bool,
-    credentials: Result<Option<(i32, String)>>,
     app: glib::WeakRef<adw::Application>,
     windows: RefCell<HashMap<Account, WindowState>>,
+    identities: RefCell<HashMap<AccountProfile, AccountIdentity>>,
     pub demo_proxy: Rc<RefCell<ProxySettings>>,
 }
 
@@ -52,9 +52,9 @@ impl Accounts {
     pub fn new(app: &adw::Application, demo: bool) -> Rc<Self> {
         Rc::new(Self {
             demo,
-            credentials: environment_credentials(),
             app: app.downgrade(),
             windows: RefCell::new(HashMap::new()),
+            identities: RefCell::new(HashMap::new()),
             demo_proxy: Rc::new(RefCell::new(ProxySettings::default())),
         })
     }
@@ -72,14 +72,16 @@ impl Accounts {
             return self.open(Account::Demo(0), None);
         }
         let saved = crate::storage::saved_accounts();
-        match (&self.credentials, saved) {
+        match (application_credentials(), saved) {
             (Ok(Some((id, hash))), Ok(profiles)) => {
-                let legacy = AccountProfile::legacy(*id);
-                let mut matching = profiles.into_iter().filter(|profile| profile.api_id == *id);
-                match (matching.next(), matching.next()) {
-                    (None, _) => self.open(Account::Saved(legacy), Some(hash.clone())),
-                    (Some(profile), None) => self.open(Account::Saved(profile), Some(hash.clone())),
-                    _ => self.open(Account::Welcome, None),
+                if profiles.is_empty() {
+                    self.open(Account::Saved(AccountProfile::legacy(id)), Some(hash))
+                } else if profiles.len() == 1 {
+                    let profile = profiles.into_iter().next().unwrap();
+                    let hash = (profile.api_id == id).then_some(hash);
+                    self.open(Account::Saved(profile), hash)
+                } else {
+                    self.open(Account::Welcome, None)
                 }
             }
             (Ok(None), Ok(profiles)) if profiles.len() == 1 => {
@@ -90,7 +92,7 @@ impl Accounts {
     }
 
     pub fn startup_hint(&self) -> String {
-        if let Err(error) = &self.credentials {
+        if let Err(error) = application_credentials() {
             return error.to_string();
         }
         match crate::storage::saved_accounts() {
@@ -101,6 +103,48 @@ impl Accounts {
 
     pub fn open_demo(self: &Rc<Self>) -> Result<()> {
         self.open(Account::Demo(0), None)
+    }
+
+    pub fn identity(&self, account: &Account) -> Option<AccountIdentity> {
+        let Account::Saved(profile) = account else {
+            return None;
+        };
+        self.identities
+            .borrow()
+            .get(profile)
+            .cloned()
+            .or_else(|| crate::storage::account_identity(profile))
+    }
+
+    pub fn display_name(&self, account: &Account) -> String {
+        self.identity(account)
+            .filter(|identity| !identity.name.is_empty())
+            .map_or_else(|| account.label(), |identity| identity.name)
+    }
+
+    pub fn signed_in_ids(&self, current: &Account) -> Vec<i64> {
+        let mut ids: Vec<_> = self
+            .entries(current)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|account| account != current)
+            .filter_map(|account| self.identity(&account).map(|identity| identity.user_id))
+            .filter(|id| *id > 0)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    pub fn remember_identity(&self, account: &Account, identity: AccountIdentity) {
+        if let Account::Saved(profile) = account
+            && self.identity(account).as_ref() != Some(&identity)
+        {
+            let _ = crate::storage::remember_account_identity(profile, &identity);
+            self.identities
+                .borrow_mut()
+                .insert(profile.clone(), identity);
+        }
     }
 
     fn open(self: &Rc<Self>, account: Account, hash: Option<String>) -> Result<()> {
@@ -180,6 +224,9 @@ impl Accounts {
                 .map_err(|_| anyhow::anyhow!("Не удалось остановить сетевые задачи"))
                 .and_then(|result| result);
             accounts.windows.borrow_mut().remove(&account);
+            if let Account::Saved(profile) = &account {
+                accounts.identities.borrow_mut().remove(profile);
+            }
             if let Err(error) = result {
                 let message = format!("Не удалось очистить сеанс «{}». {error:#}", account.label());
                 eprintln!("{message}");
@@ -254,25 +301,32 @@ impl Accounts {
             }
             Ok(accounts) => {
                 for account in accounts {
+                    let display = self.display_name(&account);
                     let row = adw::ActionRow::builder()
-                        .title(account.label())
                         .activatable(account != *current)
                         .build();
+                    row.set_use_markup(false);
+                    row.set_title(&display);
+                    let badge = adw::Avatar::new(34, Some(&display), true);
+                    badge.set_valign(gtk::Align::Center);
+                    row.add_prefix(&badge);
                     if account == *current {
                         row.set_subtitle("Текущий аккаунт");
                     } else {
-                        if let Account::Saved(profile) = &account {
-                            row.set_subtitle(&format!("API {}", profile.api_id));
+                        if let Some(identity) = self.identity(&account)
+                            && !identity.username.is_empty()
+                        {
+                            row.set_subtitle(&format!("@{}", identity.username));
                         }
                         let open = gtk::Button::builder()
                             .icon_name("go-next-symbolic")
-                            .tooltip_text(format!("Открыть аккаунт {}", account.label()))
+                            .tooltip_text(format!("Открыть аккаунт {display}"))
                             .valign(gtk::Align::Center)
                             .build();
                         open.add_css_class("flat");
                         open.update_property(&[gtk::accessible::Property::Label(&format!(
                             "Открыть аккаунт {}",
-                            account.label()
+                            display
                         ))]);
                         row.add_suffix(&open);
                         row.set_activatable_widget(Some(&open));
@@ -286,11 +340,11 @@ impl Accounts {
                             #[weak]
                             parent,
                             move |_| {
-                                let hash = match (&account, &controller.credentials) {
+                                let hash = match (&account, application_credentials()) {
                                     (Account::Saved(profile), Ok(Some((id, hash))))
-                                        if *id == profile.api_id =>
+                                        if id == profile.api_id =>
                                     {
-                                        Some(hash.clone())
+                                        Some(hash)
                                     }
                                     _ => None,
                                 };
@@ -328,6 +382,18 @@ impl Accounts {
         dialog
     }
 
+    fn start_account(self: &Rc<Self>, api_id: i32, hash: String) -> Result<()> {
+        let mut profiles = crate::storage::saved_accounts()?;
+        profiles.extend(self.windows.borrow().keys().filter_map(|account| {
+            if let Account::Saved(profile) = account {
+                Some(profile.clone())
+            } else {
+                None
+            }
+        }));
+        self.open(Account::Saved(next_profile(api_id, &profiles)?), Some(hash))
+    }
+
     fn append_add_form(
         self: &Rc<Self>,
         body: &gtk::Box,
@@ -339,51 +405,84 @@ impl Accounts {
         let group = adw::PreferencesGroup::builder()
             .title("Добавить аккаунт")
             .build();
-        let name = adw::EntryRow::builder()
-            .title("Метка, например work")
+        let credentials = application_credentials().ok().flatten();
+        if credentials.is_some() {
+            let open = gtk::Button::with_label("Добавить аккаунт");
+            open.set_halign(gtk::Align::Start);
+            open.add_css_class("suggested-action");
+            group.add(&open);
+            let accounts = self.clone();
+            open.connect_clicked(glib::clone!(
+                #[weak]
+                dialog,
+                #[weak]
+                status,
+                #[weak]
+                parent,
+                move |_| {
+                    let result = application_credentials().and_then(|keys| {
+                        let (id, hash) = keys.context("Сначала настройте ключи приложения")?;
+                        accounts.start_account(id, hash)
+                    });
+                    finish_open(result, &dialog, &status, close_welcome.then_some(&parent));
+                }
+            ));
+        }
+        let setup = adw::ExpanderRow::builder()
+            .title("Ключи приложения Telegram")
+            .expanded(credentials.is_none())
             .build();
         let id = adw::EntryRow::builder()
             .title("API ID")
             .input_purpose(gtk::InputPurpose::Digits)
             .build();
         let hash = adw::PasswordEntryRow::builder().title("API hash").build();
-        if let Ok(Some((api_id, _))) = &self.credentials {
-            id.set_text(&api_id.to_string());
+        if let Some((configured, _)) = credentials {
+            id.set_text(&configured.to_string());
         }
-        group.add(&name);
-        group.add(&id);
-        group.add(&hash);
-        body.append(&group);
-        let submit = gtk::Button::with_label("Продолжить вход");
+        let hint = gtk::Label::new(Some(
+            "Настраивается один раз. Используйте ключи своего приложения с my.telegram.org.",
+        ));
+        hint.set_wrap(true);
+        hint.set_xalign(0.0);
+        hint.set_margin_start(10);
+        hint.set_margin_end(10);
+        hint.set_margin_top(6);
+        hint.set_margin_bottom(6);
+        setup.add_row(&hint);
+        setup.add_row(&id);
+        setup.add_row(&hash);
+        let submit = gtk::Button::with_label("Сохранить ключи и войти");
         submit.add_css_class("suggested-action");
-        submit.set_halign(gtk::Align::End);
-        body.append(&submit);
+        submit.set_halign(gtk::Align::Start);
+        submit.set_margin_start(10);
+        submit.set_margin_top(6);
+        submit.set_margin_bottom(6);
+        setup.add_row(&submit);
+        group.add(&setup);
+        body.append(&group);
+
         let accounts = self.clone();
         submit.connect_clicked(glib::clone!(
-            #[weak] dialog,
-            #[weak] status,
-            #[weak] name,
-            #[weak] id,
-            #[weak] hash,
-            #[weak] parent,
+            #[weak]
+            dialog,
+            #[weak]
+            status,
+            #[weak]
+            id,
+            #[weak]
+            hash,
+            #[weak]
+            parent,
             move |_| {
                 let result = (|| {
-                    let api_id = parse_api_id(id.text().trim())?;
-                    let profile = AccountProfile::named(api_id, name.text().trim())?;
-                    let password = hash.text();
-                    let api_hash = match &accounts.credentials {
-                        Ok(Some((known, value))) if *known == api_id && password.is_empty() => value.clone(),
-                        _ => {
-                            validate_hash(&password)?;
-                            password.to_string()
-                        }
-                    };
-                    let target = Account::Saved(profile.clone());
-                    ensure!(!accounts.windows.borrow().contains_key(&target) && !crate::storage::saved_accounts()?.contains(&profile),
-                        "Эта метка уже используется с данным API ID. Выберите аккаунт из списка или используйте другую метку.");
-                    accounts.open(target, Some(api_hash))?;
+                    let id = parse_api_id(id.text().trim())?;
+                    let api_hash = hash.text().to_string();
+                    validate_hash(&api_hash)?;
+                    crate::storage::save_application_credentials(id, &api_hash)
+                        .context("Не удалось сохранить ключи приложения")?;
                     hash.set_text("");
-                    Ok(())
+                    accounts.start_account(id, api_hash)
                 })();
                 finish_open(result, &dialog, &status, close_welcome.then_some(&parent));
             }
@@ -427,17 +526,65 @@ pub fn validate_hash(hash: &str) -> Result<()> {
     Ok(())
 }
 
-fn environment_credentials() -> Result<Option<(i32, String)>> {
-    match (
+fn next_profile(api_id: i32, profiles: &[AccountProfile]) -> Result<AccountProfile> {
+    if !profiles.iter().any(|profile| profile.api_id == api_id) {
+        return Ok(AccountProfile::legacy(api_id));
+    }
+    for number in 2..=profiles.len().saturating_add(2) {
+        let candidate = AccountProfile::named(api_id, &format!("account-{number}"))?;
+        if !profiles.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("Не удалось выбрать локальный номер аккаунта")
+}
+
+fn application_credentials() -> Result<Option<(i32, String)>> {
+    let environment = (
         std::env::var("TGRUST_API_ID").ok(),
         std::env::var("TGRUST_API_HASH").ok(),
-    ) {
-        (None, None) => Ok(None),
-        (Some(id), Some(hash)) => {
-            let id = parse_api_id(&id)?;
-            validate_hash(&hash)?;
-            Ok(Some((id, hash)))
-        }
+    );
+    match environment {
+        (Some(id), Some(hash)) => return checked_credentials(&id, hash).map(Some),
+        (None, None) => {}
         _ => anyhow::bail!("Укажите TGRUST_API_ID и TGRUST_API_HASH вместе"),
+    }
+    if let Some((id, hash)) = crate::storage::application_credentials()? {
+        return checked_credentials(&id.to_string(), hash).map(Some);
+    }
+    match (
+        option_env!("TGRUST_BUILD_API_ID"),
+        option_env!("TGRUST_BUILD_API_HASH"),
+    ) {
+        (Some(id), Some(hash)) => checked_credentials(id, hash.to_owned()).map(Some),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("В сборке нужна пара ключей приложения Telegram"),
+    }
+}
+
+fn checked_credentials(id: &str, hash: String) -> Result<(i32, String)> {
+    let id = parse_api_id(id)?;
+    validate_hash(&hash)?;
+    Ok((id, hash))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_account_slots_avoid_legacy_and_named_session_collisions() {
+        let legacy = AccountProfile::legacy(123);
+        let second = AccountProfile::named(123, "account-2").unwrap();
+        assert_eq!(next_profile(123, &[]).unwrap(), legacy);
+        assert_eq!(
+            next_profile(123, std::slice::from_ref(&legacy)).unwrap(),
+            second
+        );
+        assert_eq!(
+            next_profile(123, &[legacy, second]).unwrap(),
+            AccountProfile::named(123, "account-3").unwrap()
+        );
+        assert_eq!(next_profile(321, &[]).unwrap(), AccountProfile::legacy(321));
     }
 }

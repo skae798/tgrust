@@ -51,9 +51,16 @@ struct Ui {
     root: gtk::Stack,
     login_title: gtk::Label,
     login_status: gtk::Label,
-    login_entry: gtk::PasswordEntry,
+    login_entry: gtk::Entry,
+    login_password: gtk::PasswordEntry,
     login_submit: gtk::Button,
     login_reset: gtk::Button,
+    login_qr: gtk::Button,
+    login_phone: gtk::Button,
+    login_qr_retry: gtk::Button,
+    login_qr_image: gtk::Picture,
+    qr_cancel: RefCell<Option<watch::Sender<bool>>>,
+    qr_visible: Cell<bool>,
     connect_retry: gtk::Button,
     split: adw::NavigationSplitView,
     toasts: adw::ToastOverlay,
@@ -74,6 +81,11 @@ struct Ui {
     title: adw::WindowTitle,
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
+    own_profile_dialog: glib::WeakRef<adw::Dialog>,
+    own_name: RefCell<Option<String>>,
+    account_label: gtk::Label,
+    account_avatar: adw::Avatar,
+    demo_profile: Rc<RefCell<crate::model::OwnProfile>>,
     contacts_dialog: glib::WeakRef<adw::Dialog>,
     devices_dialog: glib::WeakRef<adw::Dialog>,
     demo_devices: Rc<RefCell<crate::model::DeviceSessions>>,
@@ -152,7 +164,7 @@ pub fn open(
     let title = if matches!(account, Account::Welcome | Account::Demo(0)) {
         "tgrust".into()
     } else {
-        format!("tgrust — {}", account.label())
+        format!("tgrust — {}", accounts.display_name(&account))
     };
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -179,12 +191,30 @@ pub fn open(
     let login_status = label("", "dim-label");
     login_status.set_wrap(true);
     login_status.set_max_width_chars(36);
-    let login_entry = gtk::PasswordEntry::builder().show_peek_icon(true).build();
+    let login_entry = gtk::Entry::builder()
+        .input_purpose(gtk::InputPurpose::Phone)
+        .build();
+    let login_password = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .visible(false)
+        .build();
     let login_submit = gtk::Button::with_label("Продолжить");
     login_submit.add_css_class("suggested-action");
-    let login_reset = gtk::Button::with_label("Запросить новый код");
+    let login_reset = gtk::Button::with_label("Начать вход заново");
     login_reset.add_css_class("flat");
     login_reset.set_visible(false);
+    let login_qr = gtk::Button::with_label("Войти по QR-коду");
+    login_qr.set_visible(false);
+    let login_phone = gtk::Button::with_label("Войти по номеру телефона");
+    login_phone.set_visible(false);
+    let login_qr_retry = gtk::Button::with_label("Получить QR-код снова");
+    login_qr_retry.set_visible(false);
+    let login_qr_image = gtk::Picture::builder()
+        .halign(gtk::Align::Center)
+        .can_shrink(false)
+        .visible(false)
+        .build();
+    login_qr_image.update_property(&[gtk::accessible::Property::Label("QR-код входа в Telegram")]);
     let api_hash_input = gtk::PasswordEntry::builder()
         .placeholder_text("API hash для повторного входа")
         .visible(false)
@@ -202,8 +232,13 @@ pub fn open(
         login_title.upcast_ref::<gtk::Widget>(),
         login_status.upcast_ref(),
         login_entry.upcast_ref(),
+        login_password.upcast_ref(),
         login_submit.upcast_ref(),
         login_reset.upcast_ref(),
+        login_qr_image.upcast_ref(),
+        login_qr.upcast_ref(),
+        login_phone.upcast_ref(),
+        login_qr_retry.upcast_ref(),
         api_hash_input.upcast_ref(),
         connect_retry.upcast_ref(),
         login_accounts.upcast_ref(),
@@ -212,7 +247,11 @@ pub fn open(
     ] {
         login_box.append(widget);
     }
-    login.set_content(Some(&login_box));
+    let login_scroll = gtk::ScrolledWindow::builder()
+        .child(&login_box)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    login.set_content(Some(&login_scroll));
     root.add_named(&login, Some("login"));
 
     let split = adw::NavigationSplitView::new();
@@ -234,6 +273,9 @@ pub fn open(
     menu_body.set_margin_end(6);
     menu_body.set_margin_top(6);
     menu_body.set_margin_bottom(6);
+    let my_profile = gtk::Button::with_label("Мой профиль");
+    my_profile.add_css_class("flat");
+    menu_body.append(&my_profile);
     menu_body.append(&devices_button);
     let privacy_button = gtk::Button::with_label("Конфиденциальность");
     privacy_button.add_css_class("flat");
@@ -257,13 +299,18 @@ pub fn open(
         .label(if matches!(account, Account::Welcome | Account::Demo(0)) {
             "tgrust".into()
         } else {
-            account.label()
+            accounts.display_name(&account)
         })
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(14)
         .build();
+    let account_avatar = adw::Avatar::new(24, None, true);
+    account_avatar.set_visible(false);
+    let account_header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    account_header.append(&account_avatar);
+    account_header.append(&menu_label);
     let app_menu = gtk::MenuButton::builder()
-        .child(&menu_label)
+        .child(&account_header)
         .tooltip_text("Меню приложения (F10)")
         .primary(true)
         .popover(&menu_popup)
@@ -457,8 +504,15 @@ pub fn open(
         login_title,
         login_status,
         login_entry,
+        login_password,
         login_submit,
         login_reset,
+        login_qr,
+        login_phone,
+        login_qr_retry,
+        login_qr_image,
+        qr_cancel: RefCell::new(None),
+        qr_visible: Cell::new(false),
         connect_retry,
         split,
         toasts,
@@ -479,6 +533,11 @@ pub fn open(
         title,
         profile_button,
         profile_dialog: glib::WeakRef::new(),
+        own_profile_dialog: glib::WeakRef::new(),
+        own_name: RefCell::new(None),
+        account_label: menu_label,
+        account_avatar,
+        demo_profile: Rc::new(RefCell::new(demo::own_profile())),
         contacts_dialog: glib::WeakRef::new(),
         devices_dialog: glib::WeakRef::new(),
         demo_devices: Rc::new(RefCell::new(demo::device_sessions())),
@@ -556,6 +615,23 @@ pub fn open(
         #[weak]
         ui,
         move |_| ui.submit_login()
+    ));
+    ui.login_password.connect_activate(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.submit_login()
+    ));
+    for button in [&ui.login_qr, &ui.login_qr_retry] {
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            ui,
+            move |_| ui.start_qr_login()
+        ));
+    }
+    ui.login_phone.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        move |_| ui.return_to_phone()
     ));
     ui.login_reset.connect_clicked(glib::clone!(
         #[weak]
@@ -686,6 +762,16 @@ pub fn open(
         move |_| {
             menu_popup.popdown();
             ui.open_privacy();
+        }
+    ));
+    my_profile.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        #[weak]
+        menu_popup,
+        move |_| {
+            menu_popup.popdown();
+            ui.open_own_profile();
         }
     ));
     for button in [&login_proxy, &proxy_button] {
@@ -934,6 +1020,9 @@ pub fn open(
                 viewer.close();
             }
             ui.window.set(None);
+            if let Some(cancel) = ui.qr_cancel.take() {
+                cancel.send_replace(true);
+            }
             stop.send_replace(true);
             ui.client.take();
             if let Some(runtime) = runtime.take() {
@@ -983,6 +1072,7 @@ impl Ui {
         self.set_login_busy(true);
         self.connect_retry.set_visible(false);
         self.login_entry.set_visible(false);
+        self.login_password.set_visible(false);
         self.login_submit.set_visible(false);
         let Account::Saved(profile) = &self.account else {
             self.login_status.set_text(&self.accounts.startup_hint());
@@ -1008,7 +1098,11 @@ impl Ui {
                     ui.unread_overrides.borrow_mut().clear();
                     ui.reading_chats.borrow_mut().clear();
                     ui.client.replace(Some(client));
-                    ui.show_step(step);
+                    if step == LoginStep::Phone {
+                        ui.start_qr_login();
+                    } else {
+                        ui.show_step(step);
+                    }
                 }
                 Err(error) => {
                     ui.login_status
@@ -1027,15 +1121,101 @@ impl Ui {
 
     fn set_login_busy(&self, busy: bool) {
         self.login_entry.set_sensitive(!busy);
+        self.login_password.set_sensitive(!busy);
         self.login_submit.set_sensitive(!busy);
         self.login_reset.set_sensitive(!busy);
+        self.login_qr.set_sensitive(!busy);
+    }
+
+    fn hide_qr(&self) {
+        self.qr_visible.set(false);
+        self.login_phone.set_visible(false);
+        self.login_qr_retry.set_visible(false);
+        self.login_qr_image.set_visible(false);
+        self.login_qr_image
+            .set_paintable(None::<&gtk::gdk::Paintable>);
+    }
+
+    fn start_qr_login(self: &Rc<Self>) {
+        if self.qr_cancel.borrow().is_some() || self.is_demo.get() {
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        self.set_login_busy(true);
+        self.login_entry.set_visible(false);
+        self.login_password.set_visible(false);
+        self.login_submit.set_visible(false);
+        self.login_reset.set_visible(false);
+        self.login_qr.set_visible(false);
+        self.login_phone.set_visible(true);
+        self.login_qr_retry.set_visible(false);
+        self.login_title.set_text("Вход по QR-коду");
+        self.login_status.set_text("Получаем QR-код…");
+        self.qr_visible.set(true);
+        let (cancel, cancelled) = watch::channel(false);
+        self.qr_cancel.replace(Some(cancel));
+        let (tokens, mut new_tokens) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            while let Some(token) = new_tokens.recv().await {
+                let Some(ui) = weak.upgrade().filter(|ui| ui.qr_visible.get()) else { break };
+                match crate::qr_login::texture(&token) {
+                    Ok(image) => {
+                        ui.login_qr_image.set_paintable(Some(&image));
+                        ui.login_qr_image.set_visible(true);
+                        ui.login_status.set_text("Откройте Telegram на телефоне, затем «Настройки» → «Устройства» → «Подключить устройство» и отсканируйте код.");
+                    }
+                    Err(error) => ui.login_status.set_text(&error.to_string()),
+                }
+            }
+        });
+        let except_ids = self.accounts.signed_in_ids(&self.account);
+        self.job(
+            async move { client.login_by_qr(except_ids, cancelled, tokens).await },
+            |ui, result| {
+                ui.qr_cancel.take();
+                if ui.is_demo.get() {
+                    return;
+                }
+                match result {
+                    Ok(step) => ui.show_step(step),
+                    Err(error) if ui.qr_visible.get() => {
+                        ui.login_qr_image.set_visible(false);
+                        ui.login_qr_image
+                            .set_paintable(None::<&gtk::gdk::Paintable>);
+                        ui.login_status
+                            .set_text(&format!("Не удалось выполнить вход по QR-коду. {error}"));
+                        ui.login_qr_retry.set_visible(true);
+                    }
+                    Err(_) => ui.show_step(LoginStep::Phone),
+                }
+            },
+        );
+    }
+
+    fn return_to_phone(self: &Rc<Self>) {
+        self.hide_qr();
+        if let Some(cancel) = self.qr_cancel.borrow().as_ref() {
+            self.login_status
+                .set_text("Переключаемся на вход по номеру…");
+            cancel.send_replace(true);
+        } else {
+            self.show_step(LoginStep::Phone);
+        }
     }
 
     fn show_step(self: &Rc<Self>, step: LoginStep) {
+        self.hide_qr();
         self.login_step.set(step);
-        self.login_entry.set_visible(true);
-        self.login_submit.set_visible(true);
+        self.login_entry
+            .set_visible(matches!(step, LoginStep::Phone | LoginStep::Code));
+        self.login_password.set_visible(step == LoginStep::Password);
+        self.login_submit.set_visible(step != LoginStep::Authorized);
         self.login_entry.set_text("");
+        self.login_password.set_text("");
+        self.login_qr.set_visible(step == LoginStep::Phone);
         self.set_login_busy(false);
         self.login_reset
             .set_visible(matches!(step, LoginStep::Code | LoginStep::Password));
@@ -1062,8 +1242,19 @@ impl Ui {
         };
         self.login_title.set_text(title);
         self.login_status.set_text(status);
-        self.login_entry.set_placeholder_text(Some(placeholder));
-        self.login_entry.grab_focus();
+        if step == LoginStep::Password {
+            self.login_password.set_placeholder_text(Some(placeholder));
+            self.login_password.grab_focus();
+        } else {
+            self.login_entry
+                .set_input_purpose(if step == LoginStep::Phone {
+                    gtk::InputPurpose::Phone
+                } else {
+                    gtk::InputPurpose::Digits
+                });
+            self.login_entry.set_placeholder_text(Some(placeholder));
+            self.login_entry.grab_focus();
+        }
     }
 
     fn submit_login(self: &Rc<Self>) {
@@ -1073,11 +1264,10 @@ impl Ui {
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
-        let value = self.login_entry.text().to_string();
         let value = if self.login_step.get() == LoginStep::Password {
-            value
+            self.login_password.text().to_string()
         } else {
-            value.trim().to_owned()
+            self.login_entry.text().trim().to_owned()
         };
         if value.is_empty() {
             return;
@@ -1101,6 +1291,7 @@ impl Ui {
                     }
                     Err(error) => {
                         ui.login_entry.set_text("");
+                        ui.login_password.set_text("");
                         ui.login_status.set_text(&error.to_string());
                         ui.set_login_busy(false);
                     }
@@ -1147,6 +1338,17 @@ impl Ui {
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
+        let identity_client = client.clone();
+        self.job(
+            async move {
+                tokio::time::timeout(Duration::from_secs(12), identity_client.own_profile()).await?
+            },
+            |ui, result| {
+                if let Ok(profile) = result {
+                    ui.remember_own_profile(&profile);
+                }
+            },
+        );
         let mut changes = client.changes();
         let stop = self.stop.clone();
         let (incoming, mut messages) = tokio::sync::mpsc::channel(32);
@@ -1260,7 +1462,11 @@ impl Ui {
         else {
             return;
         };
-        let title = format!("{} · {}", message.title, self.account.label());
+        let title = format!(
+            "{} · {}",
+            message.title,
+            self.accounts.display_name(&self.account)
+        );
         let notification = gtk::gio::Notification::new(&title);
         notification.set_body(Some("Новое сообщение"));
         notification.set_default_action_and_target_value(
@@ -1906,6 +2112,7 @@ impl Ui {
         [
             &self.message_search,
             &self.profile_dialog,
+            &self.own_profile_dialog,
             &self.contacts_dialog,
             &self.devices_dialog,
             &self.privacy_dialog,
@@ -2332,6 +2539,140 @@ impl Ui {
         self.blocked_dialog.set(Some(&dialog));
     }
 
+    fn remember_own_profile(self: &Rc<Self>, profile: &crate::model::OwnProfile) {
+        let name = profile.details.display_name();
+        let new_name = (!name.is_empty()).then_some(name.clone());
+        let label = new_name.as_deref().unwrap_or("Мой аккаунт");
+        self.accounts.remember_identity(
+            &self.account,
+            crate::model::AccountIdentity {
+                user_id: profile.id,
+                name,
+                username: profile.username.clone(),
+            },
+        );
+        self.account_label.set_text(label);
+        self.account_avatar.set_text(Some(label));
+        self.account_avatar.set_visible(true);
+        if let Some(photo) = profile.avatar {
+            self.load_avatar(&self.account_avatar, ChatImage::Avatar(photo));
+        } else {
+            self.account_avatar
+                .set_custom_image(None::<&gtk::gdk::Paintable>);
+        }
+        if matches!(self.account, Account::Saved(_))
+            && let Some(window) = self.window.upgrade()
+        {
+            window.set_title(Some(&format!("tgrust — {label}")));
+        }
+        if *self.own_name.borrow() == new_name {
+            return;
+        }
+        self.own_name.replace(new_name);
+        if self.is_demo.get() {
+            let history = self.demo_messages.borrow();
+            for chat in self.chats.borrow_mut().iter_mut().filter(|chat| chat.group) {
+                if let Some(last) = history.get(&chat.id).and_then(|messages| messages.last())
+                    && last.self_authored
+                    && last.id == chat.last_message_id
+                {
+                    chat.preview_sender = Some(
+                        last.displayed_sender(self.own_name.borrow().as_deref())
+                            .to_owned(),
+                    );
+                }
+            }
+            drop(history);
+            self.render_chats();
+        } else {
+            self.refresh_chats();
+        }
+        if self.selection.get().is_some() {
+            let adjustment = self.scroll.vadjustment();
+            self.render_history_position(false, Some((adjustment.upper(), adjustment.value())));
+            self.update_send_button();
+        }
+    }
+
+    fn open_own_profile(self: &Rc<Self>) {
+        if self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        if !demo && (client.is_none() || self.login_step.get() != LoginStep::Authorized) {
+            return;
+        }
+        let load_client = client.clone();
+        let load_demo = self.demo_profile.clone();
+        let demo_profile = self.demo_profile.clone();
+        let dialog = crate::own_profile::open(
+            &window,
+            crate::own_profile::ProfileContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move || {
+                    let local = demo.then(|| load_demo.borrow().clone());
+                    let client = load_client.clone();
+                    Box::pin(async move {
+                        if let Some(local) = local {
+                            Ok(local)
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .own_profile()
+                                .await
+                        }
+                    })
+                }),
+                save: Box::new(move |original, edit| {
+                    let local = demo.then(|| {
+                        use crate::model::ProfileEditResult;
+                        use crate::profile_edit::{Plan, prepare};
+                        let mut current = demo_profile.borrow_mut();
+                        match prepare(&original, &current, &edit)? {
+                            Plan::Conflict => {
+                                return Ok(ProfileEditResult::Conflict(current.clone()));
+                            }
+                            Plan::Write(patch) => patch.apply(&mut current),
+                            Plan::Current => {}
+                        }
+                        Ok(ProfileEditResult::Saved(current.clone()))
+                    });
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if let Some(local) = local {
+                            local
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .edit_own_profile(&original, edit)
+                                .await
+                        }
+                    })
+                }),
+                changed: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |profile| if ui.window.upgrade().is_some() {
+                        ui.remember_own_profile(profile);
+                    }
+                )),
+            },
+        );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.own_profile_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
+        self.own_profile_dialog.set(Some(&dialog));
+    }
+
     fn open_chat_profile(self: &Rc<Self>) {
         let Some(id) = self.selection.get() else {
             return;
@@ -2345,17 +2686,27 @@ impl Ui {
         let client = self.client.borrow().clone();
         let demo = self.is_demo.get();
         let demo_blocked = self.demo_blocked.clone();
+        let demo_profile = self.demo_profile.clone();
         let dialog = crate::profile::open(
             &window,
             crate::profile::ProfileContext {
                 runtime: self.runtime.clone(),
                 load: Box::new(move || {
                     let blocked = demo && demo_blocked.borrow().contains(&id);
+                    let own = demo.then(|| demo_profile.borrow().clone());
                     let client = client.clone();
                     Box::pin(async move {
                         if demo {
                             let mut profile = demo::peer_profile(id).context("Чат не найден")?;
                             profile.blocked = profile.blocked.map(|_| blocked);
+                            if let Some(own) = own.filter(|_| profile.is_self) {
+                                profile.title = own.details.display_name();
+                                profile.about = own.details.about;
+                                profile.usernames = (!own.username.is_empty())
+                                    .then(|| format!("@{}", own.username))
+                                    .into_iter()
+                                    .collect();
+                            }
                             Ok(profile)
                         } else {
                             let client = client.context("Нет подключения к Telegram")?;
@@ -2369,6 +2720,14 @@ impl Ui {
                     move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
                 )),
                 set_blocked: self.block_action(),
+                edit: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || {
+                        ui.profile_dialog.set(None);
+                        ui.open_own_profile();
+                    }
+                )),
             },
         );
         self.profile_dialog.set(Some(&dialog));
@@ -2911,6 +3270,7 @@ impl Ui {
             self.history.append(&self.older);
         }
         let messages = self.messages.borrow();
+        let own_name = self.own_name.borrow();
         self.revealed_spoilers
             .borrow_mut()
             .retain(|id, _| messages.contains_key(id));
@@ -2961,12 +3321,13 @@ impl Ui {
                 gtk::Align::Start
             });
             let author = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let avatar = adw::Avatar::new(24, Some(&message.sender), true);
+            let sender = message.displayed_sender(own_name.as_deref());
+            let avatar = adw::Avatar::new(24, Some(sender), true);
             if let Some(photo) = message.sender_avatar {
                 self.load_avatar(&avatar, ChatImage::Avatar(photo));
             }
             author.append(&avatar);
-            let name = label(&message.sender, "message-name");
+            let name = label(sender, "message-name");
             name.set_ellipsize(gtk::pango::EllipsizeMode::End);
             author.append(&name);
             bubble.append(&author);
@@ -2983,8 +3344,10 @@ impl Ui {
                 author.set_text(
                     original
                         .as_ref()
-                        .and_then(|item| item.sender.as_deref())
-                        .or_else(|| preview.and_then(|item| item.sender.as_deref()))
+                        .and_then(|item| item.displayed_sender(own_name.as_deref()))
+                        .or_else(|| {
+                            preview.and_then(|item| item.displayed_sender(own_name.as_deref()))
+                        })
                         .unwrap_or("Исходное сообщение"),
                 );
                 excerpt.set_text(preview.map_or("", |item| item.text.as_str()));
@@ -3618,8 +3981,7 @@ impl Ui {
             self.reply_sender.set_text(
                 reply
                     .preview
-                    .sender
-                    .as_deref()
+                    .displayed_sender(self.own_name.borrow().as_deref())
                     .unwrap_or("Исходное сообщение"),
             );
             self.reply_label.set_text(&reply.preview.text);
@@ -3716,6 +4078,7 @@ impl Ui {
                 styles: text.spans,
                 sender: demo::OWN_NAME.into(),
                 sender_avatar: Some(demo::OWN_AVATAR),
+                self_authored: true,
                 outgoing: true,
                 timestamp: demo::now(),
                 attachment: None,
@@ -3968,7 +4331,10 @@ impl Ui {
                 .unwrap_or_else(|| "Вложение".into());
             chat.last_activity = last.timestamp;
             chat.last_message_id = last.id;
-            chat.preview_sender = chat.group.then(|| last.sender.clone());
+            chat.preview_sender = chat.group.then(|| {
+                last.displayed_sender(self.own_name.borrow().as_deref())
+                    .to_owned()
+            });
             chat.preview_image = last
                 .thumbnail
                 .map(|media| ChatImage::attachment(chat.id, last.id, media));
@@ -4042,6 +4408,7 @@ impl Ui {
                         timestamp: demo::now(),
                         sender: demo::OWN_NAME.into(),
                         sender_avatar: Some(demo::OWN_AVATAR),
+                        self_authored: true,
                         outgoing: true,
                         reply_to: None,
                         reply_preview: None,
@@ -4200,9 +4567,11 @@ impl Ui {
                 chat.preview = last
                     .map(|message| message.preview_text().into_owned())
                     .unwrap_or_default();
-                chat.preview_sender = last
-                    .filter(|_| chat.group)
-                    .map(|message| message.sender.clone());
+                chat.preview_sender = last.filter(|_| chat.group).map(|message| {
+                    message
+                        .displayed_sender(self.own_name.borrow().as_deref())
+                        .to_owned()
+                });
                 chat.preview_image = last.and_then(|message| {
                     message
                         .thumbnail

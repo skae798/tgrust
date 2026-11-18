@@ -1,5 +1,6 @@
 use std::env;
 use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -144,6 +145,7 @@ impl SessionRemoval {
             }
         }
         fs::remove_file(&self.path)?;
+        let _ = fs::remove_file(self.path.with_extension("session.identity"));
         Ok(())
     }
 }
@@ -188,6 +190,111 @@ fn check_session_directory(directory: &Path) -> Result<()> {
         directory.display()
     );
     Ok(())
+}
+
+fn read_private_settings(path: &Path) -> Result<Option<gtk::glib::KeyFile>> {
+    let info = match fs::symlink_metadata(path) {
+        Ok(info) => info,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        info.is_file() && info.mode() & 0o077 == 0 && info.nlink() == 1 && info.len() <= 4096,
+        "Настройки должны быть обычным файлом с правами 0600"
+    );
+    let file = File::open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        (info.dev(), info.ino()) == (opened.dev(), opened.ino()),
+        "Файл настроек изменился при чтении"
+    );
+    let mut text = String::new();
+    file.take(4097).read_to_string(&mut text)?;
+    ensure!(
+        text.len() <= 4096 && !text.contains('\0'),
+        "Некорректный файл настроек"
+    );
+    let key_file = gtk::glib::KeyFile::new();
+    key_file
+        .load_from_data(&text, gtk::glib::KeyFileFlags::NONE)
+        .map_err(|_| anyhow::anyhow!("Некорректный файл настроек"))?;
+    Ok(Some(key_file))
+}
+
+fn write_private_settings(path: &Path, key_file: &gtk::glib::KeyFile) -> Result<()> {
+    let directory = path.parent().context("Нет каталога настроек")?;
+    check_session_directory(directory)?;
+    let data = key_file.to_data();
+    ensure!(data.len() <= 4096, "Файл настроек слишком длинный");
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.write_all(data.as_bytes())?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+pub fn account_identity(
+    profile: &crate::model::AccountProfile,
+) -> Option<crate::model::AccountIdentity> {
+    let directory = session_directory().ok()?;
+    check_session_directory(&directory).ok()?;
+    let path = directory.join(format!("{}.session.identity", profile.key()));
+    let key_file = read_private_settings(&path).ok()??;
+    Some(crate::model::AccountIdentity {
+        user_id: key_file.int64("Account", "UserId").ok()?,
+        name: key_file.string("Account", "Name").ok()?.to_string(),
+        username: key_file.string("Account", "Username").ok()?.to_string(),
+    })
+}
+
+pub fn remember_account_identity(
+    profile: &crate::model::AccountProfile,
+    identity: &crate::model::AccountIdentity,
+) -> Result<()> {
+    let path = session_directory()?.join(format!("{}.session.identity", profile.key()));
+    let key_file = gtk::glib::KeyFile::new();
+    key_file.set_int64("Account", "UserId", identity.user_id);
+    key_file.set_string("Account", "Name", &identity.name);
+    key_file.set_string("Account", "Username", &identity.username);
+    write_private_settings(&path, &key_file)
+}
+
+pub fn application_credentials() -> Result<Option<(i32, String)>> {
+    let directory = gtk::glib::user_config_dir().join("tgrust");
+    match check_session_directory(&directory) {
+        Ok(()) => {}
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    }
+    let Some(key_file) = read_private_settings(&directory.join("telegram-app.conf"))? else {
+        return Ok(None);
+    };
+    let id = key_file
+        .integer("Telegram", "ApiId")
+        .map_err(|_| anyhow::anyhow!("Нет API ID приложения"))?;
+    let hash = key_file
+        .string("Telegram", "ApiHash")
+        .map_err(|_| anyhow::anyhow!("Нет API hash приложения"))?;
+    Ok(Some((id, hash.to_string())))
+}
+
+pub fn save_application_credentials(id: i32, hash: &str) -> Result<()> {
+    let directory = gtk::glib::user_config_dir().join("tgrust");
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    let key_file = gtk::glib::KeyFile::new();
+    key_file.set_integer("Telegram", "ApiId", id);
+    key_file.set_string("Telegram", "ApiHash", hash);
+    write_private_settings(&directory.join("telegram-app.conf"), &key_file)
 }
 
 pub fn saved_accounts() -> Result<Vec<crate::model::AccountProfile>> {
@@ -553,7 +660,9 @@ mod tests {
             "123.session-wal",
             "123.session-shm",
             "123.session-journal",
+            "123.session.identity",
             "456.session",
+            "456.session.identity",
             "saved.png",
         ] {
             fs::write(directory.path().join(name), b"fictional")?;
@@ -561,9 +670,15 @@ mod tests {
         assert!(lock_session_file(&path, false).is_err());
         removal.remove()?;
         assert!(!path.exists());
-        for name in ["123.session-wal", "123.session-shm", "123.session-journal"] {
+        for name in [
+            "123.session-wal",
+            "123.session-shm",
+            "123.session-journal",
+            "123.session.identity",
+        ] {
             assert!(!directory.path().join(name).exists());
         }
+        assert!(directory.path().join("456.session.identity").is_file());
         assert_eq!(
             find_saved_accounts(directory.path())?,
             vec![crate::model::AccountProfile::legacy(456)]
