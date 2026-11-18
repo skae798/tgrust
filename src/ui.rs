@@ -5399,10 +5399,7 @@ fn bubble_item_id(mut widget: Option<gtk::Widget>) -> Option<i32> {
 
 fn message_copy_text(bubble: &gtk::Box, id: i32) -> Option<(String, bool)> {
     let name = format!("message-text-{id}");
-    let label = bubble
-        .observe_children()
-        .iter::<gtk::Widget>()
-        .filter_map(Result::ok)
+    let label = std::iter::successors(bubble.first_child(), |child| child.next_sibling())
         .find(|child| child.widget_name() == name)?
         .downcast::<gtk::Label>()
         .ok()?;
@@ -5508,7 +5505,27 @@ fn after_layout(widget: &impl IsA<gtk::Widget>, action: impl FnOnce() + 'static)
 
 #[cfg(test)]
 mod tests {
-    use super::photo_viewport;
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn message_menu_copies_selected_characters_or_the_visible_label() {
+        gtk::test_synced(|| {
+            let bubble = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            bubble.append(&gtk::Button::with_label("Вложение"));
+            let caption = gtk::Label::new(Some("😀 текст ▰▰▰"));
+            caption.set_widget_name("message-text-12");
+            caption.set_selectable(true);
+            bubble.append(&caption);
+            assert_eq!(
+                message_copy_text(&bubble, 12),
+                Some(("😀 текст ▰▰▰".into(), false))
+            );
+            caption.select_region(2, 7);
+            assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
+            assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
 
     #[test]
     fn photo_window_includes_its_header_in_the_quarter_screen_limit() {
