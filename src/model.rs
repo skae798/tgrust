@@ -332,6 +332,7 @@ pub struct PeerProfile {
     pub title: String,
     pub kind: ChatKind,
     pub is_self: bool,
+    pub blocked: Option<bool>,
     pub avatar: Option<Avatar>,
     pub about: String,
     pub usernames: Vec<String>,
@@ -341,6 +342,21 @@ pub struct PeerProfile {
     pub verified: bool,
     pub scam: bool,
     pub fake: bool,
+}
+
+pub const BLOCKED_PAGE_SIZE: i32 = 40;
+
+pub struct BlockedPeer {
+    pub id: i64,
+    pub name: String,
+    pub username: Option<String>,
+    pub avatar: Option<Avatar>,
+    pub available: bool,
+}
+
+pub struct BlockedPage {
+    pub peers: Vec<BlockedPeer>,
+    pub next_offset: Option<i32>,
 }
 
 #[derive(Clone, Default)]

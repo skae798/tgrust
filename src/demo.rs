@@ -97,6 +97,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             title: contact.name,
             kind: contact.kind,
             is_self: false,
+            blocked: Some(false),
             avatar: contact.avatar,
             about: "Демонстрационный контакт.".into(),
             usernames: contact.usernames,
@@ -118,6 +119,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         },
         kind: chat.kind,
         is_self: chat.saved_messages,
+        blocked: (chat.kind == ChatKind::Broadcast).then_some(false),
         avatar: if chat.saved_messages {
             Some(OWN_AVATAR)
         } else {
@@ -168,6 +170,36 @@ pub fn contacts() -> Vec<Contact> {
         available: true,
     })
     .collect()
+}
+
+pub fn blocked_page(ids: &[i64], offset: i32) -> crate::model::BlockedPage {
+    use crate::model::{BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer};
+    let peers = ids
+        .iter()
+        .copied()
+        .skip(offset as usize)
+        .take(BLOCKED_PAGE_SIZE as usize)
+        .map(|id| {
+            let profile = peer_profile(id);
+            BlockedPeer {
+                id,
+                name: profile.as_ref().map_or_else(
+                    || format!("Демопрофиль {}", id - 10000),
+                    |profile| profile.title.clone(),
+                ),
+                username: profile
+                    .as_ref()
+                    .and_then(|profile| profile.usernames.first().cloned()),
+                avatar: profile.and_then(|profile| profile.avatar),
+                available: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let next = offset + peers.len() as i32;
+    BlockedPage {
+        peers,
+        next_offset: ((next as usize) < ids.len()).then_some(next),
+    }
 }
 
 pub fn history(chat: i64) -> Vec<Message> {

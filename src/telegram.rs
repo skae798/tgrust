@@ -21,12 +21,12 @@ use grammers_session::{
 use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore, mpsc, watch};
 
 use crate::model::{
-    AttachmentThumbnail, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact, DeviceChange,
-    DeviceSession, DeviceSessions, FormattedText, HISTORY_PAGE_SIZE, HistoryRevision,
-    IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile, PlayableMedia, PlaybackFile,
-    PlaybackProgress, PrivacyAudience, PrivacyChange, PrivacyKey, PrivacySetting, Reaction,
-    ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan,
-    TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
+    AttachmentThumbnail, Avatar, BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer, Chat, ChatFolder,
+    ChatImage, ChatKind, Contact, DeviceChange, DeviceSession, DeviceSessions, FormattedText,
+    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, PeerProfile,
+    PlayableMedia, PlaybackFile, PlaybackProgress, PrivacyAudience, PrivacyChange, PrivacyKey,
+    PrivacySetting, Reaction, ReadRequest, ReplyPreview, SearchBuffer, SearchHandle, SearchHit,
+    SearchPage, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind, redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -92,6 +92,7 @@ pub struct Telegram {
     contacts_revision: AtomicU64,
     dialog_settings: Mutex<()>,
     privacy_settings: Mutex<()>,
+    blocked_changes: watch::Sender<u64>,
     read_state: crate::read_state::ReadState,
 }
 
@@ -176,6 +177,7 @@ impl Telegram {
                 contacts_revision: AtomicU64::new(0),
                 dialog_settings: Mutex::new(()),
                 privacy_settings: Mutex::new(()),
+                blocked_changes: watch::channel(0).0,
                 read_state: crate::read_state::ReadState::default(),
             }),
             step,
@@ -340,6 +342,15 @@ impl Telegram {
         self.changes.subscribe()
     }
 
+    pub fn blocked_changes(&self) -> watch::Receiver<u64> {
+        self.blocked_changes.subscribe()
+    }
+
+    fn invalidate_blocked(&self) {
+        self.blocked_changes
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
+
     pub async fn listen(
         self: Arc<Self>,
         mut stop: watch::Receiver<bool>,
@@ -364,6 +375,9 @@ impl Telegram {
                 Ok(update) => {
                     retry_delay = Duration::from_secs(1);
                     self.record_history_change(&update);
+                    if matches!(update.raw(), enums::Update::PeerBlocked(_)) {
+                        self.invalidate_blocked();
+                    }
                     if let Update::NewMessage(message) = &update
                         && let Some(notification) = notification_for(message, started)
                     {
@@ -447,6 +461,7 @@ impl Telegram {
             match tokio::time::timeout(Duration::from_secs(15), self.client.is_authorized()).await {
                 Ok(Ok(true)) => {
                     self.invalidate_history(None, true);
+                    self.invalidate_blocked();
                     self.changes.send_modify(|status| {
                         status.reconnecting = false;
                         status.revision = status.revision.wrapping_add(1);
@@ -691,6 +706,7 @@ impl Telegram {
             let mut profile = peer_profile_view(&peer)?;
             if !matches!(&peer, Peer::User(user) if user.deleted()) {
                 profile.about = full.about.unwrap_or_default();
+                profile.blocked = (!profile.is_self).then_some(full.blocked);
             }
             ensure!(profile.id == id, "Telegram вернул другой профиль");
             return Ok(profile);
@@ -732,6 +748,7 @@ impl Telegram {
             }
             enums::ChatFull::ChannelFull(full) => {
                 profile.about = full.about;
+                profile.blocked = (profile.kind == ChatKind::Broadcast).then_some(full.blocked);
                 profile.members = full
                     .participants_count
                     .and_then(|count| u32::try_from(count).ok())
@@ -744,6 +761,100 @@ impl Telegram {
         }
         ensure!(profile.id == id, "Telegram вернул другой чат");
         Ok(profile)
+    }
+
+    pub async fn blocked_page(&self, offset: i32) -> Result<BlockedPage> {
+        let raw = self
+            .client
+            .invoke(&grammers_client::tl::functions::contacts::GetBlocked {
+                my_stories_from: false,
+                offset,
+                limit: BLOCKED_PAGE_SIZE,
+            })
+            .await?;
+        let (entries, users, chats, count) = match raw {
+            enums::contacts::Blocked::Blocked(raw) => (raw.blocked, raw.users, raw.chats, None),
+            enums::contacts::Blocked::Slice(raw) => {
+                (raw.blocked, raw.users, raw.chats, Some(raw.count))
+            }
+        };
+        let next_offset = next_blocked_offset(offset, entries.len(), count);
+        let peers: HashMap<_, _> = users
+            .into_iter()
+            .map(|user| Peer::User(grammers_client::peer::User::from_raw(&self.client, user)))
+            .chain(
+                chats
+                    .into_iter()
+                    .map(|chat| Peer::from_raw(&self.client, chat)),
+            )
+            .map(|peer| (peer.id(), peer))
+            .collect();
+        let mut page = Vec::new();
+        let mut refs = HashMap::new();
+        for entry in entries {
+            let enums::PeerBlocked::Blocked(entry) = entry;
+            let Some(peer_id) = blocked_peer_id(&entry.peer_id) else {
+                continue;
+            };
+            let Some(id) = peer_id.bot_api_dialog_id() else {
+                continue;
+            };
+            let peer = peers.get(&peer_id);
+            let reference = match peer {
+                Some(peer) => peer.to_ref().await.map_err(anyhow::Error::from_boxed)?,
+                None => self.session.peer_ref(peer_id).await?,
+            };
+            if let Some(reference) = reference {
+                refs.insert(id, reference);
+            }
+            let profile = peer.map(peer_profile_view).transpose()?;
+            page.push(BlockedPeer {
+                id,
+                avatar: profile
+                    .as_ref()
+                    .and_then(|profile| reference.and(profile.avatar)),
+                username: profile
+                    .as_ref()
+                    .and_then(|profile| profile.usernames.first().cloned()),
+                name: profile.map_or_else(
+                    || format!("Недоступный профиль ({id})"),
+                    |profile| profile.title,
+                ),
+                available: reference.is_some(),
+            });
+        }
+        self.peers.write().await.extend(refs);
+        Ok(BlockedPage {
+            peers: page,
+            next_offset,
+        })
+    }
+
+    pub async fn set_blocked(&self, id: i64, blocked: bool) -> Result<()> {
+        use grammers_client::tl::functions::contacts::{Block, Unblock};
+        let id: enums::InputPeer = self.peer(id).await?.into();
+        ensure!(
+            id != enums::InputPeer::PeerSelf,
+            "Свой аккаунт заблокировать нельзя"
+        );
+        let confirmed = if blocked {
+            self.client
+                .invoke(&Block {
+                    my_stories_from: false,
+                    id,
+                })
+                .await?
+        } else {
+            self.client
+                .invoke(&Unblock {
+                    my_stories_from: false,
+                    id,
+                })
+                .await?
+        };
+        ensure!(confirmed, "Telegram не подтвердил изменение блокировки");
+        self.invalidate_blocked();
+        Ok(())
     }
 
     pub async fn notification_enabled(&self, chat: i64, kind: ChatKind) -> Result<bool> {
@@ -1825,6 +1936,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
             .to_owned(),
         kind: chat_kind(peer),
         is_self: false,
+        blocked: None,
         avatar: peer_avatar(peer),
         about: String::new(),
         usernames: Vec::new(),
@@ -1917,6 +2029,19 @@ fn chat_kind(peer: &Peer) -> ChatKind {
         Peer::Channel(_) => ChatKind::Broadcast,
         Peer::Group(_) | Peer::Community(_) => ChatKind::Group,
     }
+}
+
+fn blocked_peer_id(peer: &enums::Peer) -> Option<PeerId> {
+    match peer {
+        enums::Peer::User(peer) => PeerId::user(peer.user_id),
+        enums::Peer::Chat(peer) => PeerId::chat(peer.chat_id),
+        enums::Peer::Channel(peer) => PeerId::channel(peer.channel_id),
+    }
+}
+
+fn next_blocked_offset(offset: i32, received: usize, count: Option<i32>) -> Option<i32> {
+    let next = offset.checked_add(i32::try_from(received).ok()?)?;
+    (received > 0 && next < count?).then_some(next)
 }
 
 fn input_peer_id(peer: &enums::InputPeer, self_id: Option<PeerId>) -> Option<i64> {
@@ -2497,6 +2622,29 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 mod tests {
     use super::*;
     use grammers_client::sender::RpcError;
+
+    #[test]
+    fn blocked_list_offsets_count_raw_entries_and_stop_on_complete_empty_or_final_pages() {
+        assert_eq!(next_blocked_offset(0, 12, Some(86)), Some(12));
+        assert_eq!(next_blocked_offset(12, 40, Some(86)), Some(52));
+        assert_eq!(next_blocked_offset(52, 34, Some(86)), None);
+        assert_eq!(next_blocked_offset(52, 2, None), None);
+        assert_eq!(next_blocked_offset(52, 0, Some(86)), None);
+        assert_eq!(next_blocked_offset(i32::MAX, 2, Some(i32::MAX)), None);
+    }
+
+    #[test]
+    fn blocked_list_keeps_user_group_and_channel_ids_distinct() {
+        let peers = [
+            types::PeerUser { user_id: 23 }.into(),
+            types::PeerChat { chat_id: 23 }.into(),
+            types::PeerChannel { channel_id: 23 }.into(),
+        ];
+        assert_eq!(
+            peers.map(|peer| blocked_peer_id(&peer).and_then(PeerId::bot_api_dialog_id)),
+            [Some(23), Some(-23), Some(-1_000_000_000_023)]
+        );
+    }
 
     fn synthetic_device(hash: i64, current: bool, active: i32) -> enums::Authorization {
         types::Authorization {

@@ -8,6 +8,7 @@ use anyhow::Result;
 use gtk::glib;
 use tokio::runtime::Handle;
 
+use crate::blocked::{self, BlockAction};
 use crate::model::{Avatar, ChatKind, PeerProfile};
 
 type ProfileFuture = Pin<Box<dyn Future<Output = Result<PeerProfile>> + Send>>;
@@ -17,6 +18,7 @@ pub struct ProfileContext {
     pub runtime: Handle,
     pub load: Box<dyn Fn() -> ProfileFuture>,
     pub avatar: AvatarLoader,
+    pub set_blocked: BlockAction,
 }
 
 struct ProfileDialog {
@@ -24,6 +26,7 @@ struct ProfileDialog {
     body: gtk::Box,
     status: gtk::Label,
     retry: gtk::Button,
+    scroll: gtk::ScrolledWindow,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     closed: Cell<bool>,
 }
@@ -63,6 +66,7 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
         body,
         status,
         retry,
+        scroll,
         task: RefCell::new(None),
         closed: Cell::new(false),
     });
@@ -114,7 +118,7 @@ impl ProfileDialog {
         });
     }
 
-    fn show(&self, profile: PeerProfile) {
+    fn show(self: &Rc<Self>, profile: PeerProfile) {
         while let Some(child) = self.body.first_child() {
             self.body.remove(&child);
         }
@@ -194,6 +198,83 @@ impl ProfileDialog {
             }
         }
         self.body.append(&details);
+        if let Some(value) = profile.blocked {
+            self.add_block_controls(profile.id, profile.title, value);
+        }
+    }
+
+    fn add_block_controls(self: &Rc<Self>, id: i64, name: String, initial: bool) {
+        let status = text("");
+        status.set_visible(false);
+        let button = gtk::Button::new();
+        button.set_halign(gtk::Align::Center);
+        let blocked = Rc::new(Cell::new(initial));
+        show_block_button(&button, initial);
+        button.connect_clicked(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            #[weak]
+            status,
+            move |button| {
+                let desired = !blocked.get();
+                let weak = Rc::downgrade(&state);
+                let button_ref = button.downgrade();
+                let status = status.clone();
+                let blocked = blocked.clone();
+                blocked::confirm(button, &name, desired, move || {
+                    let Some(state) = weak.upgrade().filter(|state| !state.closed.get()) else {
+                        return;
+                    };
+                    let Some(button) = button_ref.upgrade() else {
+                        return;
+                    };
+                    state.scroll.grab_focus();
+                    button.set_sensitive(false);
+                    status.set_text("Сохранение…");
+                    status.set_visible(true);
+                    let task = blocked::request_change(
+                        &state.context.runtime,
+                        &state.context.set_blocked,
+                        id,
+                        desired,
+                    );
+                    glib::MainContext::default().spawn_local(async move {
+                        let result = task
+                            .await
+                            .map_err(anyhow::Error::from)
+                            .and_then(|result| result);
+                        if !weak.upgrade().is_some_and(|state| !state.closed.get()) {
+                            return;
+                        }
+                        button.set_sensitive(true);
+                        match result {
+                            Ok(()) => {
+                                blocked.set(desired);
+                                show_block_button(&button, desired);
+                                status.set_visible(false);
+                            }
+                            Err(error) => {
+                                status.set_text(&format!(
+                                    "Не удалось подтвердить изменение. {error}"
+                                ));
+                            }
+                        }
+                    });
+                });
+            }
+        ));
+        self.body.append(&button);
+        self.body.append(&status);
+    }
+}
+
+fn show_block_button(button: &gtk::Button, blocked: bool) {
+    if blocked {
+        button.set_label("Разблокировать");
+        button.remove_css_class("destructive-action");
+    } else {
+        button.set_label("Заблокировать");
+        button.add_css_class("destructive-action");
     }
 }
 

@@ -79,6 +79,8 @@ struct Ui {
     demo_devices: Rc<RefCell<crate::model::DeviceSessions>>,
     privacy_dialog: glib::WeakRef<adw::Dialog>,
     demo_privacy: Rc<RefCell<HashMap<crate::model::PrivacyKey, crate::model::PrivacySetting>>>,
+    blocked_dialog: glib::WeakRef<adw::Dialog>,
+    demo_blocked: Rc<RefCell<Vec<i64>>>,
     history: gtk::Box,
     message_menu: gtk::Popover,
     menu_message: Cell<Option<i32>>,
@@ -232,6 +234,9 @@ pub fn open(
     let privacy_button = gtk::Button::with_label("Конфиденциальность");
     privacy_button.add_css_class("flat");
     menu_body.append(&privacy_button);
+    let blocked_button = gtk::Button::with_label("Заблокированные");
+    blocked_button.add_css_class("flat");
+    menu_body.append(&blocked_button);
     let logout = gtk::Button::with_label("Выйти из аккаунта");
     logout.add_css_class("flat");
     logout.add_css_class("destructive-action");
@@ -472,6 +477,10 @@ pub fn open(
         demo_devices: Rc::new(RefCell::new(demo::device_sessions())),
         privacy_dialog: glib::WeakRef::new(),
         demo_privacy: Rc::new(RefCell::new(demo::privacy_settings())),
+        blocked_dialog: glib::WeakRef::new(),
+        demo_blocked: Rc::new(RefCell::new(
+            std::iter::once(12).chain(10001..=10043).collect(),
+        )),
         history,
         message_menu,
         menu_message: Cell::new(None),
@@ -669,6 +678,16 @@ pub fn open(
         move |_| {
             menu_popup.popdown();
             ui.open_privacy();
+        }
+    ));
+    blocked_button.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        #[weak]
+        menu_popup,
+        move |_| {
+            menu_popup.popdown();
+            ui.open_blocked();
         }
     ));
     let devices_action = gtk::gio::SimpleAction::new("devices", None);
@@ -1870,6 +1889,7 @@ impl Ui {
             &self.contacts_dialog,
             &self.devices_dialog,
             &self.privacy_dialog,
+            &self.blocked_dialog,
             &self.logout_dialog,
             &self.accounts_dialog,
         ]
@@ -2196,6 +2216,81 @@ impl Ui {
         self.contacts_dialog.set(Some(&dialog));
     }
 
+    fn block_action(&self) -> crate::blocked::BlockAction {
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let demo_blocked = self.demo_blocked.clone();
+        Rc::new(move |id, blocked| {
+            if demo {
+                let mut ids = demo_blocked.borrow_mut();
+                ids.retain(|peer| *peer != id);
+                if blocked {
+                    ids.insert(0, id);
+                }
+                return Box::pin(async { Ok(()) });
+            }
+            let client = client.clone();
+            Box::pin(async move {
+                client
+                    .context("Нет подключения к Telegram")?
+                    .set_blocked(id, blocked)
+                    .await
+            })
+        })
+    }
+
+    fn open_blocked(self: &Rc<Self>) {
+        if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
+            || self.chat_dialog_open()
+        {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let client = self.client.borrow().clone();
+        let changes = client.as_ref().map(|client| client.blocked_changes());
+        let demo_mode = self.is_demo.get();
+        let demo_blocked = self.demo_blocked.clone();
+        let dialog = crate::blocked::open(
+            &window,
+            crate::blocked::BlockedContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |offset| {
+                    let page =
+                        demo_mode.then(|| demo::blocked_page(&demo_blocked.borrow(), offset));
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if let Some(page) = page {
+                            Ok(page)
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .blocked_page(offset)
+                                .await
+                        }
+                    })
+                }),
+                change: self.block_action(),
+                avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
+                )),
+                changes,
+            },
+        );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.blocked_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
+        self.blocked_dialog.set(Some(&dialog));
+    }
+
     fn open_chat_profile(self: &Rc<Self>) {
         let Some(id) = self.selection.get() else {
             return;
@@ -2208,15 +2303,19 @@ impl Ui {
         }
         let client = self.client.borrow().clone();
         let demo = self.is_demo.get();
+        let demo_blocked = self.demo_blocked.clone();
         let dialog = crate::profile::open(
             &window,
             crate::profile::ProfileContext {
                 runtime: self.runtime.clone(),
                 load: Box::new(move || {
+                    let blocked = demo && demo_blocked.borrow().contains(&id);
                     let client = client.clone();
                     Box::pin(async move {
                         if demo {
-                            demo::peer_profile(id).ok_or_else(|| anyhow::anyhow!("Чат не найден"))
+                            let mut profile = demo::peer_profile(id).context("Чат не найден")?;
+                            profile.blocked = profile.blocked.map(|_| blocked);
+                            Ok(profile)
                         } else {
                             let client = client.context("Нет подключения к Telegram")?;
                             client.peer_profile(id).await
@@ -2228,6 +2327,7 @@ impl Ui {
                     self,
                     move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
                 )),
+                set_blocked: self.block_action(),
             },
         );
         self.profile_dialog.set(Some(&dialog));
