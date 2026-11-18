@@ -12,7 +12,7 @@ use crate::blocked::{self, BlockAction};
 use crate::model::{Avatar, ChatKind, PeerProfile};
 
 type ProfileFuture = Pin<Box<dyn Future<Output = Result<PeerProfile>> + Send>>;
-type AvatarLoader = Box<dyn Fn(&adw::Avatar, Avatar)>;
+pub(crate) type AvatarLoader = Box<dyn Fn(&adw::Avatar, Avatar)>;
 
 pub struct ProfileContext {
     pub runtime: Handle,

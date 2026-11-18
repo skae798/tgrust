@@ -1169,6 +1169,76 @@ impl Telegram {
         Ok(ProfileEditResult::Saved(next))
     }
 
+    pub async fn set_own_photo(
+        &self,
+        original: &OwnProfile,
+        jpeg: Arc<[u8]>,
+    ) -> Result<ProfileEditResult> {
+        use grammers_client::tl::functions::photos::UploadProfilePhoto;
+
+        let photo_changed = |current: &OwnProfile| {
+            ensure!(current.id == original.id, "Telegram вернул другой аккаунт");
+            Ok::<_, anyhow::Error>(
+                current.avatar.map(|photo| photo.photo) != original.avatar.map(|photo| photo.photo),
+            )
+        };
+        let _edit = self.profile_edit.lock().await;
+        let current = self.read_own_profile().await?;
+        if photo_changed(&current)? {
+            return Ok(ProfileEditResult::Conflict(current));
+        }
+        let size = jpeg.len();
+        let mut stream = std::io::Cursor::new(jpeg);
+        let upload = self
+            .client
+            .upload_stream(&mut stream, size, "profile.jpg".into())
+            .await?;
+        let mut current = self.read_own_profile().await?;
+        if photo_changed(&current)? {
+            return Ok(ProfileEditResult::Conflict(current));
+        }
+        let enums::photos::Photo::Photo(result) = self
+            .client
+            .invoke(&UploadProfilePhoto {
+                fallback: false,
+                bot: None,
+                file: Some(upload.raw),
+                video: None,
+                video_start_ts: None,
+                video_emoji_markup: None,
+            })
+            .await?;
+        self.invalidate_views();
+
+        if let enums::Photo::Photo(photo) = result.photo {
+            let avatar = Avatar {
+                peer: current.id,
+                photo: photo.id,
+                dc: photo.dc_id,
+            };
+            current.avatar = Some(avatar);
+            if let Some(raw) = result
+                .users
+                .into_iter()
+                .find(|user| user.id() == current.id)
+            {
+                let user = grammers_client::peer::User::from_raw(&self.client, raw);
+                if let Ok(next) = own_profile_view(&user, current.details.about.clone())
+                    && next.avatar.is_some_and(|value| value.photo == avatar.photo)
+                {
+                    self.remember_profile(user).await;
+                    return Ok(ProfileEditResult::Saved(next));
+                }
+            }
+        }
+        Ok(
+            match tokio::time::timeout(Duration::from_secs(6), self.read_own_profile()).await {
+                Ok(Ok(next)) => ProfileEditResult::Saved(next),
+                _ => ProfileEditResult::Confirmed(current),
+            },
+        )
+    }
+
     pub async fn search(self: &Arc<Self>, query: &str, chat: Option<i64>) -> Result<SearchHandle> {
         let messages = match chat {
             Some(id) => SearchMessages::Chat(

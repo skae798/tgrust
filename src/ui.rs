@@ -19,9 +19,9 @@ use crate::formatting::{
 use crate::media_viewer::fit_viewport as photo_viewport;
 use crate::model::PlayableMedia;
 use crate::model::{
-    COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText, HISTORY_PAGE_SIZE,
-    HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, Reaction,
-    ReadRequest, Reply, SearchHit, TextStyle, UpdateStatus, Upload, UploadKind,
+    Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
+    HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
+    Reaction, ReadRequest, Reply, SearchHit, TextStyle, UpdateStatus, Upload, UploadKind,
     merge_latest_history, order_chats, redact_spoilers,
 };
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
@@ -83,9 +83,11 @@ struct Ui {
     profile_dialog: glib::WeakRef<adw::Dialog>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
+    own_avatar: Cell<Option<Option<Avatar>>>,
     account_label: gtk::Label,
     account_avatar: adw::Avatar,
     demo_profile: Rc<RefCell<crate::model::OwnProfile>>,
+    demo_photo: Rc<RefCell<Option<(Avatar, gtk::gdk::Texture)>>>,
     contacts_dialog: glib::WeakRef<adw::Dialog>,
     devices_dialog: glib::WeakRef<adw::Dialog>,
     demo_devices: Rc<RefCell<crate::model::DeviceSessions>>,
@@ -535,9 +537,11 @@ pub fn open(
         profile_dialog: glib::WeakRef::new(),
         own_profile_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
+        own_avatar: Cell::new(None),
         account_label: menu_label,
         account_avatar,
         demo_profile: Rc::new(RefCell::new(demo::own_profile())),
+        demo_photo: Rc::new(RefCell::new(None)),
         contacts_dialog: glib::WeakRef::new(),
         devices_dialog: glib::WeakRef::new(),
         demo_devices: Rc::new(RefCell::new(demo::device_sessions())),
@@ -2554,40 +2558,54 @@ impl Ui {
         self.account_label.set_text(label);
         self.account_avatar.set_text(Some(label));
         self.account_avatar.set_visible(true);
-        if let Some(photo) = profile.avatar {
-            self.load_avatar(&self.account_avatar, ChatImage::Avatar(photo));
-        } else {
+        let old_avatar = self.own_avatar.replace(Some(profile.avatar));
+        let avatar_changed = old_avatar != Some(profile.avatar);
+        if avatar_changed {
             self.account_avatar
                 .set_custom_image(None::<&gtk::gdk::Paintable>);
+        }
+        if let Some(photo) = profile.avatar {
+            self.load_chat_image(
+                ChatImage::Avatar(photo),
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |texture: &gtk::gdk::Texture| {
+                        if ui.own_avatar.get() == Some(Some(photo)) {
+                            ui.account_avatar.set_custom_image(Some(texture));
+                        }
+                    }
+                ),
+            );
         }
         if matches!(self.account, Account::Saved(_))
             && let Some(window) = self.window.upgrade()
         {
             window.set_title(Some(&format!("tgrust — {label}")));
         }
-        if *self.own_name.borrow() == new_name {
-            return;
-        }
-        self.own_name.replace(new_name);
-        if self.is_demo.get() {
-            let history = self.demo_messages.borrow();
-            for chat in self.chats.borrow_mut().iter_mut().filter(|chat| chat.group) {
-                if let Some(last) = history.get(&chat.id).and_then(|messages| messages.last())
-                    && last.self_authored
-                    && last.id == chat.last_message_id
-                {
-                    chat.preview_sender = Some(
-                        last.displayed_sender(self.own_name.borrow().as_deref())
-                            .to_owned(),
-                    );
+        let name_changed = *self.own_name.borrow() != new_name;
+        if name_changed {
+            self.own_name.replace(new_name);
+            if self.is_demo.get() {
+                let history = self.demo_messages.borrow();
+                for chat in self.chats.borrow_mut().iter_mut().filter(|chat| chat.group) {
+                    if let Some(last) = history.get(&chat.id).and_then(|messages| messages.last())
+                        && last.self_authored
+                        && last.id == chat.last_message_id
+                    {
+                        chat.preview_sender = Some(
+                            last.displayed_sender(self.own_name.borrow().as_deref())
+                                .to_owned(),
+                        );
+                    }
                 }
+                drop(history);
+                self.render_chats();
+            } else {
+                self.refresh_chats();
             }
-            drop(history);
-            self.render_chats();
-        } else {
-            self.refresh_chats();
         }
-        if self.selection.get().is_some() {
+        if (name_changed || avatar_changed) && self.selection.get().is_some() {
             let adjustment = self.scroll.vadjustment();
             self.render_history_position(false, Some((adjustment.upper(), adjustment.value())));
             self.update_send_button();
@@ -2607,8 +2625,11 @@ impl Ui {
             return;
         }
         let load_client = client.clone();
+        let photo_client = client.clone();
         let load_demo = self.demo_profile.clone();
         let demo_profile = self.demo_profile.clone();
+        let demo_photo_profile = self.demo_profile.clone();
+        let demo_photo = self.demo_photo.clone();
         let dialog = crate::own_profile::open(
             &window,
             crate::own_profile::ProfileContext {
@@ -2653,6 +2674,37 @@ impl Ui {
                         }
                     })
                 }),
+                set_photo: Box::new(move |original, jpeg| {
+                    let local = demo.then(|| {
+                        let mut current = demo_photo_profile.borrow_mut();
+                        if current.avatar != original.avatar {
+                            return Ok(crate::model::ProfileEditResult::Conflict(current.clone()));
+                        }
+                        let texture =
+                            gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(jpeg.clone()))?;
+                        let mut avatar = current.avatar.unwrap_or(demo::OWN_AVATAR);
+                        avatar.photo += 1;
+                        demo_photo.replace(Some((avatar, texture)));
+                        current.avatar = Some(avatar);
+                        Ok(crate::model::ProfileEditResult::Saved(current.clone()))
+                    });
+                    let client = photo_client.clone();
+                    Box::pin(async move {
+                        if let Some(local) = local {
+                            local
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .set_own_photo(&original, jpeg)
+                                .await
+                        }
+                    })
+                }),
+                load_avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
+                )),
                 changed: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
@@ -2702,6 +2754,7 @@ impl Ui {
                             if let Some(own) = own.filter(|_| profile.is_self) {
                                 profile.title = own.details.display_name();
                                 profile.about = own.details.about;
+                                profile.avatar = own.avatar;
                                 profile.usernames = (!own.username.is_empty())
                                     .then(|| format!("@{}", own.username))
                                     .into_iter()
@@ -3323,7 +3376,12 @@ impl Ui {
             let author = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             let sender = message.displayed_sender(own_name.as_deref());
             let avatar = adw::Avatar::new(24, Some(sender), true);
-            if let Some(photo) = message.sender_avatar {
+            let photo = if message.self_authored {
+                self.own_avatar.get().unwrap_or(message.sender_avatar)
+            } else {
+                message.sender_avatar
+            };
+            if let Some(photo) = photo {
                 self.load_avatar(&avatar, ChatImage::Avatar(photo));
             }
             author.append(&avatar);
@@ -3647,6 +3705,12 @@ impl Ui {
         show: impl FnOnce(&gtk::gdk::Texture) + 'static,
     ) {
         if self.is_demo.get() {
+            if let Some((avatar, texture)) = self.demo_photo.borrow().as_ref()
+                && image == ChatImage::Avatar(*avatar)
+            {
+                show(texture);
+                return;
+            }
             let texture = self.demo_image.get_or_init(demo_texture);
             if matches!(image, ChatImage::Attachment { .. }) {
                 if let Some(thumbnail) = scaled_thumbnail(texture.upcast_ref()) {
