@@ -62,7 +62,7 @@ pub fn open(window: &adw::ApplicationWindow, context: PrivacyContext) -> adw::Di
     let context = Rc::new(context);
     let rows: Vec<_> = PrivacyKey::ALL
         .into_iter()
-        .map(|key| SettingRow::new(key, context.clone(), &body))
+        .map(|key| SettingRow::new(key, context.clone(), &body, &refresh))
         .collect();
 
     refresh.connect_clicked({
@@ -91,7 +91,12 @@ pub fn open(window: &adw::ApplicationWindow, context: PrivacyContext) -> adw::Di
 }
 
 impl SettingRow {
-    fn new(key: PrivacyKey, context: Rc<PrivacyContext>, body: &gtk::Box) -> Rc<Self> {
+    fn new(
+        key: PrivacyKey,
+        context: Rc<PrivacyContext>,
+        body: &gtk::Box,
+        refresh: &gtk::Button,
+    ) -> Rc<Self> {
         let group = adw::PreferencesGroup::builder().title(key.title()).build();
         let block = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let choice = adw::ComboRow::builder()
@@ -137,7 +142,9 @@ impl SettingRow {
         row.save.connect_clicked(glib::clone!(
             #[weak]
             row,
-            move |_| row.save()
+            #[weak]
+            refresh,
+            move |_| row.save(&refresh)
         ));
         row
     }
@@ -218,7 +225,7 @@ impl SettingRow {
         });
     }
 
-    fn save(self: &Rc<Self>) {
+    fn save(self: &Rc<Self>, refresh: &gtk::Button) {
         if self.closed.get() || self.task.borrow().is_some() {
             return;
         }
@@ -231,6 +238,8 @@ impl SettingRow {
         if !baseline.editable || baseline.audience == Some(audience) {
             return;
         }
+        // Keep focus within the dialog when both editing controls become insensitive.
+        refresh.grab_focus();
         self.saving.set(true);
         self.status("Сохранение…");
         self.request(
