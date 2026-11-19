@@ -20,7 +20,8 @@ use crate::model::{
     Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
     Poll, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit, TextStyle,
-    UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, redact_spoilers,
+    UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, prepend_history_page,
+    redact_spoilers,
 };
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -38,6 +39,13 @@ struct InlineAudio {
     id: i32,
     media: PlayableMedia,
     player: Rc<crate::audio::InlinePlayer>,
+}
+
+#[derive(Clone, Copy)]
+enum HistoryScroll {
+    Bottom,
+    Message { id: i32, offset: f64 },
+    Value(f64),
 }
 
 struct Ui {
@@ -107,7 +115,8 @@ struct Ui {
     menu_message: Cell<Option<i32>>,
     scroll: gtk::ScrolledWindow,
     older: gtk::Button,
-    adjusting_history: Cell<bool>,
+    history_scroll: Cell<Option<HistoryScroll>>,
+    prepend_scroll: Cell<Option<(f64, f64)>>,
     latest: gtk::Button,
     input: gtk::TextView,
     input_placeholder: gtk::Label,
@@ -138,6 +147,7 @@ struct Ui {
     chat_settings_revision: Cell<u64>,
     history_refresh: Cell<bool>,
     latest_history_pending: Cell<Option<bool>>,
+    older_history_pending: Cell<bool>,
     search_anchor: Cell<Option<i32>>,
     scroll_to_search_result: Cell<bool>,
     sending: Cell<bool>,
@@ -160,6 +170,7 @@ struct Ui {
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
     inline_audio: RefCell<Option<InlineAudio>>,
+    audio_cards: RefCell<HashMap<i32, crate::audio::AudioCard>>,
     media_generation: Cell<u64>,
     loaded: Cell<bool>,
     has_older: Cell<bool>,
@@ -569,7 +580,8 @@ pub fn open(
         menu_message: Cell::new(None),
         scroll,
         older,
-        adjusting_history: Cell::new(false),
+        history_scroll: Cell::new(None),
+        prepend_scroll: Cell::new(None),
         latest,
         input,
         input_placeholder,
@@ -600,6 +612,7 @@ pub fn open(
         chat_settings_revision: Cell::new(0),
         history_refresh: Cell::new(false),
         latest_history_pending: Cell::new(None),
+        older_history_pending: Cell::new(false),
         search_anchor: Cell::new(None),
         scroll_to_search_result: Cell::new(false),
         sending: Cell::new(false),
@@ -622,6 +635,7 @@ pub fn open(
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
         inline_audio: RefCell::new(None),
+        audio_cards: RefCell::new(HashMap::new()),
         media_generation: Cell::new(0),
         loaded: Cell::new(false),
         has_older: Cell::new(false),
@@ -876,6 +890,34 @@ pub fn open(
         ui,
         move |_| ui.load_older_near_top()
     ));
+    ui.scroll.vadjustment().connect_changed(glib::clone!(
+        #[weak]
+        ui,
+        move |adjustment| {
+            // Keep the viewport in place during GTK's first allocation of an older page.
+            // The message anchor corrects changes in individual row heights afterwards.
+            if let Some((upper, value)) = ui.prepend_scroll.take()
+                && adjustment.upper() > upper
+            {
+                adjustment.set_value(value + adjustment.upper() - upper);
+            }
+        }
+    ));
+    let history_scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    history_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    history_scroll.connect_scroll(glib::clone!(
+        #[weak]
+        ui,
+        #[upgrade_or]
+        glib::Propagation::Proceed,
+        move |_, _, dy| {
+            if dy < 0.0 {
+                ui.load_older_near_top();
+            }
+            glib::Propagation::Proceed
+        }
+    ));
+    ui.scroll.add_controller(history_scroll);
     ui.scroll.connect_edge_overshot(glib::clone!(
         #[weak]
         ui,
@@ -2659,8 +2701,7 @@ impl Ui {
             }
         }
         if (name_changed || avatar_changed) && self.selection.get().is_some() {
-            let adjustment = self.scroll.vadjustment();
-            self.render_history_position(false, Some((adjustment.upper(), adjustment.value())));
+            self.render_history(false);
             self.update_send_button();
         }
     }
@@ -3001,6 +3042,9 @@ impl Ui {
         self.latest.set_visible(anchor.is_some());
         self.history_refresh.set(false);
         self.latest_history_pending.set(None);
+        self.older_history_pending.set(false);
+        self.history_scroll.set(None);
+        self.prepend_scroll.set(None);
         self.loaded.set(false);
         self.has_older.set(false);
         self.messages.borrow_mut().clear();
@@ -3213,18 +3257,89 @@ impl Ui {
     }
 
     fn load_older_near_top(self: &Rc<Self>) {
-        if self.adjusting_history.get()
-            || self.history_refresh.get()
-            || !self.has_older.get()
-            || !self.scroll.is_mapped()
+        if self.history_scroll.get().is_some() || !self.has_older.get() || !self.scroll.is_mapped()
         {
             return;
         }
         let adjustment = self.scroll.vadjustment();
-        if adjustment.value() - adjustment.lower() <= 180.0
-            && let Some(before) = self.messages.borrow().first_key_value().map(|(&id, _)| id)
-        {
-            self.load_history(Some(before), false);
+        if adjustment.value() - adjustment.lower() <= 180.0 {
+            if self.history_refresh.get() {
+                self.older_history_pending.set(true);
+            } else {
+                let before = self.messages.borrow().first_key_value().map(|(&id, _)| id);
+                if before.is_some() {
+                    self.load_history(before, false);
+                }
+            }
+        }
+    }
+
+    fn continue_history(self: &Rc<Self>) {
+        if self.history_refresh.get() || self.history_scroll.get().is_some() {
+            return;
+        }
+        if self.older_history_pending.replace(false) {
+            self.load_older_near_top();
+            if self.history_refresh.get() {
+                return;
+            }
+        }
+        if let Some(mark_read) = self.latest_history_pending.take() {
+            self.load_history(
+                None,
+                mark_read && (!self.split.is_collapsed() || self.split.shows_content()),
+            );
+        }
+    }
+
+    fn history_position(&self) -> HistoryScroll {
+        let value = self.scroll.vadjustment().value();
+        let mut child = self.history.first_child();
+        while let Some(widget) = child {
+            if let Some(id) = widget
+                .widget_name()
+                .strip_prefix("message-")
+                .and_then(|id| id.parse().ok())
+                && let Some(bounds) = widget.compute_bounds(&self.history)
+                && f64::from(bounds.y() + bounds.height()) > value
+            {
+                return HistoryScroll::Message {
+                    id,
+                    offset: f64::from(bounds.y()) - value,
+                };
+            }
+            child = widget.next_sibling();
+        }
+        HistoryScroll::Value(value)
+    }
+
+    fn history_at_bottom(&self) -> bool {
+        let adjustment = self.scroll.vadjustment();
+        adjustment.upper() - adjustment.page_size() - adjustment.value() < 36.0
+    }
+
+    fn restore_history_position(&self, position: HistoryScroll) {
+        let adjustment = self.scroll.vadjustment();
+        match position {
+            HistoryScroll::Bottom => adjustment.set_value(adjustment.upper()),
+            HistoryScroll::Value(value) => adjustment.set_value(value),
+            HistoryScroll::Message { id, offset } => {
+                let nearest = || {
+                    let messages = self.messages.borrow();
+                    messages
+                        .range(id..)
+                        .next()
+                        .or_else(|| messages.last_key_value())
+                        .map(|(&id, _)| id)
+                };
+                if let Some(bounds) = self
+                    .message_bubble(id)
+                    .or_else(|| nearest().and_then(|id| self.message_bubble(id)))
+                    .and_then(|widget| widget.compute_bounds(&self.history))
+                {
+                    adjustment.set_value(f64::from(bounds.y()) - offset);
+                }
+            }
         }
     }
 
@@ -3275,6 +3390,23 @@ impl Ui {
                 client.history_revision(id)
             });
         let demo_page = demo.then(|| self.demo_history(id, before, anchor));
+        let visible = if before.is_none()
+            && anchor.is_none()
+            && self.loaded.get()
+            && !self.history_at_bottom()
+        {
+            match self
+                .history_scroll
+                .get()
+                .unwrap_or_else(|| self.history_position())
+            {
+                HistoryScroll::Message { id, .. } => Some(id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let keep_older = revision.can_keep_older(self.history_revision.get());
         let requested_through = self.messages.borrow().last_key_value().map(|(&id, _)| id);
         self.older.set_sensitive(false);
         let has_unread = self
@@ -3286,17 +3418,45 @@ impl Ui {
         self.job(
             async move {
                 if let Some(page) = demo_page {
+                    if before.is_some() {
+                        tokio::time::sleep(Duration::from_millis(180)).await;
+                    }
                     return Ok(page);
                 }
                 let client = client.expect("Telegram history requires a client");
-                if before.is_none()
-                    && let Some(anchor) = anchor
-                {
-                    let (messages, older) = client.history_around(id, anchor).await?;
-                    Ok((messages, older, false))
-                } else {
-                    client.history(id, before, read).await
-                }
+                tokio::time::timeout(Duration::from_secs(25), async {
+                    if before.is_none()
+                        && let Some(anchor) = anchor
+                    {
+                        let (messages, older) = client.history_around(id, anchor).await?;
+                        return Ok((messages, older, false));
+                    }
+                    let (messages, mut older, marked) = client.history(id, before, read).await?;
+                    let needs_more = visible.filter(|visible| {
+                        messages.first().is_some_and(|first| {
+                            *visible < first.id
+                                && (!keep_older || requested_through.is_none_or(|id| id < first.id))
+                        })
+                    });
+                    let Some(visible) = needs_more else {
+                        return Ok((messages, older, marked));
+                    };
+                    // A burst of updates can move the latest page past the loaded range.
+                    // Refill the gap before replacing the part of history being read.
+                    let mut pages = vec![messages];
+                    while let Some(oldest) = pages.last().and_then(|page| page.first())
+                        && older
+                        && oldest.id > visible
+                    {
+                        let (page, has_older, _) =
+                            client.history(id, Some(oldest.id), None).await?;
+                        older = has_older && !page.is_empty();
+                        pages.push(page);
+                    }
+                    Ok((pages.into_iter().rev().flatten().collect(), older, marked))
+                })
+                .await
+                .context("Telegram не прислал историю вовремя")?
             },
             move |ui, result| {
                 if generation != ui.generation.get() {
@@ -3319,25 +3479,29 @@ impl Ui {
                         }
                         drop(recent);
                         let was_loaded = ui.loaded.replace(true);
-                        let adjustment = ui.scroll.vadjustment();
-                        let at_bottom =
-                            adjustment.upper() - adjustment.page_size() - adjustment.value() < 36.0;
-                        let previous_position =
-                            before.map(|_| (adjustment.upper(), adjustment.value()));
+                        let at_bottom = ui.history_at_bottom();
                         let mut current = ui.messages.borrow_mut();
-                        if before.is_some() {
-                            current
-                                .extend(messages.into_iter().map(|message| (message.id, message)));
-                            ui.has_older.set(has_older);
+                        if let Some(before) = before {
+                            if ui.history_scroll.get().is_none() {
+                                let adjustment = ui.scroll.vadjustment();
+                                ui.prepend_scroll
+                                    .set(Some((adjustment.upper(), adjustment.value())));
+                            }
+                            ui.has_older.set(prepend_history_page(
+                                &mut current,
+                                messages,
+                                before,
+                                has_older,
+                            ));
                         } else {
-                            let previous = ui.history_revision.replace(revision);
+                            ui.history_revision.set(revision);
                             if anchor.is_none() {
                                 ui.history_refreshed.set(Some(Instant::now()));
                             }
                             let older_loaded = merge_latest_history(
                                 &mut current,
                                 messages,
-                                has_older && revision.can_keep_older(previous),
+                                has_older && keep_older,
                                 requested_through,
                             );
                             if !older_loaded {
@@ -3345,15 +3509,15 @@ impl Ui {
                             }
                         }
                         drop(current);
-                        ui.render_history_position(
+                        ui.render_history(
                             anchor.is_none() && before.is_none() && (!was_loaded || at_bottom),
-                            previous_position,
                         );
                         if marked && has_unread {
                             ui.refresh_chats();
                         }
                     }
                     Err(error) => {
+                        ui.older_history_pending.set(false);
                         if !ui.loaded.get() {
                             while let Some(child) = ui.history.first_child() {
                                 ui.history.remove(&child);
@@ -3361,29 +3525,32 @@ impl Ui {
                             let message = label("Не удалось загрузить историю", "dim-label");
                             message.set_halign(gtk::Align::Center);
                             ui.history.append(&message);
+                            let retry = gtk::Button::with_label("Повторить загрузку");
+                            retry.set_halign(gtk::Align::Center);
+                            retry.connect_clicked(glib::clone!(
+                                #[weak]
+                                ui,
+                                move |_| ui.load_history(None, true)
+                            ));
+                            ui.history.append(&retry);
                         }
                         ui.toast(&format!("Не удалось загрузить историю. {error}"));
                     }
                 }
-                if let Some(mark_read) = ui.latest_history_pending.replace(None) {
-                    ui.load_history(
-                        None,
-                        mark_read && (!ui.split.is_collapsed() || ui.split.shows_content()),
-                    );
-                }
+                ui.continue_history();
             },
         );
     }
 
     fn render_history(self: &Rc<Self>, bottom: bool) {
-        self.render_history_position(bottom, None);
-    }
-
-    fn render_history_position(
-        self: &Rc<Self>,
-        bottom: bool,
-        previous_position: Option<(f64, f64)>,
-    ) {
+        let position = if bottom {
+            HistoryScroll::Bottom
+        } else {
+            self.history_scroll
+                .get()
+                .unwrap_or_else(|| self.history_position())
+        };
+        self.set_history_position(position);
         if self.inline_audio.borrow().as_ref().is_some_and(|audio| {
             self.messages
                 .borrow()
@@ -3392,7 +3559,7 @@ impl Ui {
         }) {
             self.inline_audio.take();
         }
-        self.adjusting_history.set(true);
+        self.audio_cards.borrow_mut().clear();
         while let Some(child) = self.history.first_child() {
             self.history.remove(&child);
         }
@@ -3578,27 +3745,20 @@ impl Ui {
             bubble.append(&footer);
             self.history.append(&bubble);
             if selected && self.scroll_to_search_result.replace(false) {
-                let weak = bubble.downgrade();
-                let generation = self.generation.get();
-                after_layout(
-                    &self.history,
-                    glib::clone!(
-                        #[weak(rename_to = ui)]
-                        self,
-                        move || {
-                            if ui.generation.get() == generation
-                                && let Some(bubble) = weak.upgrade()
-                                && let Some(bounds) = bubble.compute_bounds(&ui.history)
-                            {
-                                let adjustment = ui.scroll.vadjustment();
-                                adjustment.set_value(
-                                    f64::from(bounds.y()) - adjustment.page_size() / 3.0,
-                                );
-                            }
-                        }
-                    ),
-                );
+                self.history_scroll.set(Some(HistoryScroll::Message {
+                    id: message.id,
+                    offset: self.scroll.vadjustment().page_size() / 3.0,
+                }));
             }
+        }
+    }
+
+    fn set_history_position(self: &Rc<Self>, position: HistoryScroll) {
+        if self.history_scroll.replace(Some(position)).is_some() {
+            return;
+        }
+        if let Some(viewport) = self.history.parent().and_downcast::<gtk::Viewport>() {
+            viewport.set_scroll_to_focus(false);
         }
         let adjustment = self.scroll.vadjustment();
         let generation = self.generation.get();
@@ -3609,15 +3769,22 @@ impl Ui {
                 self,
                 move || {
                     if ui.generation.get() == generation {
-                        if bottom {
-                            adjustment.set_value(adjustment.upper());
-                        } else if let Some((old_height, old_position)) = previous_position {
-                            adjustment.set_value(old_position + adjustment.upper() - old_height);
+                        ui.prepend_scroll.set(None);
+                        if let Some(position) = ui.history_scroll.get() {
+                            ui.restore_history_position(position);
                         }
-                        ui.adjusting_history.set(false);
+                        ui.history_scroll.set(None);
+                        if let Some(viewport) = ui.history.parent().and_downcast::<gtk::Viewport>()
+                        {
+                            viewport.set_scroll_to_focus(true);
+                            // GTK can consume an allocation queued by the adjustment during the
+                            // current layout. Apply the final offset even if the value is unchanged.
+                            viewport.queue_allocate();
+                        }
                         if adjustment.upper() - adjustment.page_size() <= adjustment.lower() {
-                            ui.load_older_near_top();
+                            ui.older_history_pending.set(true);
                         }
+                        ui.continue_history();
                     }
                 }
             ),
@@ -3684,14 +3851,12 @@ impl Ui {
         let id = message.id;
         let playback = message.playback.filter(|_| !message.ephemeral);
         if let Some(media @ (PlayableMedia::Audio | PlayableMedia::Voice)) = playback {
-            let (content, cover) = crate::audio::content(
+            let (card, content, cover) = crate::audio::AudioCard::new(
                 media,
                 message.audio.as_ref().unwrap_or(&Default::default()),
                 message.attachment.as_deref(),
+                media == PlayableMedia::Audio && message.thumbnail.is_some(),
             );
-            let play = gtk::Image::from_icon_name("media-playback-start-symbolic");
-            play.set_valign(gtk::Align::Center);
-            content.append(&play);
             if media == PlayableMedia::Audio
                 && let Some(thumbnail) = message.thumbnail
             {
@@ -3704,26 +3869,32 @@ impl Ui {
                     ),
                 );
             }
-            let button = gtk::Button::builder().child(&content).build();
-            button.add_css_class("flat");
-            button.add_css_class("audio-attachment");
-            button.update_property(&[gtk::accessible::Property::Label(media.open_label())]);
-            button.connect_clicked(glib::clone!(
+            card.connect_play(glib::clone!(
                 #[weak(rename_to = ui)]
                 self,
-                move |_| ui.open_playback(chat, id, media)
+                move || ui.open_playback(chat, id, media)
             ));
-            let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            card.set_widget_name(&format!("attachment-{id}"));
-            card.append(&button);
+            card.connect_seek(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move |fraction| {
+                    if let Some(audio) = ui.inline_audio.borrow().as_ref()
+                        && audio.chat == chat
+                        && audio.id == id
+                    {
+                        audio.player.seek(fraction);
+                    }
+                }
+            ));
+            content.set_widget_name(&format!("attachment-{id}"));
             if let Some(audio) = self.inline_audio.borrow().as_ref()
                 && audio.chat == chat
                 && audio.id == id
             {
-                audio.player.detach();
-                card.append(&audio.player.widget);
+                audio.player.attach(card.clone());
             }
-            return Some(card.upcast());
+            self.audio_cards.borrow_mut().insert(id, card);
+            return Some(content.upcast());
         }
         let visual = message.photo_preview || matches!(playback, Some(PlayableMedia::Video { .. }));
         let preview = gtk::Stack::new();
@@ -3769,7 +3940,17 @@ impl Ui {
                     picture,
                     #[weak]
                     preview,
+                    #[weak(rename_to = ui)]
+                    self,
                     move |texture: &gtk::gdk::Texture| {
+                        if preview.is_mapped() && ui.history_scroll.get().is_none() {
+                            let position = if ui.history_at_bottom() {
+                                HistoryScroll::Bottom
+                            } else {
+                                ui.history_position()
+                            };
+                            ui.set_history_position(position);
+                        }
                         let scale = if in_album && message_photo { 2 } else { 1 };
                         picture.set_size_request(
                             (texture.width() / scale).max(1),
@@ -4486,8 +4667,7 @@ impl Ui {
     }
 
     fn render_poll_change(self: &Rc<Self>) {
-        let adjustment = self.scroll.vadjustment();
-        self.render_history_position(false, Some((adjustment.upper(), adjustment.value())));
+        self.render_history(false);
     }
 
     fn send_message(self: &Rc<Self>) {
@@ -5199,11 +5379,18 @@ impl Ui {
             if self.selection.get() != Some(chat) {
                 return;
             }
-            if let Some(audio) = self.inline_audio.borrow().as_ref()
-                && audio.chat == chat
-                && audio.id == id
-            {
-                audio.player.toggle();
+            let active = self
+                .inline_audio
+                .borrow()
+                .as_ref()
+                .filter(|audio| audio.chat == chat && audio.id == id)
+                .map(|audio| audio.player.clone());
+            if let Some(player) = active {
+                if player.is_loading() {
+                    self.inline_audio.take();
+                } else {
+                    player.toggle();
+                }
                 return;
             }
         }
@@ -5230,14 +5417,10 @@ impl Ui {
             }),
         };
         if matches!(media, PlayableMedia::Audio | PlayableMedia::Voice) {
-            let player = crate::audio::InlinePlayer::open(context);
-            if let Some(card) = self
-                .message_bubble(id)
-                .and_then(|bubble| named_child(&bubble, &format!("attachment-{id}")))
-                .and_downcast::<gtk::Box>()
-            {
-                card.append(&player.widget);
-            }
+            let Some(card) = self.audio_cards.borrow().get(&id).cloned() else {
+                return;
+            };
+            let player = crate::audio::InlinePlayer::open(context, card, self.toasts.clone());
             self.inline_audio.replace(Some(InlineAudio {
                 chat,
                 id,

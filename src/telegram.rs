@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -79,6 +79,12 @@ async fn initial_login_state(
     }
 }
 
+#[derive(Clone)]
+struct ChatAuthor {
+    name: String,
+    avatar: Option<Avatar>,
+}
+
 pub struct Telegram {
     client: Client,
     session: Arc<SqliteSession>,
@@ -89,6 +95,7 @@ pub struct Telegram {
     api_hash: Option<String>,
     state: Mutex<LoginState>,
     peers: RwLock<HashMap<i64, PeerRef>>,
+    chat_authors: StdMutex<HashMap<PeerId, ChatAuthor>>,
     changes: watch::Sender<UpdateStatus>,
     history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
@@ -178,6 +185,7 @@ impl Telegram {
                 api_hash,
                 state: Mutex::new(state),
                 peers: RwLock::new(HashMap::new()),
+                chat_authors: StdMutex::new(HashMap::new()),
                 changes,
                 history_changes: StdMutex::default(),
                 image_downloads: Semaphore::new(4),
@@ -634,6 +642,7 @@ impl Telegram {
             let group = matches!(peer, Peer::Group(_) | Peer::Community(_));
             let last = dialog.last_message.as_ref();
             let kind = chat_kind(peer);
+            self.remember_chat_author(peer);
             let enums::PeerNotifySettings::Settings(settings) = &raw.notify_settings;
             let mute_until = match settings.mute_until {
                 Some(until) => until,
@@ -660,7 +669,11 @@ impl Telegram {
                     })
                     .unwrap_or_default(),
                 preview_sender: if group {
-                    last.and_then(|message| preview_sender(message, profile))
+                    last.filter(|message| message.action().is_none())
+                        .and_then(|message| {
+                            self.message_author(message, profile)
+                                .map(|author| author.name)
+                        })
                 } else {
                     None
                 },
@@ -1314,6 +1327,7 @@ impl Telegram {
                 continue;
             };
             self.peers.write().await.insert(id, peer_ref);
+            self.remember_chat_author(peer);
             buffer.push(SearchHit {
                 chat: Chat {
                     id,
@@ -1342,7 +1356,7 @@ impl Telegram {
                     kind: chat_kind(peer),
                     muted: false,
                 },
-                message: message_view(message, self_id, profile),
+                message: self.message_view(message, self_id, profile),
             });
             pending.take();
         }
@@ -1359,41 +1373,171 @@ impl Telegram {
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
         let profile = profile.as_deref();
-        let mut iter = self
-            .client
-            .iter_messages(peer)
-            .limit(HISTORY_PAGE_SIZE + MAX_ALBUM_ITEMS);
+        let mut iter = self.client.iter_messages(peer);
         if let Some(before) = before {
             iter = iter.offset_id(before);
         }
-        let mut result = Vec::new();
-        let newest = iter.next().await?;
-        if let Some(message) = &newest {
-            result.push(message_view(message, self_id, profile));
-        }
+        let mut page: Vec<TelegramMessage> = Vec::new();
         let mut has_older = false;
+        let mut cursor = before;
         while let Some(message) = iter.next().await? {
-            // Keep the album at the pagination boundary together.
-            if result.len() >= HISTORY_PAGE_SIZE
-                && (message.grouped_id().is_none()
-                    || result.last().and_then(|item| item.album) != message.grouped_id())
+            if matches!(message.raw, enums::Message::Empty(_))
+                || cursor.is_some_and(|id| message.id() >= id)
+            {
+                continue;
+            }
+            cursor = Some(message.id());
+            // Read one message past the page and keep its boundary album together.
+            let album = message.grouped_id();
+            if page.len() >= HISTORY_PAGE_SIZE
+                && (album.is_none()
+                    || page.last().and_then(TelegramMessage::grouped_id) != album
+                    || page.len() >= HISTORY_PAGE_SIZE + MAX_ALBUM_ITEMS - 1)
             {
                 has_older = true;
                 break;
             }
-            result.push(message_view(&message, self_id, profile));
+            page.push(message);
         }
         let marked = if let Some(read) = read {
-            self.mark_read_through(id, newest.as_ref().map_or(0, |message| message.id()), read)
+            self.mark_read_through(id, page.first().map_or(0, TelegramMessage::id), read)
                 .await
                 .unwrap_or(false)
         } else {
             false
         };
-        result.reverse();
+        self.resolve_chat_authors(peer, page.iter()).await;
+        let mut result: Vec<_> = page
+            .iter()
+            .rev()
+            .map(|message| self.message_view(message, self_id, profile))
+            .collect();
         self.load_reply_previews(peer, &mut result, self_id, profile)
             .await;
         Ok((result, has_older, marked))
+    }
+
+    fn message_author(
+        &self,
+        message: &TelegramMessage,
+        profile: Option<&Peer>,
+    ) -> Option<ChatAuthor> {
+        if let Some(id) = message_chat_author(message) {
+            return incoming_author_peer(message, id)
+                .and_then(peer_author)
+                .or_else(|| self.chat_authors.lock().unwrap().get(&id).cloned());
+        }
+        let sender = message.sender_id();
+        let own = profile.filter(|profile| {
+            sender == Some(profile.id())
+                || sender == Some(PeerId::self_user())
+                || (sender.is_none() && message.outgoing())
+        });
+        own.or_else(|| message.sender()).and_then(peer_author)
+    }
+
+    fn message_view(
+        &self,
+        message: &TelegramMessage,
+        self_id: Option<PeerId>,
+        profile: Option<&Peer>,
+    ) -> Message {
+        let chat_author = message_chat_author(message);
+        let author = self.message_author(message, profile);
+        message_view(message, self_id, profile, chat_author, author)
+    }
+
+    fn remember_chat_author(&self, peer: &Peer) {
+        if peer.id().kind() != PeerKind::User
+            && let Some(author) = peer_author(peer)
+        {
+            self.chat_authors.lock().unwrap().insert(peer.id(), author);
+        }
+    }
+
+    async fn resolve_chat_authors<'a>(
+        &self,
+        peer: PeerRef,
+        messages: impl IntoIterator<Item = &'a TelegramMessage>,
+    ) {
+        let mut channels = HashMap::new();
+        let mut groups = HashSet::new();
+        {
+            let mut authors = self.chat_authors.lock().unwrap();
+            for message in messages {
+                let Some(id) = message_chat_author(message) else {
+                    continue;
+                };
+                if let Some(author) = incoming_author_peer(message, id).and_then(peer_author) {
+                    authors.insert(id, author);
+                    continue;
+                }
+                if authors.contains_key(&id) {
+                    continue;
+                }
+                let Some(bare_id) = id.bare_id() else {
+                    continue;
+                };
+                match id.kind() {
+                    PeerKind::Channel => {
+                        channels.entry(id).or_insert_with(|| {
+                            if id == peer.id {
+                                peer.into()
+                            } else {
+                                types::InputChannelFromMessage {
+                                    peer: peer.into(),
+                                    msg_id: message.id(),
+                                    channel_id: bare_id,
+                                }
+                                .into()
+                            }
+                        });
+                    }
+                    PeerKind::Chat => {
+                        groups.insert(bare_id);
+                    }
+                    PeerKind::User => {}
+                }
+            }
+            channels.retain(|id, _| !authors.contains_key(id));
+            groups.retain(|id| PeerId::chat(*id).is_some_and(|id| !authors.contains_key(&id)));
+        }
+        if !channels.is_empty() {
+            let channels = grammers_client::tl::functions::channels::GetChannels {
+                id: channels.into_values().collect(),
+            };
+            if let Ok(Ok(chats)) =
+                tokio::time::timeout(Duration::from_secs(2), self.client.invoke(&channels)).await
+            {
+                self.remember_chat_authors(chats).await;
+            }
+        }
+        if !groups.is_empty() {
+            let groups = grammers_client::tl::functions::messages::GetChats {
+                id: groups.into_iter().collect(),
+            };
+            if let Ok(Ok(chats)) =
+                tokio::time::timeout(Duration::from_secs(2), self.client.invoke(&groups)).await
+            {
+                self.remember_chat_authors(chats).await;
+            }
+        }
+    }
+
+    async fn remember_chat_authors(&self, chats: enums::messages::Chats) {
+        let chats = match chats {
+            enums::messages::Chats::Chats(chats) => chats.chats,
+            enums::messages::Chats::Slice(chats) => chats.chats,
+        };
+        for chat in chats {
+            let peer = Peer::from_raw(&self.client, chat);
+            self.remember_chat_author(&peer);
+            if let Some(id) = peer.id().bot_api_dialog_id()
+                && let Ok(Some(reference)) = peer.to_ref().await
+            {
+                self.peers.write().await.insert(id, reference);
+            }
+        }
     }
 
     pub fn read_revision(&self, chat: i64) -> u64 {
@@ -1508,7 +1652,7 @@ impl Telegram {
             .await?
             .context("Сообщение больше недоступно")?;
         let (mut messages, older, _) = self.history(chat, Some(anchor), None).await?;
-        messages.push(message_view(&original, self_id, profile));
+        let mut additional = vec![original];
         let mut newer = self
             .client
             .iter_messages(peer)
@@ -1517,9 +1661,15 @@ impl Telegram {
             .limit(HISTORY_PAGE_SIZE / 2);
         while let Some(message) = newer.next().await? {
             if message.id() > anchor {
-                messages.push(message_view(&message, self_id, profile));
+                additional.push(message);
             }
         }
+        self.resolve_chat_authors(peer, additional.iter()).await;
+        messages.extend(
+            additional
+                .iter()
+                .map(|message| self.message_view(message, self_id, profile)),
+        );
         self.load_reply_previews(peer, &mut messages, self_id, profile)
             .await;
         Ok((messages, older))
@@ -1550,10 +1700,12 @@ impl Telegram {
         else {
             return;
         };
+        self.resolve_chat_authors(peer, originals.iter().flatten())
+            .await;
         let previews: HashMap<_, _> = originals.into_iter().flatten()
             .filter(|message| matches!(&message.raw, enums::Message::Message(raw) if raw.ttl_period.is_none()))
             .map(|message| {
-                let original = message_view(&message, self_id, profile);
+                let original = self.message_view(&message, self_id, profile);
                 (original.id, original.reply_preview())
             }).collect();
         for message in messages {
@@ -1562,6 +1714,7 @@ impl Telegram {
                     .reply_preview
                     .get_or_insert_with(|| original.clone());
                 preview.sender.clone_from(&original.sender);
+                preview.self_authored = original.self_authored;
             }
         }
     }
@@ -1607,7 +1760,7 @@ impl Telegram {
             return Ok(messages
                 .into_iter()
                 .flatten()
-                .map(|message| message_view(&message, self_id, profile))
+                .map(|message| self.message_view(&message, self_id, profile))
                 .collect());
         }
 
@@ -1624,7 +1777,7 @@ impl Telegram {
             };
         }
         let message = self.client.send_message(peer, message).await?;
-        Ok(vec![message_view(&message, self_id, profile)])
+        Ok(vec![self.message_view(&message, self_id, profile)])
     }
 
     pub async fn send_poll(
@@ -1686,7 +1839,11 @@ impl Telegram {
             .send_message(peer, InputMessage::new().media(media).random_id(random_id))
             .await;
         match message {
-            Ok(message) => Ok(Some(message_view(&message, self_id, profile.as_deref()))),
+            Ok(message) => Ok(Some(self.message_view(
+                &message,
+                self_id,
+                profile.as_deref(),
+            ))),
             Err(error) if error.is("RANDOM_ID_DUPLICATE") => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -2123,7 +2280,7 @@ impl Telegram {
             .next()
             .flatten()
             .context("Telegram не вернул пересланное сообщение")?;
-        Ok(message_view(&message, self_id, profile))
+        Ok(self.message_view(&message, self_id, profile))
     }
 
     async fn message_by_id(&self, peer: PeerRef, id: i32) -> Result<Option<TelegramMessage>> {
@@ -2608,6 +2765,8 @@ fn message_view(
     message: &TelegramMessage,
     self_id: Option<PeerId>,
     profile: Option<&Peer>,
+    chat_author: Option<PeerId>,
+    author: Option<ChatAuthor>,
 ) -> Message {
     let outgoing = message.outgoing();
     let attachment = attachment(message);
@@ -2649,20 +2808,34 @@ fn message_view(
     };
     Message {
         id: message.id(),
-        sender: author_name(message, profile).unwrap_or_else(|| {
-            if outgoing {
-                "Вы"
-            } else {
-                "Сообщение"
-            }
-            .to_owned()
-        }),
-        sender_avatar: author_peer(message, profile).and_then(peer_avatar),
-        self_authored: matches!(message.sender(), Some(Peer::User(user)) if user.is_self())
-            || message
-                .sender_id()
-                .is_some_and(|id| Some(id) == self_id || profile.is_some_and(|own| own.id() == id))
-            || (outgoing && !message.post() && message.sender_id().is_none()),
+        sender: author
+            .as_ref()
+            .map(|author| author.name.clone())
+            .unwrap_or_else(|| {
+                if let Some(author) = chat_author {
+                    if author.kind() == PeerKind::Chat
+                        || (!message.post() && author == message.peer_id())
+                    {
+                        "Группа"
+                    } else {
+                        "Канал"
+                    }
+                } else if outgoing {
+                    "Вы"
+                } else {
+                    "Сообщение"
+                }
+                .to_owned()
+            }),
+        sender_avatar: author.and_then(|author| author.avatar),
+        self_authored: chat_author.is_none()
+            && (matches!(message.sender(), Some(Peer::User(user)) if user.is_self())
+                || message.sender_id().is_some_and(|id| {
+                    id == PeerId::self_user()
+                        || Some(id) == self_id
+                        || profile.is_some_and(|own| own.id() == id)
+                })
+                || (outgoing && !message.post() && message.sender_id().is_none())),
         timestamp: message.date().as_second(),
         text: if attachment.is_some() || poll.is_some() {
             message.text().to_owned()
@@ -2804,40 +2977,44 @@ fn poll_update(raw: &types::UpdateMessagePoll) -> PollUpdate {
     update
 }
 
-fn author_peer<'a>(message: &'a TelegramMessage, profile: Option<&'a Peer>) -> Option<&'a Peer> {
-    if let Some(profile) = profile
-        && (message.sender_id() == Some(profile.id())
-            || matches!(message.sender(), Some(Peer::User(user)) if user.is_self()))
-    {
-        return Some(profile);
+fn chat_author_id(
+    sender: Option<PeerId>,
+    destination: PeerId,
+    post: bool,
+    outgoing: bool,
+) -> Option<PeerId> {
+    match sender {
+        Some(id) if id.kind() != PeerKind::User => Some(id),
+        None if destination.kind() != PeerKind::User && (post || !outgoing) => Some(destination),
+        _ => None,
     }
-    message.sender().or_else(|| {
-        let sender = message.sender_id();
-        if sender == Some(message.peer_id()) || (sender.is_none() && message.post()) {
-            message.peer()
-        } else if message.outgoing() && sender.is_none_or(|id| id.kind() == PeerKind::User) {
-            profile
-        } else {
-            None
-        }
+}
+
+fn message_chat_author(message: &TelegramMessage) -> Option<PeerId> {
+    chat_author_id(
+        message.sender_id(),
+        message.peer_id(),
+        message.post(),
+        message.outgoing(),
+    )
+}
+
+fn incoming_author_peer(message: &TelegramMessage, id: PeerId) -> Option<&Peer> {
+    message
+        .sender()
+        .filter(|peer| peer.id() == id)
+        .or_else(|| message.peer().filter(|peer| peer.id() == id))
+}
+
+fn peer_author(peer: &Peer) -> Option<ChatAuthor> {
+    let name = match peer {
+        Peer::User(user) => user.full_name(),
+        peer => peer.name()?.to_owned(),
+    };
+    (!name.trim().is_empty()).then(|| ChatAuthor {
+        name,
+        avatar: peer_avatar(peer),
     })
-}
-
-fn author_name(message: &TelegramMessage, profile: Option<&Peer>) -> Option<String> {
-    match author_peer(message, profile)? {
-        Peer::User(user) => Some(user.full_name()).filter(|name| !name.is_empty()),
-        peer => peer
-            .name()
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned),
-    }
-}
-
-fn preview_sender(message: &TelegramMessage, profile: Option<&Peer>) -> Option<String> {
-    if message.action().is_some() {
-        return None;
-    }
-    author_name(message, profile)
 }
 
 fn can_delete(message: &TelegramMessage, self_id: Option<PeerId>) -> bool {
@@ -3247,6 +3424,29 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_authorship_distinguishes_destination_from_explicit_sender() {
+        let member = PeerId::user(5).unwrap();
+        let group = PeerId::chat(7).unwrap();
+        let channel = PeerId::channel(11).unwrap();
+        let megagroup = PeerId::channel(13).unwrap();
+
+        assert_eq!(
+            chat_author_id(Some(channel), megagroup, false, false),
+            Some(channel)
+        );
+        assert_eq!(
+            chat_author_id(Some(megagroup), megagroup, false, true),
+            Some(megagroup)
+        );
+        assert_eq!(chat_author_id(None, channel, true, false), Some(channel));
+        assert_eq!(chat_author_id(None, group, false, false), Some(group));
+        assert_eq!(chat_author_id(Some(member), group, false, false), None);
+        assert_eq!(chat_author_id(Some(member), channel, true, false), None);
+        assert_eq!(chat_author_id(None, group, false, true), None);
+        assert_eq!(chat_author_id(None, member, false, false), None);
+    }
     use grammers_client::sender::RpcError;
 
     #[test]
