@@ -3777,6 +3777,9 @@ impl Ui {
                         if let Some(viewport) = ui.history.parent().and_downcast::<gtk::Viewport>()
                         {
                             viewport.set_scroll_to_focus(true);
+                            // GTK can consume an allocation queued by the adjustment during the
+                            // current layout. Apply the final offset even if the value is unchanged.
+                            viewport.queue_allocate();
                         }
                         if adjustment.upper() - adjustment.page_size() <= adjustment.lower() {
                             ui.older_history_pending.set(true);
