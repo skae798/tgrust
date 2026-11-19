@@ -91,3 +91,14 @@
   padding: 4px 8px 4px 4px;
   border-radius: 8px;
 }
+
+scale.audio-position {
+  min-height: 16px;
+  padding: 0;
+}
+
+scale.waveform-position trough,
+scale.waveform-position highlight,
+scale.waveform-position slider {
+  opacity: 0;
+}

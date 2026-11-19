@@ -1134,6 +1134,22 @@ pub fn merge_latest_history(
     older_loaded
 }
 
+pub fn prepend_history_page(
+    current: &mut BTreeMap<i32, Message>,
+    earlier: Vec<Message>,
+    before: i32,
+    has_older: bool,
+) -> bool {
+    let mut advanced = false;
+    for message in earlier.into_iter().filter(|message| message.id < before) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = current.entry(message.id) {
+            entry.insert(message);
+            advanced = true;
+        }
+    }
+    has_older && advanced
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1521,6 +1537,24 @@ mod tests {
             Some(7),
         ));
         assert_eq!(current.into_keys().collect::<Vec<_>>(), [50, 51]);
+    }
+
+    #[test]
+    fn older_page_advances_only_when_new_messages_precede_the_cursor() {
+        let mut current = history(&[12, 15, 16]);
+        assert!(prepend_history_page(
+            &mut current,
+            messages(&[5, 6, 6, 12, 16]),
+            12,
+            true,
+        ));
+        assert!(!prepend_history_page(
+            &mut current,
+            messages(&[5, 6, 12]),
+            5,
+            true,
+        ));
+        assert_eq!(current.into_keys().collect::<Vec<_>>(), [5, 6, 12, 15, 16]);
     }
 
     #[test]

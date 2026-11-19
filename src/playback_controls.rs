@@ -197,7 +197,7 @@ impl std::ops::Deref for PlaybackControls {
     }
 }
 
-fn time_label(microseconds: i64) -> String {
+pub(crate) fn time_label(microseconds: i64) -> String {
     let seconds = microseconds / 1_000_000;
     if seconds >= 3600 {
         format!(

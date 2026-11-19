@@ -375,11 +375,27 @@ pub fn history(chat: i64) -> Vec<Message> {
     if chat == 1 {
         let sample = messages[0].clone();
         let day = 24 * 60 * 60;
-        let older = (1..=80).map(|id| Message {
-            id,
-            timestamp: today - 2 * day + i64::from(id) * 60,
-            text: format!("Заметка о проекте № {id}"),
-            ..sample.clone()
+        let older = (1..=80).map(|id| {
+            let mut message = Message {
+                id,
+                timestamp: today - 2 * day + i64::from(id) * 60,
+                text: format!("Заметка о проекте № {id}"),
+                ..sample.clone()
+            };
+            if id == 75 {
+                message.sender = "Дизайн-команда".into();
+                message.text = "Сообщение от имени группы".into();
+                message.outgoing = true;
+            } else if id == 76 {
+                message.sender = "Новости проекта".into();
+                message.sender_avatar = Some(Avatar {
+                    peer: 3,
+                    photo: 3,
+                    dc: 0,
+                });
+                message.text = "Сообщение от имени канала".into();
+            }
+            message
         });
         messages.splice(..0, older);
     }
