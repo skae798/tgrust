@@ -1,6 +1,7 @@
 mod accounts;
 mod audio;
 mod blocked;
+mod chat_management;
 mod contacts;
 mod demo;
 mod devices;

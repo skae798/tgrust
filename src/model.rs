@@ -351,6 +351,97 @@ pub struct PeerProfile {
     pub verified: bool,
     pub scam: bool,
     pub fake: bool,
+    pub can_edit_chat: bool,
+    pub can_view_members: bool,
+    pub bot_commands: Vec<BotCommand>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatInfo {
+    pub title: String,
+    pub about: String,
+}
+
+impl ChatInfo {
+    pub fn changes(
+        &self,
+        original: &Self,
+        current: &Self,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        let title = self.title.trim();
+        anyhow::ensure!(
+            !title.is_empty() && !title.contains(['\r', '\n']),
+            "Введите название чата"
+        );
+        let field = |proposed: &str, before: &str, now: &str| {
+            if proposed == before || proposed == now {
+                Ok(None)
+            } else if before == now {
+                Ok(Some(proposed.to_owned()))
+            } else {
+                anyhow::bail!("Данные чата изменились. Откройте редактор снова")
+            }
+        };
+        Ok((
+            field(title, &original.title, &current.title)?,
+            field(&self.about, &original.about, &current.about)?,
+        ))
+    }
+}
+
+impl PeerProfile {
+    pub fn chat_info(&self) -> ChatInfo {
+        ChatInfo {
+            title: self.title.clone(),
+            about: self.about.clone(),
+        }
+    }
+}
+
+pub const MEMBER_PAGE_SIZE: i32 = 40;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemberFilter {
+    All,
+    Admins,
+    Bots,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MemberRole {
+    Owner,
+    Administrator,
+    Member,
+}
+
+#[derive(Clone)]
+pub struct ChatMember {
+    pub id: i64,
+    pub name: String,
+    pub avatar: Option<Avatar>,
+    pub role: MemberRole,
+    pub bot: bool,
+}
+
+impl MemberFilter {
+    pub fn includes(self, member: &ChatMember) -> bool {
+        match self {
+            Self::All => true,
+            Self::Admins => member.role != MemberRole::Member,
+            Self::Bots => member.bot,
+        }
+    }
+}
+
+pub struct MemberPage {
+    pub members: Vec<ChatMember>,
+    pub next: Option<i32>,
+}
+
+#[derive(Clone)]
+pub struct BotCommand {
+    pub name: String,
+    pub description: String,
 }
 
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -1170,6 +1261,39 @@ pub fn prepend_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_info_retry_skips_a_confirmed_title_and_preserves_unedited_fields() {
+        let original = ChatInfo {
+            title: "Старое".into(),
+            about: "Первое".into(),
+        };
+        let proposed = ChatInfo {
+            title: " Новое ".into(),
+            about: "Второе".into(),
+        };
+        let partial = ChatInfo {
+            title: "Новое".into(),
+            about: "Первое".into(),
+        };
+        assert_eq!(
+            proposed.changes(&original, &partial).unwrap(),
+            (None, Some("Второе".into()))
+        );
+        let conflicting = ChatInfo {
+            about: "Третье".into(),
+            ..partial
+        };
+        assert!(proposed.changes(&original, &conflicting).is_err());
+        let rename_only = ChatInfo {
+            about: original.about.clone(),
+            ..proposed
+        };
+        assert_eq!(
+            rename_only.changes(&original, &conflicting).unwrap(),
+            (None, None)
+        );
+    }
 
     #[test]
     fn confirmed_device_changes_preserve_current_identity_and_change_only_acknowledged_fields() {

@@ -32,7 +32,10 @@ use crate::model::{
     SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
     UploadKind, redact_spoilers,
 };
-use crate::model::{AudioInfo, TextLink};
+use crate::model::{
+    AudioInfo, BotCommand, ChatInfo, ChatMember, MEMBER_PAGE_SIZE, MemberFilter, MemberPage,
+    MemberRole, TextLink,
+};
 use crate::session_runner::SessionRunner;
 use crate::storage::{
     PendingSave, PlaybackDownload, SessionRemoval, attachment_name, open_session_file,
@@ -792,10 +795,48 @@ impl Telegram {
             if !matches!(&peer, Peer::User(user) if user.deleted()) {
                 profile.about = full.about.unwrap_or_default();
                 profile.blocked = (!profile.is_self).then_some(full.blocked);
+                if profile.kind == ChatKind::Bot {
+                    profile.bot_commands = bot_commands(full.id, full.bot_info);
+                }
             }
             ensure!(profile.id == id, "Telegram вернул другой профиль");
             return Ok(profile);
         }
+        let result = self.full_chat(reference).await?;
+        let peer = result
+            .chats
+            .into_iter()
+            .map(|chat| Peer::from_raw(&self.client, chat))
+            .find(|peer| peer.id() == reference.id)
+            .context("Информация о чате недоступна")?;
+        let mut profile = peer_profile_view(&peer)?;
+        match result.full_chat {
+            enums::ChatFull::Full(full) => {
+                profile.about = full.about;
+                if let enums::ChatParticipants::Participants(participants) = full.participants {
+                    profile.can_view_members = true;
+                    profile.members = u32::try_from(participants.participants.len()).ok();
+                }
+            }
+            enums::ChatFull::ChannelFull(full) => {
+                profile.about = full.about;
+                profile.can_view_members = full.can_view_participants;
+                profile.blocked = (profile.kind == ChatKind::Broadcast).then_some(full.blocked);
+                profile.members = full
+                    .participants_count
+                    .and_then(|count| u32::try_from(count).ok())
+                    .or(profile.members);
+                profile.online_members = full
+                    .online_count
+                    .and_then(|count| u32::try_from(count).ok());
+            }
+            enums::ChatFull::CommunityFull(full) => profile.about = full.about,
+        }
+        ensure!(profile.id == id, "Telegram вернул другой чат");
+        Ok(profile)
+    }
+
+    async fn full_chat(&self, reference: PeerRef) -> Result<types::messages::ChatFull> {
         let enums::messages::ChatFull::Full(result) = match reference.id.kind() {
             PeerKind::Chat => {
                 self.client
@@ -811,41 +852,190 @@ impl Telegram {
                     })
                     .await?
             }
-            PeerKind::User => unreachable!(),
+            PeerKind::User => bail!("У пользователя нет списка участников"),
         };
         ensure!(
             Some(result.full_chat.id()) == reference.id.bare_id(),
             "Telegram вернул другой чат"
         );
-        let peer = result
-            .chats
-            .into_iter()
-            .map(|chat| Peer::from_raw(&self.client, chat))
-            .find(|peer| peer.id() == reference.id)
-            .context("Информация о чате недоступна")?;
-        let mut profile = peer_profile_view(&peer)?;
-        match result.full_chat {
-            enums::ChatFull::Full(full) => {
-                profile.about = full.about;
-                if let enums::ChatParticipants::Participants(participants) = full.participants {
-                    profile.members = u32::try_from(participants.participants.len()).ok();
+        Ok(result)
+    }
+
+    pub async fn edit_chat_info(
+        &self,
+        id: i64,
+        original: ChatInfo,
+        proposed: ChatInfo,
+    ) -> Result<ChatInfo> {
+        let _serial = self.dialog_settings.lock().await;
+        let profile = self.peer_profile(id).await?;
+        ensure!(
+            profile.can_edit_chat,
+            "Telegram не разрешает менять данные этого чата"
+        );
+        let reference = self.peer(id).await?;
+        let mut current = profile.chat_info();
+        let (title, about) = proposed.changes(&original, &current)?;
+        if let Some(title) = title {
+            let result = match reference.id.kind() {
+                PeerKind::Chat => {
+                    self.client
+                        .invoke(&grammers_client::tl::functions::messages::EditChatTitle {
+                            chat_id: reference.id.bare_id().context("Чат не найден")?,
+                            title: title.clone(),
+                        })
+                        .await
                 }
+                PeerKind::Channel => {
+                    self.client
+                        .invoke(&grammers_client::tl::functions::channels::EditTitle {
+                            channel: reference.into(),
+                            title: title.clone(),
+                        })
+                        .await
+                }
+                PeerKind::User => bail!("Нельзя менять название собеседника"),
+            };
+            if let Err(error) = result
+                && !error.is("CHAT_NOT_MODIFIED")
+            {
+                return Err(error.into());
             }
-            enums::ChatFull::ChannelFull(full) => {
-                profile.about = full.about;
-                profile.blocked = (profile.kind == ChatKind::Broadcast).then_some(full.blocked);
-                profile.members = full
-                    .participants_count
-                    .and_then(|count| u32::try_from(count).ok())
-                    .or(profile.members);
-                profile.online_members = full
-                    .online_count
-                    .and_then(|count| u32::try_from(count).ok());
-            }
-            enums::ChatFull::CommunityFull(full) => profile.about = full.about,
+            current.title = title;
+            self.invalidate_history(Some(id), false);
+            self.invalidate_views();
         }
-        ensure!(profile.id == id, "Telegram вернул другой чат");
-        Ok(profile)
+        if let Some(about) = about {
+            let result = self
+                .client
+                .invoke(&grammers_client::tl::functions::messages::EditChatAbout {
+                    peer: reference.into(),
+                    about: about.clone(),
+                })
+                .await;
+            match result {
+                Ok(true) => {}
+                Err(error)
+                    if error.is("CHAT_ABOUT_NOT_MODIFIED") || error.is("CHAT_NOT_MODIFIED") => {}
+                Ok(false) => bail!("Telegram не подтвердил изменение описания"),
+                Err(error) => return Err(error.into()),
+            }
+            current.about = about;
+            self.invalidate_views();
+        }
+        Ok(current)
+    }
+
+    pub async fn chat_members(
+        &self,
+        id: i64,
+        filter: MemberFilter,
+        offset: i32,
+    ) -> Result<MemberPage> {
+        ensure!(offset >= 0, "Неверная страница списка участников");
+        let reference = self.peer(id).await?;
+        match reference.id.kind() {
+            PeerKind::Chat => {
+                let result = self.full_chat(reference).await?;
+                let enums::ChatFull::Full(full) = result.full_chat else {
+                    bail!("Профиль группы изменился")
+                };
+                let enums::ChatParticipants::Participants(participants) = full.participants else {
+                    bail!("Telegram ограничил доступ к списку участников")
+                };
+                let roles = participants.participants.into_iter().map(|participant| {
+                    let role = match participant {
+                        enums::ChatParticipant::Creator(_) => MemberRole::Owner,
+                        enums::ChatParticipant::Admin(_) => MemberRole::Administrator,
+                        enums::ChatParticipant::Participant(_) => MemberRole::Member,
+                    };
+                    (participant.user_id(), role)
+                });
+                let mut members = self.member_views(result.users, roles, filter).await;
+                members.sort_unstable_by_key(|member| member.id);
+                let count = members.len() as i32;
+                let members = members
+                    .into_iter()
+                    .skip(offset as usize)
+                    .take(MEMBER_PAGE_SIZE as usize)
+                    .collect();
+                Ok(MemberPage {
+                    members,
+                    next: member_next(
+                        offset,
+                        MEMBER_PAGE_SIZE.min((count - offset).max(0)) as usize,
+                        count,
+                    ),
+                })
+            }
+            PeerKind::Channel => {
+                use enums::ChannelParticipantsFilter as F;
+                let result = self
+                    .client
+                    .invoke(&grammers_client::tl::functions::channels::GetParticipants {
+                        channel: reference.into(),
+                        filter: match filter {
+                            MemberFilter::All => F::ChannelParticipantsRecent,
+                            MemberFilter::Admins => F::ChannelParticipantsAdmins,
+                            MemberFilter::Bots => F::ChannelParticipantsBots,
+                        },
+                        offset,
+                        limit: MEMBER_PAGE_SIZE,
+                        hash: 0,
+                    })
+                    .await?;
+                let enums::channels::ChannelParticipants::Participants(result) = result else {
+                    bail!("Telegram не вернул страницу участников")
+                };
+                let next = member_next(offset, result.participants.len(), result.count);
+                let roles = result.participants.into_iter().filter_map(channel_member);
+                Ok(MemberPage {
+                    members: self.member_views(result.users, roles, filter).await,
+                    next,
+                })
+            }
+            PeerKind::User => bail!("У пользователя нет списка участников"),
+        }
+    }
+
+    async fn member_views(
+        &self,
+        users: Vec<enums::User>,
+        roles: impl IntoIterator<Item = (i64, MemberRole)>,
+        filter: MemberFilter,
+    ) -> Vec<ChatMember> {
+        let mut users: HashMap<_, _> = users.into_iter().map(|user| (user.id(), user)).collect();
+        let mut members = Vec::new();
+        let mut refs = Vec::new();
+        for (id, role) in roles {
+            let Some(raw) = users.remove(&id) else {
+                continue;
+            };
+            let user = grammers_client::peer::User::from_raw(&self.client, raw);
+            let Some(id) = user.id().bot_api_dialog_id() else {
+                continue;
+            };
+            let name = user.full_name();
+            let member = ChatMember {
+                id,
+                name: if name.trim().is_empty() {
+                    "Недоступный аккаунт".into()
+                } else {
+                    name
+                },
+                bot: user.is_bot(),
+                avatar: peer_avatar(&Peer::User(user.clone())),
+                role,
+            };
+            if filter.includes(&member) {
+                if let Ok(Some(reference)) = user.to_ref().await {
+                    refs.push((id, reference));
+                }
+                members.push(member);
+            }
+        }
+        self.peers.write().await.extend(refs);
+        members
     }
 
     pub async fn blocked_page(&self, offset: i32) -> Result<BlockedPage> {
@@ -2458,6 +2648,65 @@ fn public_usernames(primary: Option<&str>, extra: Option<&[enums::Username]>) ->
     names
 }
 
+fn member_next(offset: i32, received: usize, count: i32) -> Option<i32> {
+    let next = offset.checked_add(i32::try_from(received).ok()?)?;
+    (received > 0 && next < count).then_some(next)
+}
+
+fn channel_member(participant: enums::ChannelParticipant) -> Option<(i64, MemberRole)> {
+    use enums::ChannelParticipant as P;
+    match participant {
+        P::Participant(value) => Some((value.user_id, MemberRole::Member)),
+        P::ParticipantSelf(value) => Some((value.user_id, MemberRole::Member)),
+        P::Creator(value) => Some((value.user_id, MemberRole::Owner)),
+        P::Admin(value) => Some((value.user_id, MemberRole::Administrator)),
+        P::Banned(value) if !value.left => {
+            let peer = PeerId::from(value.peer);
+            (peer.kind() == PeerKind::User).then(|| (peer.bare_id_unchecked(), MemberRole::Member))
+        }
+        _ => None,
+    }
+}
+
+fn bot_commands(id: i64, info: Option<enums::BotInfo>) -> Vec<BotCommand> {
+    let mut seen = HashSet::new();
+    let mut commands: Vec<_> = info
+        .and_then(|enums::BotInfo::Info(info)| {
+            info.user_id
+                .is_none_or(|user| user == id)
+                .then_some(info.commands)
+                .flatten()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|enums::BotCommand::Command(raw)| {
+            let name = raw.command;
+            let valid = (1..=32).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+            (valid && seen.insert(name.clone())).then(|| BotCommand {
+                name: format!("/{name}"),
+                description: raw.description,
+            })
+        })
+        .collect();
+    if !seen.contains("start") {
+        commands.insert(
+            0,
+            BotCommand {
+                name: "/start".into(),
+                description: "Запустить бота".into(),
+            },
+        );
+    }
+    commands
+}
+
+fn can_edit_chat(creator: bool, rights: Option<&enums::ChatAdminRights>) -> bool {
+    creator || rights.is_some_and(|enums::ChatAdminRights::Rights(rights)| rights.change_info)
+}
+
 fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     let mut profile = PeerProfile {
         id: peer.id().bot_api_dialog_id().context("Чат не найден")?,
@@ -2478,6 +2727,9 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         verified: false,
         scam: false,
         fake: false,
+        can_edit_chat: false,
+        can_view_members: false,
+        bot_commands: Vec::new(),
     };
     let channel = match peer {
         Peer::Channel(channel) => Some(&channel.raw),
@@ -2485,6 +2737,10 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
             enums::Chat::Channel(channel) => Some(channel),
             enums::Chat::Chat(chat) => {
                 profile.members = u32::try_from(chat.participants_count).ok();
+                profile.can_edit_chat = !chat.left
+                    && !chat.deactivated
+                    && chat.migrated_to.is_none()
+                    && can_edit_chat(chat.creator, chat.admin_rights.as_ref());
                 None
             }
             _ => None,
@@ -2515,6 +2771,8 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         Peer::Community(_) => None,
     };
     if let Some(channel) = channel {
+        profile.can_edit_chat =
+            !channel.left && can_edit_chat(channel.creator, channel.admin_rights.as_ref());
         profile.usernames =
             public_usernames(channel.username.as_deref(), channel.usernames.as_deref());
         profile.members = channel
@@ -3424,6 +3682,21 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_offset_follows_server_rows_and_stops_when_no_progress_is_possible() {
+        assert_eq!(member_next(40, 37, 120), Some(77));
+        assert_eq!(member_next(40, 0, 120), None);
+        assert_eq!(member_next(40, 37, 77), None);
+        assert_eq!(member_next(i32::MAX, 1, i32::MAX), None);
+    }
+
+    #[test]
+    fn bot_always_offers_a_standard_start_command() {
+        let commands = bot_commands(4, None);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "/start");
+    }
 
     #[test]
     fn chat_authorship_distinguishes_destination_from_explicit_sender() {

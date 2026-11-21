@@ -1,8 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
-    AttachmentThumbnail, AudioInfo, Avatar, Chat, ChatFolder, ChatImage, ChatKind, Contact,
-    Message, PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PollDraft, TextLink,
+    AttachmentThumbnail, AudioInfo, Avatar, BotCommand, Chat, ChatFolder, ChatImage, ChatKind,
+    ChatMember, Contact, MEMBER_PAGE_SIZE, MemberFilter, MemberPage, MemberRole, Message,
+    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -25,6 +26,7 @@ pub fn chats() -> Vec<Chat> {
         (3, "Новости проекта", "Опубликован план на неделю", 0, true),
         (5, "Демомедиа", "Видео и аудио", 0, false),
         (6, "Демоопросы", "Опрос · Когда провести встречу?", 0, false),
+        (7, "Бот проекта", "Доступные команды проекта", 0, false),
     ]
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
@@ -54,6 +56,7 @@ pub fn chats() -> Vec<Chat> {
         kind: match id {
             1 | 6 => ChatKind::Group,
             3 => ChatKind::Broadcast,
+            7 => ChatKind::Bot,
             _ => ChatKind::User,
         },
         muted: false,
@@ -108,6 +111,9 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             verified: false,
             scam: false,
             fake: false,
+            can_edit_chat: false,
+            can_view_members: false,
+            bot_commands: Vec::new(),
         });
     }
     let chat = chats().into_iter().find(|chat| chat.id == id)?;
@@ -120,7 +126,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         },
         kind: chat.kind,
         is_self: chat.saved_messages,
-        blocked: (chat.kind == ChatKind::Broadcast).then_some(false),
+        blocked: matches!(chat.kind, ChatKind::Broadcast | ChatKind::Bot).then_some(false),
         avatar: if chat.saved_messages {
             Some(OWN_AVATAR)
         } else {
@@ -130,6 +136,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             1 => "Обсуждаем макеты, сроки и материалы проекта. Демонстрационная группа.",
             2 => "Демонстрационные данные аккаунта.",
             6 => "Демонстрационная группа с опросами и викториной.",
+            7 => "Демонстрационный бот для команд проекта.",
             _ => "Объявления и новости проекта. Демонстрационный канал.",
         }
         .to_owned(),
@@ -138,17 +145,63 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
                 1 => "@demo_tgrust_team",
                 2 => "@demo_tgrust_account",
                 6 => "@demo_tgrust_polls",
+                7 => "@demo_tgrust_bot",
                 _ => "@demo_tgrust_news",
             }
             .to_owned(),
         ],
         phone: chat.saved_messages.then(|| "+00000000000".to_owned()),
-        members: (id != 2).then_some(if matches!(id, 1 | 6) { 8 } else { 120 }),
+        members: matches!(id, 1 | 3 | 6).then_some(if id == 6 { 8 } else { 45 }),
         online_members: matches!(id, 1 | 6).then_some(2),
         verified: id == 3,
         scam: false,
         fake: false,
+        can_edit_chat: matches!(id, 1 | 3),
+        can_view_members: matches!(id, 1 | 3 | 6),
+        bot_commands: if id == 7 {
+            [("/start", "Запустить бота"), ("/help", "Показать справку")]
+                .into_iter()
+                .map(|(name, description)| BotCommand {
+                    name: name.into(),
+                    description: description.into(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
     })
+}
+
+pub fn members(chat: i64, filter: MemberFilter, offset: i32) -> MemberPage {
+    let count = if chat == 6 { 8 } else { 45 };
+    let members: Vec<_> = (1..=count)
+        .map(|id| ChatMember {
+            id,
+            name: match id {
+                1 => "Алексей".into(),
+                2 => "Анна".into(),
+                3 => "Бот проекта".into(),
+                _ => format!("Участник {id}"),
+            },
+            avatar: (id <= 3).then_some(OWN_AVATAR),
+            role: match id {
+                1 => MemberRole::Owner,
+                2 => MemberRole::Administrator,
+                _ => MemberRole::Member,
+            },
+            bot: id == 3,
+        })
+        .filter(|member| filter.includes(member))
+        .collect();
+    let end = offset + MEMBER_PAGE_SIZE;
+    MemberPage {
+        next: (end < members.len() as i32).then_some(end),
+        members: members
+            .into_iter()
+            .skip(offset as usize)
+            .take(MEMBER_PAGE_SIZE as usize)
+            .collect(),
+    }
 }
 
 pub fn own_profile() -> crate::model::OwnProfile {
@@ -282,6 +335,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             ("Анна", "Сохранённая заметка", false, None),
         ],
         3 => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
+        7 => vec![("Бот проекта", "Доступные команды проекта", false, None)],
         5 => vec![
             ("Анна", "", false, Some("demo-audio.wav")),
             (OWN_NAME, "", true, Some("demo-video.webm")),
