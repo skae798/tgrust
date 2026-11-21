@@ -25,6 +25,8 @@ mod session_runner;
 mod storage;
 mod telegram;
 mod ui;
+mod update_dialog;
+mod updater;
 
 use std::env;
 use std::process::ExitCode;
@@ -39,12 +41,16 @@ fn main() -> ExitCode {
     let demo = match args.as_slice() {
         [] => false,
         [flag] if flag == "--demo" => true,
+        [flag] if flag == "--version" || flag == "-V" => {
+            println!("tgrust {}", updater::version());
+            return ExitCode::SUCCESS;
+        }
         [flag] if flag == "--help" || flag == "-h" => {
-            println!("Использование: tgrust [--demo]");
+            println!("Использование: tgrust [--demo | --version]");
             return ExitCode::SUCCESS;
         }
         _ => {
-            eprintln!("Использование: tgrust [--demo]");
+            eprintln!("Использование: tgrust [--demo | --version]");
             return ExitCode::from(2);
         }
     };
@@ -65,6 +71,7 @@ fn application(demo: bool) -> adw::Application {
             );
         }
     });
+    update_dialog::register(&app, demo);
     let accounts = accounts::Accounts::new(&app, demo);
     let target_type = <(String, i64)>::static_variant_type();
     let open_chat = gtk::gio::SimpleAction::new("open-account-chat", Some(target_type.as_ref()));

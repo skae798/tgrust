@@ -37,3 +37,54 @@ jobs:
         run: cargo test --locked -p grammers-client --lib --no-default-features
       - name: Validate desktop entry
         run: desktop-file-validate data/io.github.skae798.tgrust.desktop
+
+  native-release:
+    if: github.event_name == 'push' && github.repository == 'skae798/tgrust'
+    needs: checks
+    runs-on: ubuntu-24.04
+    container: fedora:45
+    permissions:
+      contents: write
+    concurrency:
+      group: native-fedora45-release
+      cancel-in-progress: false
+    steps:
+      - name: Install build dependencies
+        run: dnf install -y ca-certificates clang-devel cmake curl gcc gh git gtk4-devel libadwaita-devel make pkgconf-pkg-config
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/tgrust-rustup.sh
+          sh /tmp/tgrust-rustup.sh -y --profile minimal --default-toolchain 1.100.0
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build and verify the Fedora executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          export TGRUST_UPDATE_BUILD="$GITHUB_RUN_NUMBER"
+          export TGRUST_UPDATE_REVISION="${GITHUB_SHA:0:12}"
+          cargo build --locked --release
+          install -Dm755 target/release/tgrust dist/tgrust-fedora45-x86_64
+          dist/tgrust-fedora45-x86_64 --version | grep -F "сборка $TGRUST_UPDATE_BUILD ($TGRUST_UPDATE_REVISION)"
+      - name: Publish the verified build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          current=$(gh api "repos/$GH_REPO/branches/main" --jq .commit.sha)
+          if [[ "$current" != "$GITHUB_SHA" ]]; then
+            printf '%s\n' 'main уже обновилась. Выпуск опубликует новая сборка.'
+            exit 0
+          fi
+          tag="native-fedora45-$GITHUB_RUN_NUMBER-${GITHUB_SHA:0:12}"
+          if gh release view "$tag" --json tagName >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "$tag" dist/tgrust-fedora45-x86_64 \
+            --target "$GITHUB_SHA" --latest \
+            --title "tgrust для Fedora 45 x86_64, сборка $GITHUB_RUN_NUMBER" \
+            --notes "Проверенная сборка коммита $GITHUB_SHA для нативного клиента Fedora 45 x86_64."
