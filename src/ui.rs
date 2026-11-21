@@ -249,6 +249,11 @@ pub fn open(
     login_accounts.add_css_class("flat");
     let login_proxy = gtk::Button::with_label("Прокси");
     login_proxy.add_css_class("flat");
+    let login_updates = gtk::Button::builder()
+        .label("Обновления клиента")
+        .action_name("app.updates")
+        .css_classes(["flat"])
+        .build();
     let demo_button = gtk::Button::with_label("Открыть деморежим");
     demo_button.add_css_class("flat");
     for widget in [
@@ -266,6 +271,7 @@ pub fn open(
         connect_retry.upcast_ref(),
         login_accounts.upcast_ref(),
         login_proxy.upcast_ref(),
+        login_updates.upcast_ref(),
         demo_button.upcast_ref(),
     ] {
         login_box.append(widget);
@@ -309,6 +315,12 @@ pub fn open(
     let proxy_button = gtk::Button::with_label("Прокси");
     proxy_button.add_css_class("flat");
     menu_body.append(&proxy_button);
+    let updates_button = gtk::Button::builder()
+        .label("Обновления клиента")
+        .action_name("app.updates")
+        .css_classes(["flat"])
+        .build();
+    menu_body.append(&updates_button);
     let logout = gtk::Button::with_label("Выйти из аккаунта");
     logout.add_css_class("flat");
     logout.add_css_class("destructive-action");
@@ -318,6 +330,11 @@ pub fn open(
     menu_body.append(&logout);
     let menu_popup = gtk::Popover::builder().child(&menu_body).build();
     menu_popup.set_default_widget(Some(&devices_button));
+    updates_button.connect_clicked(glib::clone!(
+        #[weak]
+        menu_popup,
+        move |_| menu_popup.popdown()
+    ));
     let menu_label = gtk::Label::builder()
         .label(if matches!(account, Account::Welcome | Account::Demo(0)) {
             "tgrust".into()

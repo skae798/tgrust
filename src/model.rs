@@ -986,6 +986,23 @@ pub struct UpdateStatus {
     pub reconnecting: bool,
 }
 
+#[derive(Clone)]
+pub enum ClientUpdateStatus {
+    Disabled(&'static str),
+    Idle,
+    Checking,
+    Downloading(u8),
+    Current,
+    Installed(u64),
+    Failed(String),
+}
+
+impl ClientUpdateStatus {
+    pub fn can_check(&self) -> bool {
+        matches!(self, Self::Idle | Self::Current | Self::Failed(_))
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct HistoryRevision {
     pub all: u64,
