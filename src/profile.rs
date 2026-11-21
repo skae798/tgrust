@@ -9,7 +9,8 @@ use gtk::glib;
 use tokio::runtime::Handle;
 
 use crate::blocked::{self, BlockAction};
-use crate::model::{Avatar, ChatKind, PeerProfile};
+use crate::chat_management::{self, EditFuture, MemberFuture, MembersContext};
+use crate::model::{Avatar, ChatInfo, ChatKind, MemberFilter, PeerProfile};
 
 type ProfileFuture = Pin<Box<dyn Future<Output = Result<PeerProfile>> + Send>>;
 pub(crate) type AvatarLoader = Box<dyn Fn(&adw::Avatar, Avatar)>;
@@ -20,6 +21,10 @@ pub struct ProfileContext {
     pub avatar: AvatarLoader,
     pub set_blocked: BlockAction,
     pub edit: Box<dyn Fn()>,
+    pub edit_chat: Box<dyn Fn(ChatInfo, ChatInfo) -> EditFuture>,
+    pub chat_saved: Box<dyn Fn(ChatInfo)>,
+    pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
+    pub command: Box<dyn Fn(String)>,
 }
 
 struct ProfileDialog {
@@ -31,6 +36,7 @@ struct ProfileDialog {
     task: RefCell<Option<tokio::task::AbortHandle>>,
     closed: Cell<bool>,
     edit_requested: Cell<bool>,
+    selected_command: RefCell<Option<String>>,
     dialog: glib::WeakRef<adw::Dialog>,
 }
 
@@ -73,6 +79,7 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
         task: RefCell::new(None),
         closed: Cell::new(false),
         edit_requested: Cell::new(false),
+        selected_command: RefCell::new(None),
         dialog: dialog.downgrade(),
     });
     state.retry.connect_clicked(glib::clone!(
@@ -89,6 +96,9 @@ pub fn open(window: &adw::ApplicationWindow, context: ProfileContext) -> adw::Di
         if state.edit_requested.get() {
             (state.context.edit)();
         }
+        if let Some(command) = state.selected_command.take() {
+            (state.context.command)(command);
+        }
     });
     dialog.present(Some(window));
     dialog
@@ -101,6 +111,11 @@ impl ProfileDialog {
         }
         self.status.set_text("Загрузка профиля…");
         self.retry.set_visible(false);
+        while let Some(child) = self.body.first_child() {
+            self.body.remove(&child);
+        }
+        self.body.append(&self.status);
+        self.body.append(&self.retry);
         let task = self.context.runtime.spawn((self.context.load)());
         self.task.replace(Some(task.abort_handle()));
         let weak = Rc::downgrade(self);
@@ -206,6 +221,7 @@ impl ProfileDialog {
             }
         }
         self.body.append(&details);
+        self.add_management(&profile);
         if profile.is_self {
             let edit = gtk::Button::builder()
                 .label("Редактировать профиль")
@@ -223,6 +239,112 @@ impl ProfileDialog {
         }
         if let Some(value) = profile.blocked {
             self.add_block_controls(profile.id, profile.title, value);
+        }
+    }
+
+    fn add_management(self: &Rc<Self>, profile: &PeerProfile) {
+        if profile.can_edit_chat {
+            let settings = gtk::Button::with_label("Настройки чата");
+            settings.set_halign(gtk::Align::Center);
+            let info = profile.chat_info();
+            settings.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| {
+                    let edit = Rc::downgrade(&state);
+                    let complete = edit.clone();
+                    chat_management::edit(
+                        button,
+                        state.context.runtime.clone(),
+                        info.clone(),
+                        move |original, proposed| {
+                            if let Some(state) = edit.upgrade() {
+                                (state.context.edit_chat)(original, proposed)
+                            } else {
+                                Box::pin(async {
+                                    anyhow::bail!("Профиль чата закрыт")
+                                })
+                            }
+                        },
+                        move |saved, attempted| {
+                            if let Some(state) = complete.upgrade() {
+                                if let Some(info) = saved {
+                                    (state.context.chat_saved)(info);
+                                }
+                                if attempted {
+                                    state.load();
+                                }
+                            }
+                        },
+                    );
+                }
+            ));
+            self.body.append(&settings);
+        }
+        if profile.can_view_members {
+            let subscribers = profile.kind == ChatKind::Broadcast;
+            let button = gtk::Button::with_label(if subscribers {
+                "Список подписчиков"
+            } else {
+                "Список участников"
+            });
+            button.set_halign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| {
+                    chat_management::members(
+                        button,
+                        subscribers,
+                        MembersContext {
+                            runtime: state.context.runtime.clone(),
+                            load: Box::new(glib::clone!(
+                                #[weak]
+                                state,
+                                #[upgrade_or]
+                                Box::pin(async {
+                                    anyhow::bail!("Профиль чата закрыт")
+                                }),
+                                move |filter, offset| (state.context.members)(filter, offset)
+                            )),
+                            avatar: Box::new(glib::clone!(
+                                #[weak]
+                                state,
+                                move |avatar, photo| (state.context.avatar)(avatar, photo)
+                            )),
+                        },
+                    );
+                }
+            ));
+            self.body.append(&button);
+        }
+        if !profile.bot_commands.is_empty() {
+            let commands = adw::PreferencesGroup::builder()
+                .title("Команды бота")
+                .build();
+            for command in &profile.bot_commands {
+                let row = adw::ActionRow::builder()
+                    .use_markup(false)
+                    .title(&command.description)
+                    .build();
+                let name = command.name.clone();
+                let button = gtk::Button::builder()
+                    .label(&name)
+                    .valign(gtk::Align::Center)
+                    .build();
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = state)]
+                    self,
+                    move |_| if let Some(dialog) = state.dialog.upgrade() {
+                        state.selected_command.replace(Some(name.clone()));
+                        dialog.close();
+                    }
+                ));
+                row.add_suffix(&button);
+                row.set_activatable_widget(Some(&button));
+                commands.add(&row);
+            }
+            self.body.append(&commands);
         }
     }
 

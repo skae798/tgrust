@@ -15,7 +15,6 @@ use crate::accounts::{Account, Accounts};
 use crate::demo;
 use crate::formatting::{SPOILER_LINK, editor_text, render_message, set_editor_text, setup_editor};
 use crate::media_viewer::fit_viewport as photo_viewport;
-use crate::model::PlayableMedia;
 use crate::model::{
     Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
@@ -23,6 +22,7 @@ use crate::model::{
     UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, prepend_history_page,
     redact_spoilers,
 };
+use crate::model::{ChatInfo, PlayableMedia};
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -94,6 +94,7 @@ struct Ui {
     title: adw::WindowTitle,
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
+    demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     poll_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
@@ -574,6 +575,7 @@ pub fn open(
         title,
         profile_button,
         profile_dialog: glib::WeakRef::new(),
+        demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
         own_profile_dialog: glib::WeakRef::new(),
         poll_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
@@ -2847,7 +2849,10 @@ impl Ui {
             return;
         }
         let client = self.client.borrow().clone();
+        let edit_client = client.clone();
+        let member_client = client.clone();
         let demo = self.is_demo.get();
+        let demo_chat_info = self.demo_chat_info.clone();
         let demo_blocked = self.demo_blocked.clone();
         let demo_profile = self.demo_profile.clone();
         let dialog = crate::profile::open(
@@ -2858,10 +2863,15 @@ impl Ui {
                     let blocked = demo && demo_blocked.borrow().contains(&id);
                     let own = demo.then(|| demo_profile.borrow().clone());
                     let client = client.clone();
+                    let chat_info = demo_chat_info.borrow().get(&id).cloned();
                     Box::pin(async move {
                         if demo {
                             let mut profile = demo::peer_profile(id).context("Чат не найден")?;
                             profile.blocked = profile.blocked.map(|_| blocked);
+                            if let Some(info) = chat_info {
+                                profile.title = info.title;
+                                profile.about = info.about;
+                            }
                             if let Some(own) = own.filter(|_| profile.is_self) {
                                 profile.title = own.details.display_name();
                                 profile.about = own.details.about;
@@ -2884,6 +2894,65 @@ impl Ui {
                     move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
                 )),
                 set_blocked: self.block_action(),
+                edit_chat: Box::new({
+                    let demo_info = self.demo_chat_info.clone();
+                    move |original, proposed| {
+                        let client = edit_client.clone();
+                        let current = demo_info
+                            .borrow()
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_else(|| original.clone());
+                        Box::pin(async move {
+                            if demo {
+                                let (title, about) = proposed.changes(&original, &current)?;
+                                return Ok(ChatInfo {
+                                    title: title.unwrap_or(current.title),
+                                    about: about.unwrap_or(current.about),
+                                });
+                            }
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .edit_chat_info(id, original, proposed)
+                                .await
+                        })
+                    }
+                }),
+                chat_saved: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |info| ui.apply_chat_info(id, info)
+                )),
+                members: Box::new(move |filter, offset| {
+                    let client = member_client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            return Ok(demo::members(id, filter, offset));
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .chat_members(id, filter, offset)
+                            .await
+                    })
+                }),
+                command: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |command| {
+                        if ui.selection.get() == Some(id) && ui.input.is_sensitive() {
+                            let buffer = ui.input.buffer();
+                            let mut end = buffer.end_iter();
+                            let text = buffer.text(&buffer.start_iter(), &end, false);
+                            if !text.is_empty() && !text.ends_with('\n') {
+                                buffer.insert(&mut end, "\n");
+                            }
+                            buffer.insert(&mut end, &command);
+                            buffer.place_cursor(&end);
+                            ui.focus_composer();
+                        }
+                    }
+                )),
                 edit: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
@@ -2895,6 +2964,34 @@ impl Ui {
             },
         );
         self.profile_dialog.set(Some(&dialog));
+    }
+
+    fn apply_chat_info(self: &Rc<Self>, id: i64, info: ChatInfo) {
+        if self.is_demo.get() {
+            self.demo_chat_info.borrow_mut().insert(id, info.clone());
+        }
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|chat| chat.id == id)
+        {
+            chat.title.clone_from(&info.title);
+        }
+        if let Some(chat) = self
+            .external_chat
+            .borrow_mut()
+            .as_mut()
+            .filter(|chat| chat.id == id)
+        {
+            chat.title.clone_from(&info.title);
+        }
+        if self.selection.get() == Some(id) {
+            self.title.set_title(&info.title);
+        }
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
+        self.render_chats();
     }
 
     fn open_message_search(self: &Rc<Self>, scoped: bool) {
