@@ -353,6 +353,7 @@ pub struct PeerProfile {
     pub fake: bool,
     pub can_edit_chat: bool,
     pub can_view_members: bool,
+    pub moderation: Option<MemberModeration>,
     pub bot_commands: Vec<BotCommand>,
 }
 
@@ -405,13 +406,39 @@ pub enum MemberFilter {
     All,
     Admins,
     Bots,
+    Banned,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemberRole {
     Owner,
     Administrator,
     Member,
+    Banned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberModeration {
+    Remove,
+    Ban,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberChange {
+    Remove,
+    Ban,
+    Unban,
+}
+
+impl MemberModeration {
+    pub fn action(self, role: MemberRole) -> Option<MemberChange> {
+        match (self, role) {
+            (Self::Remove, MemberRole::Member) => Some(MemberChange::Remove),
+            (Self::Ban, MemberRole::Member) => Some(MemberChange::Ban),
+            (Self::Ban, MemberRole::Banned) => Some(MemberChange::Unban),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -421,14 +448,16 @@ pub struct ChatMember {
     pub avatar: Option<Avatar>,
     pub role: MemberRole,
     pub bot: bool,
+    pub can_update: bool,
 }
 
 impl MemberFilter {
     pub fn includes(self, member: &ChatMember) -> bool {
         match self {
-            Self::All => true,
-            Self::Admins => member.role != MemberRole::Member,
-            Self::Bots => member.bot,
+            Self::All => member.role != MemberRole::Banned,
+            Self::Admins => matches!(member.role, MemberRole::Owner | MemberRole::Administrator),
+            Self::Bots => member.bot && member.role != MemberRole::Banned,
+            Self::Banned => member.role == MemberRole::Banned,
         }
     }
 }

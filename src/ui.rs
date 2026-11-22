@@ -95,6 +95,7 @@ struct Ui {
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
+    demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     poll_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
@@ -576,6 +577,7 @@ pub fn open(
         profile_button,
         profile_dialog: glib::WeakRef::new(),
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
+        demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::new())),
         own_profile_dialog: glib::WeakRef::new(),
         poll_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
@@ -2851,8 +2853,10 @@ impl Ui {
         let client = self.client.borrow().clone();
         let edit_client = client.clone();
         let member_client = client.clone();
+        let moderation_client = client.clone();
         let demo = self.is_demo.get();
         let demo_chat_info = self.demo_chat_info.clone();
+        let demo_members = self.demo_member_changes.clone();
         let demo_blocked = self.demo_blocked.clone();
         let demo_profile = self.demo_profile.clone();
         let dialog = crate::profile::open(
@@ -2864,10 +2868,12 @@ impl Ui {
                     let own = demo.then(|| demo_profile.borrow().clone());
                     let client = client.clone();
                     let chat_info = demo_chat_info.borrow().get(&id).cloned();
+                    let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
                     Box::pin(async move {
                         if demo {
                             let mut profile = demo::peer_profile(id).context("Чат не найден")?;
                             profile.blocked = profile.blocked.map(|_| blocked);
+                            profile.members = profile.members.and(demo_count);
                             if let Some(info) = chat_info {
                                 profile.title = info.title;
                                 profile.about = info.about;
@@ -2923,18 +2929,41 @@ impl Ui {
                     self,
                     move |info| ui.apply_chat_info(id, info)
                 )),
-                members: Box::new(move |filter, offset| {
-                    let client = member_client.clone();
-                    Box::pin(async move {
-                        if demo {
-                            tokio::time::sleep(Duration::from_millis(150)).await;
-                            return Ok(demo::members(id, filter, offset));
-                        }
-                        client
-                            .context("Нет подключения к Telegram")?
-                            .chat_members(id, filter, offset)
-                            .await
-                    })
+                members: Box::new({
+                    let demo_members = self.demo_member_changes.clone();
+                    move |filter, offset| {
+                        let client = member_client.clone();
+                        let local =
+                            demo.then(|| demo::members(id, &demo_members.borrow(), filter, offset));
+                        Box::pin(async move {
+                            if let Some(page) = local {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                return Ok(page);
+                            }
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .chat_members(id, filter, offset)
+                                .await
+                        })
+                    }
+                }),
+                moderate: Box::new({
+                    let demo_members = self.demo_member_changes.clone();
+                    move |member, change| {
+                        let client = moderation_client.clone();
+                        let local = demo.then(|| {
+                            demo::change_member(&mut demo_members.borrow_mut(), id, member, change)
+                        });
+                        Box::pin(async move {
+                            if let Some(result) = local {
+                                return result;
+                            }
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .change_chat_member(id, member, change)
+                                .await
+                        })
+                    }
                 }),
                 command: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]

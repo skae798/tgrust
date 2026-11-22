@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
     AttachmentThumbnail, AudioInfo, Avatar, BotCommand, Chat, ChatFolder, ChatImage, ChatKind,
-    ChatMember, Contact, MEMBER_PAGE_SIZE, MemberFilter, MemberPage, MemberRole, Message,
-    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
+    ChatMember, Contact, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration,
+    MemberPage, MemberRole, Message, PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource,
+    PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -113,6 +115,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             fake: false,
             can_edit_chat: false,
             can_view_members: false,
+            moderation: None,
             bot_commands: Vec::new(),
         });
     }
@@ -158,6 +161,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         fake: false,
         can_edit_chat: matches!(id, 1 | 3),
         can_view_members: matches!(id, 1 | 3 | 6),
+        moderation: demo_moderation(id),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -172,10 +176,66 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
     })
 }
 
-pub fn members(chat: i64, filter: MemberFilter, offset: i32) -> MemberPage {
-    let count = if chat == 6 { 8 } else { 45 };
-    let members: Vec<_> = (1..=count)
-        .map(|id| ChatMember {
+pub type MemberChanges = HashMap<(i64, i64), MemberChange>;
+
+fn demo_moderation(chat: i64) -> Option<MemberModeration> {
+    match chat {
+        1 => Some(MemberModeration::Remove),
+        3 => Some(MemberModeration::Ban),
+        _ => None,
+    }
+}
+
+fn demo_member_role(chat: i64, member: i64, changes: &MemberChanges) -> Option<MemberRole> {
+    match changes.get(&(chat, member)) {
+        Some(MemberChange::Remove | MemberChange::Unban) => return None,
+        Some(MemberChange::Ban) => return Some(MemberRole::Banned),
+        None => {}
+    }
+    let role = match member {
+        1 => MemberRole::Owner,
+        2 => MemberRole::Administrator,
+        3..=8 => MemberRole::Member,
+        9..=45 if chat != 6 => MemberRole::Member,
+        46..=47 if chat == 3 => MemberRole::Banned,
+        _ => return None,
+    };
+    Some(role)
+}
+
+pub fn change_member(
+    changes: &mut MemberChanges,
+    chat: i64,
+    member: i64,
+    change: MemberChange,
+) -> anyhow::Result<()> {
+    let allowed = demo_moderation(chat)
+        .zip(demo_member_role(chat, member, changes))
+        .and_then(|(mode, role)| mode.action(role));
+    anyhow::ensure!(
+        allowed == Some(change),
+        "Это действие с участником недоступно"
+    );
+    changes.insert((chat, member), change);
+    Ok(())
+}
+
+pub fn member_count(chat: i64, changes: &MemberChanges) -> u32 {
+    (1..=47)
+        .filter_map(|id| demo_member_role(chat, id, changes))
+        .filter(|role| *role != MemberRole::Banned)
+        .count() as u32
+}
+
+pub fn members(
+    chat: i64,
+    changes: &MemberChanges,
+    filter: MemberFilter,
+    offset: i32,
+) -> MemberPage {
+    let members: Vec<_> = (1..=47)
+        .filter_map(|id| Some((id, demo_member_role(chat, id, changes)?)))
+        .map(|(id, role)| ChatMember {
             id,
             name: match id {
                 1 => "Алексей".into(),
@@ -184,12 +244,9 @@ pub fn members(chat: i64, filter: MemberFilter, offset: i32) -> MemberPage {
                 _ => format!("Участник {id}"),
             },
             avatar: (id <= 3).then_some(OWN_AVATAR),
-            role: match id {
-                1 => MemberRole::Owner,
-                2 => MemberRole::Administrator,
-                _ => MemberRole::Member,
-            },
+            role,
             bot: id == 3,
+            can_update: true,
         })
         .filter(|member| filter.includes(member))
         .collect();
