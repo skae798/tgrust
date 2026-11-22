@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::model::{
     AttachmentThumbnail, AudioInfo, Avatar, BotCommand, Chat, ChatFolder, ChatImage, ChatKind,
     ChatMember, Contact, MEMBER_PAGE_SIZE, MemberFilter, MemberPage, MemberRole, Message,
-    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, PollDraft, TextLink,
+    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -384,6 +384,8 @@ pub fn history(chat: i64) -> Vec<Message> {
                 1 => PlayableMedia::Video {
                     width: 960,
                     height: 540,
+                    duration: Some(8),
+                    size: include_bytes!("../data/demo-video.webm").len() as u64,
                 },
                 _ => PlayableMedia::Voice,
             }),
@@ -516,12 +518,23 @@ pub fn now() -> i64 {
 pub async fn playback_preview(
     media: PlayableMedia,
     progress: tokio::sync::watch::Sender<PlaybackProgress>,
-) -> anyhow::Result<PlaybackFile> {
+    whole: bool,
+) -> anyhow::Result<PlaybackSource> {
     let bytes: &[u8] = match media {
         PlayableMedia::Audio => include_bytes!("../data/demo-audio.wav"),
         PlayableMedia::Voice => include_bytes!("../data/demo-voice.ogg"),
         PlayableMedia::Video { .. } => include_bytes!("../data/demo-video.webm"),
     };
+    if !whole && media != PlayableMedia::Voice {
+        let stream = crate::media_stream::StreamSource::new(bytes.len() as u64, move |index| {
+            Box::pin(async move {
+                let offset = index as usize * crate::media_stream::BLOCK_SIZE as usize;
+                let end = (offset + crate::media_stream::BLOCK_SIZE as usize).min(bytes.len());
+                Ok(bytes::Bytes::from_static(&bytes[offset..end]))
+            })
+        })?;
+        return Ok(PlaybackSource::Stream(media, stream));
+    }
     let mut output = crate::storage::PlaybackDownload::new(bytes.len() as u64)?;
     progress.send_replace(PlaybackProgress {
         received: 0,
@@ -532,7 +545,7 @@ pub async fn playback_preview(
         received: bytes.len() as u64,
         total: bytes.len() as u64,
     });
-    output.finish(media).await
+    Ok(PlaybackSource::File(output.finish(media).await?))
 }
 
 pub fn device_sessions() -> crate::model::DeviceSessions {

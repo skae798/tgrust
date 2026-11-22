@@ -7,6 +7,7 @@ mod demo;
 mod devices;
 mod formatting;
 mod links;
+mod media_stream;
 mod media_viewer;
 mod model;
 mod own_profile;

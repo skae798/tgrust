@@ -102,3 +102,12 @@ scale.waveform-position highlight,
 scale.waveform-position slider {
   opacity: 0;
 }
+
+.video-meta {
+  margin: 6px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  background: rgba(0, 0, 0, 0.76);
+  color: white;
+  font-size: 0.8em;
+}

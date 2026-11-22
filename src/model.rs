@@ -713,7 +713,12 @@ impl FormattedText {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayableMedia {
-    Video { width: i32, height: i32 },
+    Video {
+        width: i32,
+        height: i32,
+        duration: Option<u32>,
+        size: u64,
+    },
     Audio,
     Voice,
 }
@@ -737,7 +742,7 @@ impl PlayableMedia {
 
     pub fn dimensions(self) -> (i32, i32) {
         match self {
-            Self::Video { width, height } if width > 0 && height > 0 => (width, height),
+            Self::Video { width, height, .. } if width > 0 && height > 0 => (width, height),
             Self::Video { .. } => (640, 360),
             Self::Audio | Self::Voice => (360, 96),
         }
@@ -767,6 +772,20 @@ impl PlaybackFile {
     pub fn path(&self) -> PathBuf {
         use std::os::fd::AsRawFd;
         PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+}
+
+pub enum PlaybackSource {
+    File(PlaybackFile),
+    Stream(PlayableMedia, crate::media_stream::StreamSource),
+}
+
+impl PlaybackSource {
+    pub fn media(&self) -> PlayableMedia {
+        match self {
+            Self::File(file) => file.media,
+            Self::Stream(media, _) => *media,
+        }
     }
 }
 
