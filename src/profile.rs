@@ -9,8 +9,10 @@ use gtk::glib;
 use tokio::runtime::Handle;
 
 use crate::blocked::{self, BlockAction};
-use crate::chat_management::{self, EditFuture, MemberFuture, MembersContext};
-use crate::model::{Avatar, ChatInfo, ChatKind, MemberFilter, PeerProfile};
+use crate::chat_management::{self, EditFuture, MemberChangeFuture, MemberFuture, MembersContext};
+use crate::model::{
+    Avatar, ChatInfo, ChatKind, MemberChange, MemberFilter, MemberModeration, PeerProfile,
+};
 
 type ProfileFuture = Pin<Box<dyn Future<Output = Result<PeerProfile>> + Send>>;
 pub(crate) type AvatarLoader = Box<dyn Fn(&adw::Avatar, Avatar)>;
@@ -24,6 +26,7 @@ pub struct ProfileContext {
     pub edit_chat: Box<dyn Fn(ChatInfo, ChatInfo) -> EditFuture>,
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
+    pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
     pub command: Box<dyn Fn(String)>,
 }
 
@@ -281,12 +284,14 @@ impl ProfileDialog {
             ));
             self.body.append(&settings);
         }
-        if profile.can_view_members {
+        if profile.can_view_members || profile.moderation == Some(MemberModeration::Ban) {
+            let can_view_members = profile.can_view_members;
+            let moderation = profile.moderation;
             let subscribers = profile.kind == ChatKind::Broadcast;
-            let button = gtk::Button::with_label(if subscribers {
-                "Список подписчиков"
-            } else {
-                "Список участников"
+            let button = gtk::Button::with_label(match (can_view_members, subscribers) {
+                (false, _) => "Заблокированные",
+                (true, true) => "Список подписчиков",
+                (true, false) => "Список участников",
             });
             button.set_halign(gtk::Align::Center);
             button.connect_clicked(glib::clone!(
@@ -296,6 +301,8 @@ impl ProfileDialog {
                     chat_management::members(
                         button,
                         subscribers,
+                        can_view_members,
+                        moderation,
                         MembersContext {
                             runtime: state.context.runtime.clone(),
                             load: Box::new(glib::clone!(
@@ -311,6 +318,20 @@ impl ProfileDialog {
                                 #[weak]
                                 state,
                                 move |avatar, photo| (state.context.avatar)(avatar, photo)
+                            )),
+                            moderate: Box::new(glib::clone!(
+                                #[weak]
+                                state,
+                                #[upgrade_or]
+                                Box::pin(async {
+                                    anyhow::bail!("Профиль чата закрыт")
+                                }),
+                                move |member, change| (state.context.moderate)(member, change)
+                            )),
+                            refresh_profile: Box::new(glib::clone!(
+                                #[weak]
+                                state,
+                                move || state.load()
                             )),
                         },
                     );

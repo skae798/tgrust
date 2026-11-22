@@ -33,8 +33,8 @@ use crate::model::{
     UploadKind, redact_spoilers,
 };
 use crate::model::{
-    AudioInfo, BotCommand, ChatInfo, ChatMember, MEMBER_PAGE_SIZE, MemberFilter, MemberPage,
-    MemberRole, TextLink,
+    AudioInfo, BotCommand, ChatInfo, ChatMember, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
+    MemberModeration, MemberPage, MemberRole, TextLink,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -803,13 +803,7 @@ impl Telegram {
             return Ok(profile);
         }
         let result = self.full_chat(reference).await?;
-        let peer = result
-            .chats
-            .into_iter()
-            .map(|chat| Peer::from_raw(&self.client, chat))
-            .find(|peer| peer.id() == reference.id)
-            .context("Информация о чате недоступна")?;
-        let mut profile = peer_profile_view(&peer)?;
+        let mut profile = self.chat_profile_view(reference, result.chats)?;
         match result.full_chat {
             enums::ChatFull::Full(full) => {
                 profile.about = full.about;
@@ -834,6 +828,19 @@ impl Telegram {
         }
         ensure!(profile.id == id, "Telegram вернул другой чат");
         Ok(profile)
+    }
+
+    fn chat_profile_view(
+        &self,
+        reference: PeerRef,
+        chats: Vec<enums::Chat>,
+    ) -> Result<PeerProfile> {
+        let peer = chats
+            .into_iter()
+            .map(|chat| Peer::from_raw(&self.client, chat))
+            .find(|peer| peer.id() == reference.id)
+            .context("Информация о чате недоступна")?;
+        peer_profile_view(&peer)
     }
 
     async fn full_chat(&self, reference: PeerRef) -> Result<types::messages::ChatFull> {
@@ -936,6 +943,10 @@ impl Telegram {
         let reference = self.peer(id).await?;
         match reference.id.kind() {
             PeerKind::Chat => {
+                ensure!(
+                    filter != MemberFilter::Banned,
+                    "В этой группе нет списка блокировок"
+                );
                 let result = self.full_chat(reference).await?;
                 let enums::ChatFull::Full(full) = result.full_chat else {
                     bail!("Профиль группы изменился")
@@ -943,15 +954,17 @@ impl Telegram {
                 let enums::ChatParticipants::Participants(participants) = full.participants else {
                     bail!("Telegram ограничил доступ к списку участников")
                 };
-                let roles = participants.participants.into_iter().map(|participant| {
-                    let role = match participant {
-                        enums::ChatParticipant::Creator(_) => MemberRole::Owner,
-                        enums::ChatParticipant::Admin(_) => MemberRole::Administrator,
-                        enums::ChatParticipant::Participant(_) => MemberRole::Member,
-                    };
-                    (participant.user_id(), role)
-                });
-                let mut members = self.member_views(result.users, roles, filter).await;
+                let roles = participants
+                    .participants
+                    .into_iter()
+                    .filter_map(|participant| {
+                        Some((
+                            PeerId::user(participant.user_id())?,
+                            basic_member_role(&participant),
+                        ))
+                    });
+                let peers = self.peers_from_entities(result.users, Vec::new());
+                let mut members = self.member_views(peers, roles, filter).await;
                 members.sort_unstable_by_key(|member| member.id);
                 let count = members.len() as i32;
                 let members = members
@@ -970,6 +983,12 @@ impl Telegram {
             }
             PeerKind::Channel => {
                 use enums::ChannelParticipantsFilter as F;
+                if filter == MemberFilter::Banned {
+                    ensure!(
+                        self.peer_profile(id).await?.moderation == Some(MemberModeration::Ban),
+                        "Telegram не разрешает просматривать блокировки этого чата"
+                    );
+                }
                 let result = self
                     .client
                     .invoke(&grammers_client::tl::functions::channels::GetParticipants {
@@ -978,6 +997,11 @@ impl Telegram {
                             MemberFilter::All => F::ChannelParticipantsRecent,
                             MemberFilter::Admins => F::ChannelParticipantsAdmins,
                             MemberFilter::Bots => F::ChannelParticipantsBots,
+                            MemberFilter::Banned => {
+                                F::ChannelParticipantsKicked(types::ChannelParticipantsKicked {
+                                    q: String::new(),
+                                })
+                            }
                         },
                         offset,
                         limit: MEMBER_PAGE_SIZE,
@@ -988,9 +1012,13 @@ impl Telegram {
                     bail!("Telegram не вернул страницу участников")
                 };
                 let next = member_next(offset, result.participants.len(), result.count);
-                let roles = result.participants.into_iter().filter_map(channel_member);
+                let roles = result.participants.into_iter().filter_map(|participant| {
+                    let (id, role) = channel_member(&participant)?;
+                    Some((id, role?))
+                });
+                let peers = self.peers_from_entities(result.users, result.chats);
                 Ok(MemberPage {
-                    members: self.member_views(result.users, roles, filter).await,
+                    members: self.member_views(peers, roles, filter).await,
                     next,
                 })
             }
@@ -1000,42 +1028,162 @@ impl Telegram {
 
     async fn member_views(
         &self,
-        users: Vec<enums::User>,
-        roles: impl IntoIterator<Item = (i64, MemberRole)>,
+        mut peers: HashMap<PeerId, Peer>,
+        roles: impl IntoIterator<Item = (PeerId, MemberRole)>,
         filter: MemberFilter,
     ) -> Vec<ChatMember> {
-        let mut users: HashMap<_, _> = users.into_iter().map(|user| (user.id(), user)).collect();
         let mut members = Vec::new();
         let mut refs = Vec::new();
-        for (id, role) in roles {
-            let Some(raw) = users.remove(&id) else {
+        for (peer_id, role) in roles {
+            let Some(id) = peer_id.bot_api_dialog_id() else {
                 continue;
             };
-            let user = grammers_client::peer::User::from_raw(&self.client, raw);
-            let Some(id) = user.id().bot_api_dialog_id() else {
-                continue;
+            let peer = peers.remove(&peer_id);
+            let (name, bot, eligible) = match peer.as_ref() {
+                Some(Peer::User(user)) => (
+                    user.full_name(),
+                    user.is_bot(),
+                    !user.is_self() && !user.deleted(),
+                ),
+                Some(peer) => (
+                    peer.name().unwrap_or_default().to_owned(),
+                    false,
+                    role == MemberRole::Banned,
+                ),
+                None => (String::new(), false, false),
             };
-            let name = user.full_name();
-            let member = ChatMember {
+            let mut member = ChatMember {
                 id,
                 name: if name.trim().is_empty() {
                     "Недоступный аккаунт".into()
                 } else {
                     name
                 },
-                bot: user.is_bot(),
-                avatar: peer_avatar(&Peer::User(user.clone())),
+                bot,
+                avatar: None,
                 role,
+                can_update: false,
             };
             if filter.includes(&member) {
-                if let Ok(Some(reference)) = user.to_ref().await {
+                if let Some(peer) = peer
+                    && let Ok(Some(reference)) = peer.to_ref().await
+                {
                     refs.push((id, reference));
+                    member.avatar = peer_avatar(&peer);
+                    member.can_update = eligible;
                 }
                 members.push(member);
             }
         }
         self.peers.write().await.extend(refs);
         members
+    }
+
+    pub async fn change_chat_member(
+        &self,
+        chat: i64,
+        member: i64,
+        change: MemberChange,
+    ) -> Result<()> {
+        let _serial = self.dialog_settings.lock().await;
+        let chat = self.peer(chat).await?;
+        let member = self.peer(member).await?;
+        let input: enums::InputPeer = member.into();
+        ensure!(
+            member.id != chat.id
+                && input != enums::InputPeer::PeerSelf
+                && Some(member.id) != self.self_id().await?,
+            "Свой аккаунт или этот чат нельзя удалить или заблокировать"
+        );
+        let full = self.full_chat(chat).await?;
+        let profile = self.chat_profile_view(chat, full.chats)?;
+        match (profile.moderation, change) {
+            (Some(MemberModeration::Remove), MemberChange::Remove) => {
+                let enums::ChatFull::Full(full) = full.full_chat else {
+                    bail!("Профиль группы изменился")
+                };
+                let enums::ChatParticipants::Participants(members) = full.participants else {
+                    bail!("Telegram ограничил доступ к списку участников")
+                };
+                let id = member.id.bare_id().context("Участник недоступен")?;
+                ensure!(member.id.kind() == PeerKind::User, "Участник недоступен");
+                if let Some(current) = members
+                    .participants
+                    .iter()
+                    .find(|entry| entry.user_id() == id)
+                {
+                    ensure!(
+                        basic_member_role(current) == MemberRole::Member,
+                        "Роль участника изменилась"
+                    );
+                    self.client
+                        .invoke(&grammers_client::tl::functions::messages::DeleteChatUser {
+                            revoke_history: false,
+                            chat_id: full.id,
+                            user_id: member.into(),
+                        })
+                        .await?;
+                    self.invalidate_history(chat.id.bot_api_dialog_id(), false);
+                }
+            }
+            (Some(MemberModeration::Ban), MemberChange::Ban | MemberChange::Unban) => {
+                use grammers_client::tl::functions::channels::{EditBanned, GetParticipant};
+                let current = self
+                    .client
+                    .invoke(&GetParticipant {
+                        channel: chat.into(),
+                        participant: input.clone(),
+                    })
+                    .await;
+                let role = match current {
+                    Ok(enums::channels::ChannelParticipant::Participant(result)) => {
+                        let (id, role) = channel_member(&result.participant)
+                            .context("Telegram вернул неизвестного участника")?;
+                        ensure!(id == member.id, "Telegram вернул другого участника");
+                        ensure!(
+                            !matches!(
+                                result.participant,
+                                enums::ChannelParticipant::ParticipantSelf(_)
+                            ),
+                            "Свой аккаунт нельзя заблокировать"
+                        );
+                        role
+                    }
+                    Err(error) if error.is("USER_NOT_PARTICIPANT") => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if channel_moderation_needed(role, change)? {
+                    self.client
+                        .invoke(&EditBanned {
+                            channel: chat.into(),
+                            participant: input,
+                            banned_rights: membership_banned_rights(change == MemberChange::Ban)
+                                .into(),
+                        })
+                        .await?;
+                }
+            }
+            _ => bail!("Telegram не разрешает это действие с участником"),
+        }
+        self.invalidate_views();
+        Ok(())
+    }
+
+    fn peers_from_entities(
+        &self,
+        users: Vec<enums::User>,
+        chats: Vec<enums::Chat>,
+    ) -> HashMap<PeerId, Peer> {
+        users
+            .into_iter()
+            .map(|user| Peer::User(grammers_client::peer::User::from_raw(&self.client, user)))
+            .chain(
+                chats
+                    .into_iter()
+                    .map(|chat| Peer::from_raw(&self.client, chat)),
+            )
+            .map(|peer| (peer.id(), peer))
+            .collect()
     }
 
     pub async fn blocked_page(&self, offset: i32) -> Result<BlockedPage> {
@@ -1054,21 +1202,12 @@ impl Telegram {
             }
         };
         let next_offset = next_blocked_offset(offset, entries.len(), count);
-        let peers: HashMap<_, _> = users
-            .into_iter()
-            .map(|user| Peer::User(grammers_client::peer::User::from_raw(&self.client, user)))
-            .chain(
-                chats
-                    .into_iter()
-                    .map(|chat| Peer::from_raw(&self.client, chat)),
-            )
-            .map(|peer| (peer.id(), peer))
-            .collect();
+        let peers = self.peers_from_entities(users, chats);
         let mut page = Vec::new();
         let mut refs = HashMap::new();
         for entry in entries {
             let enums::PeerBlocked::Blocked(entry) = entry;
-            let Some(peer_id) = blocked_peer_id(&entry.peer_id) else {
+            let Some(peer_id) = raw_peer_id(&entry.peer_id) else {
                 continue;
             };
             let Some(id) = peer_id.bot_api_dialog_id() else {
@@ -2698,18 +2837,72 @@ fn member_next(offset: i32, received: usize, count: i32) -> Option<i32> {
     (received > 0 && next < count).then_some(next)
 }
 
-fn channel_member(participant: enums::ChannelParticipant) -> Option<(i64, MemberRole)> {
-    use enums::ChannelParticipant as P;
+fn basic_member_role(participant: &enums::ChatParticipant) -> MemberRole {
     match participant {
-        P::Participant(value) => Some((value.user_id, MemberRole::Member)),
-        P::ParticipantSelf(value) => Some((value.user_id, MemberRole::Member)),
-        P::Creator(value) => Some((value.user_id, MemberRole::Owner)),
-        P::Admin(value) => Some((value.user_id, MemberRole::Administrator)),
-        P::Banned(value) if !value.left => {
-            let peer = PeerId::from(value.peer);
-            (peer.kind() == PeerKind::User).then(|| (peer.bare_id_unchecked(), MemberRole::Member))
+        enums::ChatParticipant::Creator(_) => MemberRole::Owner,
+        enums::ChatParticipant::Admin(_) => MemberRole::Administrator,
+        enums::ChatParticipant::Participant(_) => MemberRole::Member,
+    }
+}
+
+fn channel_member(participant: &enums::ChannelParticipant) -> Option<(PeerId, Option<MemberRole>)> {
+    use enums::ChannelParticipant as P;
+    let (id, role) = match participant {
+        P::Participant(value) => (PeerId::user(value.user_id), Some(MemberRole::Member)),
+        P::ParticipantSelf(value) => (PeerId::user(value.user_id), Some(MemberRole::Member)),
+        P::Creator(value) => (PeerId::user(value.user_id), Some(MemberRole::Owner)),
+        P::Admin(value) => (PeerId::user(value.user_id), Some(MemberRole::Administrator)),
+        P::Banned(value) => {
+            let enums::ChatBannedRights::Rights(rights) = &value.banned_rights;
+            let role = if rights.view_messages {
+                Some(MemberRole::Banned)
+            } else {
+                (!value.left).then_some(MemberRole::Member)
+            };
+            (raw_peer_id(&value.peer), role)
         }
-        _ => None,
+        P::Left(value) => (raw_peer_id(&value.peer), None),
+    };
+    Some((id?, role))
+}
+
+fn channel_moderation_needed(role: Option<MemberRole>, change: MemberChange) -> Result<bool> {
+    match (role, change) {
+        (Some(MemberRole::Member), MemberChange::Ban)
+        | (Some(MemberRole::Banned), MemberChange::Unban) => Ok(true),
+        (Some(MemberRole::Banned), MemberChange::Ban)
+        | (Some(MemberRole::Member) | None, MemberChange::Unban) => Ok(false),
+        (None, MemberChange::Ban) => bail!("Пользователь больше не состоит в чате"),
+        _ => bail!("Роль участника изменилась. Обновите список"),
+    }
+}
+
+fn membership_banned_rights(banned: bool) -> types::ChatBannedRights {
+    types::ChatBannedRights {
+        view_messages: banned,
+        send_messages: false,
+        send_media: false,
+        send_stickers: false,
+        send_gifs: false,
+        send_games: false,
+        send_inline: false,
+        embed_links: false,
+        send_polls: false,
+        change_info: false,
+        invite_users: false,
+        pin_messages: false,
+        manage_topics: false,
+        send_photos: false,
+        send_videos: false,
+        send_roundvideos: false,
+        send_audios: false,
+        send_voices: false,
+        send_docs: false,
+        send_plain: false,
+        edit_rank: false,
+        send_reactions: false,
+        manage_linked_peers: false,
+        until_date: 0,
     }
 }
 
@@ -2752,6 +2945,10 @@ fn can_edit_chat(creator: bool, rights: Option<&enums::ChatAdminRights>) -> bool
     creator || rights.is_some_and(|enums::ChatAdminRights::Rights(rights)| rights.change_info)
 }
 
+fn can_moderate_chat(creator: bool, rights: Option<&enums::ChatAdminRights>) -> bool {
+    creator || rights.is_some_and(|enums::ChatAdminRights::Rights(rights)| rights.ban_users)
+}
+
 fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     let mut profile = PeerProfile {
         id: peer.id().bot_api_dialog_id().context("Чат не найден")?,
@@ -2774,6 +2971,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         fake: false,
         can_edit_chat: false,
         can_view_members: false,
+        moderation: None,
         bot_commands: Vec::new(),
     };
     let channel = match peer {
@@ -2782,10 +2980,12 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
             enums::Chat::Channel(channel) => Some(channel),
             enums::Chat::Chat(chat) => {
                 profile.members = u32::try_from(chat.participants_count).ok();
-                profile.can_edit_chat = !chat.left
-                    && !chat.deactivated
-                    && chat.migrated_to.is_none()
-                    && can_edit_chat(chat.creator, chat.admin_rights.as_ref());
+                if !chat.left && !chat.deactivated && chat.migrated_to.is_none() {
+                    profile.can_edit_chat = can_edit_chat(chat.creator, chat.admin_rights.as_ref());
+                    profile.moderation =
+                        can_moderate_chat(chat.creator, chat.admin_rights.as_ref())
+                            .then_some(MemberModeration::Remove);
+                }
                 None
             }
             _ => None,
@@ -2818,6 +3018,10 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     if let Some(channel) = channel {
         profile.can_edit_chat =
             !channel.left && can_edit_chat(channel.creator, channel.admin_rights.as_ref());
+        profile.moderation = (!channel.left
+            && !channel.min
+            && can_moderate_chat(channel.creator, channel.admin_rights.as_ref()))
+        .then_some(MemberModeration::Ban);
         profile.usernames =
             public_usernames(channel.username.as_deref(), channel.usernames.as_deref());
         profile.members = channel
@@ -2919,7 +3123,7 @@ fn chat_kind(peer: &Peer) -> ChatKind {
     }
 }
 
-fn blocked_peer_id(peer: &enums::Peer) -> Option<PeerId> {
+fn raw_peer_id(peer: &enums::Peer) -> Option<PeerId> {
     match peer {
         enums::Peer::User(peer) => PeerId::user(peer.user_id),
         enums::Peer::Chat(peer) => PeerId::chat(peer.chat_id),
@@ -3745,6 +3949,49 @@ mod tests {
     }
 
     #[test]
+    fn moderation_distinguishes_bans_from_other_restrictions_and_leavers() {
+        let build = |left, banned| {
+            let mut rights = membership_banned_rights(banned);
+            rights.send_plain = true;
+            enums::ChannelParticipant::Banned(types::ChannelParticipantBanned {
+                left,
+                peer: types::PeerUser { user_id: 5 }.into(),
+                kicked_by: 6,
+                date: 0,
+                banned_rights: rights.into(),
+                rank: None,
+            })
+        };
+        let id = PeerId::user(5).unwrap();
+        assert_eq!(
+            channel_member(&build(false, false)),
+            Some((id, Some(MemberRole::Member)))
+        );
+        assert_eq!(channel_member(&build(true, false)), Some((id, None)));
+        assert_eq!(
+            channel_member(&build(true, true)),
+            Some((id, Some(MemberRole::Banned)))
+        );
+    }
+
+    #[test]
+    fn moderation_retries_are_idempotent_and_protect_privileged_participants() {
+        use MemberChange::{Ban, Unban};
+        use MemberRole::{Administrator, Banned, Member, Owner};
+
+        assert!(channel_moderation_needed(Some(Member), Ban).unwrap());
+        assert!(channel_moderation_needed(Some(Banned), Unban).unwrap());
+        assert!(!channel_moderation_needed(Some(Banned), Ban).unwrap());
+        assert!(!channel_moderation_needed(Some(Member), Unban).unwrap());
+        assert!(!channel_moderation_needed(None, Unban).unwrap());
+        assert!(channel_moderation_needed(None, Ban).is_err());
+        for role in [Administrator, Owner] {
+            assert!(channel_moderation_needed(Some(role), Ban).is_err());
+            assert!(channel_moderation_needed(Some(role), Unban).is_err());
+        }
+    }
+
+    #[test]
     fn bot_always_offers_a_standard_start_command() {
         let commands = bot_commands(4, None);
         assert_eq!(commands.len(), 1);
@@ -3810,7 +4057,7 @@ mod tests {
             types::PeerChannel { channel_id: 23 }.into(),
         ];
         assert_eq!(
-            peers.map(|peer| blocked_peer_id(&peer).and_then(PeerId::bot_api_dialog_id)),
+            peers.map(|peer| raw_peer_id(&peer).and_then(PeerId::bot_api_dialog_id)),
             [Some(23), Some(-23), Some(-1_000_000_000_023)]
         );
     }
