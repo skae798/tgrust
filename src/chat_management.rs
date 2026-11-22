@@ -19,7 +19,7 @@ pub type EditFuture = Pin<Box<dyn Future<Output = Result<ChatInfo>> + Send>>;
 pub type MemberFuture = Pin<Box<dyn Future<Output = Result<MemberPage>> + Send>>;
 pub type MemberChangeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
-fn dialog(title: &str) -> (adw::Dialog, gtk::Box) {
+pub(crate) fn dialog(title: &str) -> (adw::Dialog, gtk::Box) {
     let dialog = adw::Dialog::builder()
         .title(title)
         .content_width(440)

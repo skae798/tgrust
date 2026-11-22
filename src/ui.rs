@@ -96,6 +96,7 @@ struct Ui {
     profile_dialog: glib::WeakRef<adw::Dialog>,
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
     demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
+    demo_invites: Rc<RefCell<demo::InviteLinks>>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     poll_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
@@ -578,6 +579,7 @@ pub fn open(
         profile_dialog: glib::WeakRef::new(),
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
         demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::new())),
+        demo_invites: Rc::new(RefCell::new(demo::InviteLinks::default())),
         own_profile_dialog: glib::WeakRef::new(),
         poll_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
@@ -2965,6 +2967,11 @@ impl Ui {
                         })
                     }
                 }),
+                invites: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |button| ui.open_invite_links(id, button)
+                )),
                 command: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
@@ -2993,6 +3000,48 @@ impl Ui {
             },
         );
         self.profile_dialog.set(Some(&dialog));
+    }
+
+    fn open_invite_links(&self, chat: i64, anchor: &gtk::Button) {
+        use crate::invite_links::{self, InviteContext};
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let write_client = client.clone();
+        let links = self.demo_invites.clone();
+        let edit_links = links.clone();
+        invite_links::open(
+            anchor,
+            InviteContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |revoked, cursor| {
+                    let client = client.clone();
+                    let local =
+                        demo.then(|| links.borrow_mut().page(chat, revoked, cursor.clone()));
+                    Box::pin(async move {
+                        if let Some(page) = local {
+                            return Ok(page);
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .invite_links(chat, revoked, cursor)
+                            .await
+                    })
+                }),
+                write: Box::new(move |action| {
+                    let client = write_client.clone();
+                    if demo {
+                        let changed = edit_links.borrow_mut().change(chat, action);
+                        return Box::pin(async { changed });
+                    }
+                    Box::pin(async move {
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .change_invite(chat, action)
+                            .await
+                    })
+                }),
+            },
+        );
     }
 
     fn apply_chat_info(self: &Rc<Self>, id: i64, info: ChatInfo) {

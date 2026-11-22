@@ -27,6 +27,7 @@ pub struct ProfileContext {
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
+    pub invites: Box<dyn Fn(&gtk::Button)>,
     pub command: Box<dyn Fn(String)>,
 }
 
@@ -246,6 +247,16 @@ impl ProfileDialog {
     }
 
     fn add_management(self: &Rc<Self>, profile: &PeerProfile) {
+        if profile.can_manage_invites {
+            let button = gtk::Button::with_label("Пригласительные ссылки");
+            button.set_halign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| (state.context.invites)(button)
+            ));
+            self.body.append(&button);
+        }
         if profile.can_edit_chat {
             let settings = gtk::Button::with_label("Настройки чата");
             settings.set_halign(gtk::Align::Center);
