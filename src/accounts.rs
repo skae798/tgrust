@@ -62,7 +62,10 @@ impl Accounts {
     pub fn activate(self: &Rc<Self>) -> Result<()> {
         let app = self.app.upgrade().context("Приложение закрыто")?;
         if let Some(window) = app.active_window() {
-            window.present();
+            if gtk::prelude::WidgetExt::activate_action(&window, "viewer.show-chat", None).is_err()
+            {
+                window.present();
+            }
             return Ok(());
         }
         if !self.windows.borrow().is_empty() {
