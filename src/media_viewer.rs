@@ -9,22 +9,21 @@ use gtk::glib;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 
-use crate::model::{PlayableMedia, PlaybackFile, PlaybackProgress};
+use crate::model::{PlayableMedia, PlaybackProgress, PlaybackSource};
 
-type PlaybackFuture = Pin<Box<dyn Future<Output = Result<PlaybackFile>> + Send>>;
+type PlaybackFuture = Pin<Box<dyn Future<Output = Result<PlaybackSource>> + Send>>;
 
 pub struct PlaybackContext {
     pub runtime: Handle,
     pub media: PlayableMedia,
     pub muted: bool,
-    pub load: Box<dyn Fn(watch::Sender<PlaybackProgress>) -> PlaybackFuture>,
+    pub load: Box<dyn Fn(watch::Sender<PlaybackProgress>, bool) -> PlaybackFuture>,
 }
 
 struct Viewer {
     context: PlaybackContext,
     window: glib::WeakRef<adw::Window>,
     header: adw::HeaderBar,
-    content: gtk::Overlay,
     stack: gtk::Stack,
     visual: gtk::Stack,
     status: gtk::Label,
@@ -34,30 +33,25 @@ struct Viewer {
     media: RefCell<Option<gtk::MediaFile>>,
     picture: gtk::Picture,
     controls: Rc<crate::playback_controls::PlaybackControls>,
-    file: RefCell<Option<PlaybackFile>>,
+    source: RefCell<Option<PlaybackSource>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     screen: (i32, i32),
     closed: Cell<bool>,
 }
 
-pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::Window {
+pub type SaveAttachment = Box<dyn Fn(&adw::Window)>;
+
+pub fn open(
+    parent: &adw::ApplicationWindow,
+    context: PlaybackContext,
+    save: Option<SaveAttachment>,
+) -> adw::Window {
     let display = gtk::prelude::WidgetExt::display(parent);
-    let monitor = parent
-        .surface()
-        .and_then(|surface| display.monitor_at_surface(&surface))
-        .or_else(|| {
-            display
-                .monitors()
-                .item(0)
-                .and_downcast::<gtk::gdk::Monitor>()
-        });
-    let screen = monitor.map_or((640, 480), |monitor| {
-        let bounds = monitor.geometry();
-        (bounds.width(), bounds.height())
-    });
+    let screen = monitor_size(parent);
     let window = adw::Window::builder()
         .title(context.media.title())
         .modal(true)
+        .transient_for(parent)
         .resizable(false)
         .build();
     window.set_display(&display);
@@ -68,6 +62,15 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
         .show_title(false)
         .decoration_layout(":close")
         .build();
+    if let Some(save) = save {
+        let button = action_button("document-save-symbolic", "Сохранить вложение");
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            window,
+            move |_| save(&window)
+        ));
+        header.pack_start(&button);
+    }
     toolbar.add_top_bar(&header);
     let content = gtk::Overlay::new();
     let stack = gtk::Stack::new();
@@ -128,12 +131,13 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
     controls.set_margin_end(8);
     controls.set_visible(false);
     toolbar.add_bottom_bar(&controls.widget);
-    window.set_content(Some(&toolbar));
+    let toasts = adw::ToastOverlay::new();
+    toasts.set_child(Some(&toolbar));
+    window.set_content(Some(&toasts));
     let state = Rc::new(Viewer {
         context,
         window: window.downgrade(),
         header,
-        content,
         stack,
         visual,
         status,
@@ -143,7 +147,7 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
         media: RefCell::new(None),
         picture,
         controls,
-        file: RefCell::new(None),
+        source: RefCell::new(None),
         task: RefCell::new(None),
         screen,
         closed: Cell::new(false),
@@ -152,10 +156,17 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
         #[weak]
         state,
         move |_| {
-            if state.file.borrow().is_some() {
+            let streaming = matches!(
+                state.source.borrow().as_ref(),
+                Some(PlaybackSource::Stream(..))
+            );
+            if streaming {
+                state.source.take();
+                state.load(true);
+            } else if state.source.borrow().is_some() {
                 state.start_playback();
             } else {
-                state.load();
+                state.load(false);
             }
         }
     ));
@@ -178,7 +189,13 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
                 && media.is_prepared()
                 && media.error().is_none()
             {
-                if key == gtk::gdk::Key::space {
+                if key == gtk::gdk::Key::space
+                    && !state
+                        .window
+                        .upgrade()
+                        .and_then(|window| gtk::prelude::RootExt::focus(&window))
+                        .is_some_and(|widget| widget.is::<gtk::Button>())
+                {
                     if media.is_playing() {
                         media.pause();
                     } else {
@@ -206,7 +223,8 @@ pub fn open(parent: &adw::ApplicationWindow, context: PlaybackContext) -> adw::W
         }
     ));
     window.add_controller(keys);
-    state.load();
+    constrain_to_workspace(&window, screen);
+    state.load(false);
     window.connect_close_request(move |_| {
         state.stop();
         glib::Propagation::Proceed
@@ -263,9 +281,13 @@ impl Viewer {
         ));
     }
 
-    fn load(self: &Rc<Self>) {
+    fn load(self: &Rc<Self>, whole: bool) {
         if self.closed.get() || self.task.borrow().is_some() {
             return;
+        }
+        self.controls.set_media_stream(None);
+        if let Some(media) = self.media.take() {
+            media.clear();
         }
         self.stack.set_visible_child_name("loading");
         self.controls.set_visible(false);
@@ -273,7 +295,10 @@ impl Viewer {
         self.progress.set_fraction(0.0);
         self.resize();
         let (progress, mut updates) = watch::channel(PlaybackProgress::default());
-        let task = self.context.runtime.spawn((self.context.load)(progress));
+        let task = self
+            .context
+            .runtime
+            .spawn((self.context.load)(progress, whole));
         self.task.replace(Some(task.abort_handle()));
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
@@ -311,7 +336,7 @@ impl Viewer {
                 state.task.take();
                 match result {
                     Ok(file) => {
-                        state.file.replace(Some(file));
+                        state.source.replace(Some(file));
                         state.start_playback();
                     }
                     Err(error) => state.show_error(&format!("Не удалось загрузить медиа. {error}")),
@@ -324,12 +349,13 @@ impl Viewer {
         if self.closed.get() {
             return;
         }
-        let Some(file) = self
-            .file
-            .borrow()
-            .as_ref()
-            .map(|file| (file.path(), file.media))
-        else {
+        let Some((file, kind, streaming)) = self.source.borrow().as_ref().map(|source| {
+            (
+                media_input(source, &self.context.runtime),
+                source.media(),
+                matches!(source, PlaybackSource::Stream(..)),
+            )
+        }) else {
             return;
         };
         self.controls.set_media_stream(None);
@@ -342,13 +368,18 @@ impl Viewer {
         self.connect_media(&media);
         self.controls.set_visible(false);
         self.stack.set_visible_child_name("loading");
-        self.status.set_text("Подготовка медиа…");
-        self.progress.set_fraction(1.0);
+        self.status.set_text(if streaming {
+            "Подключение к потоку…"
+        } else {
+            "Подготовка медиа…"
+        });
+        self.progress
+            .set_fraction(if streaming { 0.0 } else { 1.0 });
         self.resize();
         if let Some(window) = self.window.upgrade() {
-            window.set_title(Some(file.1.title()));
+            window.set_title(Some(kind.title()));
         }
-        media.set_filename(Some(file.0));
+        file.bind(&media);
         media.set_muted(self.context.muted);
         media.play();
     }
@@ -359,6 +390,16 @@ impl Viewer {
             media.pause();
         }
         self.error.set_text(error);
+        self.retry.set_label(
+            if matches!(
+                self.source.borrow().as_ref(),
+                Some(PlaybackSource::Stream(..))
+            ) {
+                "Загрузить целиком"
+            } else {
+                "Повторить"
+            },
+        );
         self.stack.set_visible_child_name("error");
         self.controls.set_visible(false);
         self.resize();
@@ -380,10 +421,10 @@ impl Viewer {
             if width > 0 && height > 0 {
                 (width, height)
             } else {
-                self.file
+                self.source
                     .borrow()
                     .as_ref()
-                    .map_or(self.context.media, |file| file.media)
+                    .map_or(self.context.media, PlaybackSource::media)
                     .dimensions()
             }
         } else if playing {
@@ -408,7 +449,6 @@ impl Viewer {
         if remap {
             window.set_visible(false);
         }
-        self.content.set_size_request(width, height);
         window.set_default_size(width.max(chrome.0), height + chrome.1);
         if remap {
             window.present();
@@ -437,12 +477,15 @@ impl Viewer {
             task.abort();
         }
         self.controls.set_media_stream(None);
+        if let Some(PlaybackSource::Stream(_, stream)) = self.source.borrow().as_ref() {
+            stream.cancel();
+        }
         if let Some(media) = self.media.take() {
             media.pause();
             media.clear();
         }
         self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
-        self.file.take();
+        self.source.take();
     }
 }
 
@@ -450,6 +493,109 @@ impl Drop for Viewer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+pub enum MediaInput {
+    File(gtk::gio::File),
+    Stream(gtk::gio::InputStream),
+}
+
+impl MediaInput {
+    pub fn bind(self, media: &gtk::MediaFile) {
+        match self {
+            Self::File(file) => media.set_file(Some(&file)),
+            Self::Stream(stream) => media.set_input_stream(Some(&stream)),
+        }
+    }
+}
+
+pub fn media_input(source: &PlaybackSource, runtime: &Handle) -> MediaInput {
+    match source {
+        PlaybackSource::Stream(_, stream) => MediaInput::Stream(stream.input(runtime.clone())),
+        PlaybackSource::File(file) => MediaInput::File(gtk::gio::File::for_path(file.path())),
+    }
+}
+
+pub fn action_button(icon: &str, title: &str) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .icon_name(icon)
+        .tooltip_text(title)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(title)]);
+    button
+}
+
+pub fn monitor_size(window: &impl IsA<gtk::Window>) -> (i32, i32) {
+    let window = window.upcast_ref::<gtk::Window>();
+    let display = gtk::prelude::WidgetExt::display(window);
+    window
+        .surface()
+        .and_then(|surface| display.monitor_at_surface(&surface))
+        .or_else(|| {
+            display
+                .monitors()
+                .item(0)
+                .and_downcast::<gtk::gdk::Monitor>()
+        })
+        .map_or((640, 480), |monitor| {
+            let geometry = monitor.geometry();
+            (geometry.width(), geometry.height())
+        })
+}
+
+pub fn constrain_to_workspace(window: &adw::Window, screen: (i32, i32)) {
+    use glib::translate::ToGlibPtr;
+    use gtk::gdk::ffi;
+
+    window.connect_realize(move |window| {
+        let Some(surface) = window.surface().and_downcast::<gtk::gdk::Toplevel>() else {
+            return;
+        };
+        surface.connect_local(
+            "compute-size",
+            true,
+            glib::clone!(
+                #[weak]
+                window,
+                #[upgrade_or]
+                None,
+                move |values| {
+                    // gdk4 0.10's typed trampoline casts the inline struct to a Rust
+                    // pointer wrapper. Keep the original pointer for this handler only.
+                    // GDK passes a non-owning GdkToplevelSize valid until the handler returns.
+                    let size = unsafe {
+                        glib::gobject_ffi::g_value_get_pointer(values[1].to_glib_none().0)
+                    }
+                    .cast::<ffi::GdkToplevelSize>();
+                    if size.is_null() {
+                        return None;
+                    }
+                    let (mut work_width, mut work_height) = (0, 0);
+                    unsafe {
+                        ffi::gdk_toplevel_size_get_bounds(size, &mut work_width, &mut work_height)
+                    };
+                    let extent = |available: i32, monitor| {
+                        if available > 0 {
+                            available.min(monitor)
+                        } else {
+                            monitor
+                        }
+                    };
+                    let bounds = (extent(work_width, screen.0), extent(work_height, screen.1));
+                    let width = window.default_width();
+                    let height = window.default_height();
+                    if width > bounds.0 || height > bounds.1 {
+                        let (width, height) = fit_viewport((width, height), bounds, (1, 0), (0, 0));
+                        unsafe {
+                            ffi::gdk_toplevel_size_set_min_size(size, width, height);
+                            ffi::gdk_toplevel_size_set_size(size, width, height);
+                        }
+                    }
+                    None
+                }
+            ),
+        );
+    });
 }
 
 pub fn frame_spacing(window: &adw::Window) -> (i32, i32) {

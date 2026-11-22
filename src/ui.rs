@@ -4077,7 +4077,27 @@ impl Ui {
             );
         }
         if message.photo_preview || playback.is_some() {
-            let button = gtk::Button::builder().child(&preview).build();
+            let preview_area = gtk::Overlay::new();
+            preview_area.set_child(Some(&preview));
+            if let Some(PlayableMedia::Video { duration, size, .. }) = playback {
+                let duration = duration.map(|seconds| {
+                    crate::playback_controls::time_label(i64::from(seconds) * 1_000_000)
+                });
+                let size = (size > 0).then(|| glib::format_size(size).to_string());
+                let info = duration
+                    .into_iter()
+                    .chain(size)
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !info.is_empty() {
+                    let details = label(&info, "video-meta");
+                    details.set_halign(gtk::Align::Start);
+                    details.set_valign(gtk::Align::End);
+                    details.set_can_target(false);
+                    preview_area.add_overlay(&details);
+                }
+            }
+            let button = gtk::Button::builder().child(&preview_area).build();
             button.add_css_class("flat");
             button.add_css_class("attachment-preview");
             button.set_vexpand(false);
@@ -5432,8 +5452,16 @@ impl Ui {
         let Some(window) = self.window.upgrade() else {
             return;
         };
+        self.save_file_from(window.upcast(), chat, id, name);
+    }
+
+    fn save_file_from(self: &Rc<Self>, window: gtk::Window, chat: i64, id: i32, name: String) {
+        let toasts = window
+            .downcast_ref::<adw::Window>()
+            .and_then(|window| window.content().and_downcast::<adw::ToastOverlay>())
+            .unwrap_or_else(|| self.toasts.clone());
         if self.downloading.replace(true) {
-            self.toast("Дождитесь текущей загрузки");
+            toasts.add_toast(adw::Toast::new("Дождитесь текущей загрузки"));
             return;
         }
         let dialog = gtk::FileDialog::builder()
@@ -5450,30 +5478,68 @@ impl Ui {
             };
             let Some(path) = target.path() else {
                 ui.downloading.set(false);
-                ui.toast("Выберите локальный каталог");
+                toasts.add_toast(adw::Toast::new("Выберите локальный каталог"));
                 return;
             };
             let client = ui.client.borrow().clone();
-            ui.toast("Загрузка вложения…");
+            let fixture = ui
+                .is_demo
+                .get()
+                .then(|| match (chat, id) {
+                    (1, 83) => Some(demo::FILE_CONTENT.as_bytes().to_vec()),
+                    (5, 2) => Some(include_bytes!("../data/demo-video.webm").to_vec()),
+                    (1, 84) | (3, 1) => Some(
+                        ui.demo_image
+                            .get_or_init(demo_texture)
+                            .save_to_png_bytes()
+                            .to_vec(),
+                    ),
+                    _ => None,
+                })
+                .flatten();
+            let progress = adw::Toast::new("Загрузка вложения…");
+            toasts.add_toast(progress.clone());
             ui.job(
                 async move {
                     if let Some(client) = client {
                         client.save(chat, id, path).await
                     } else {
+                        let bytes = fixture.context("Демонстрационное вложение недоступно")?;
                         let mut output = PendingSave::new(path)?;
-                        output.write(demo::FILE_CONTENT.as_bytes()).await?;
-                        output.finish(Some(demo::FILE_CONTENT.len())).await
+                        output.write(&bytes).await?;
+                        output.finish(Some(bytes.len())).await
                     }
                 },
-                |ui, result| {
+                move |ui, result| {
+                    progress.dismiss();
                     ui.downloading.set(false);
-                    match result {
-                        Ok(()) => ui.toast("Вложение сохранено"),
-                        Err(error) => ui.toast(&format!("Не удалось сохранить вложение. {error}")),
-                    }
+                    let message = match result {
+                        Ok(()) => "Вложение сохранено".into(),
+                        Err(error) => format!("Не удалось сохранить вложение. {error}"),
+                    };
+                    toasts.add_toast(adw::Toast::new(&message));
                 },
             );
         });
+    }
+
+    fn viewer_save(
+        self: &Rc<Self>,
+        chat: i64,
+        id: i32,
+        fallback: &str,
+    ) -> crate::media_viewer::SaveAttachment {
+        let name = self
+            .messages
+            .borrow()
+            .get(&id)
+            .and_then(|message| message.attachment.clone())
+            .unwrap_or_else(|| fallback.to_owned());
+        Box::new(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |viewer| ui.save_file_from(viewer.clone().upcast(), chat, id, name.clone())
+        ))
     }
 
     fn begin_media_preview(&self) -> u64 {
@@ -5516,15 +5582,15 @@ impl Ui {
             runtime: self.runtime.clone(),
             media,
             muted: demo,
-            load: Box::new(move |progress| {
+            load: Box::new(move |progress, whole| {
                 let client = client.clone();
                 Box::pin(async move {
                     if demo {
-                        demo::playback_preview(media, progress).await
+                        demo::playback_preview(media, progress, whole).await
                     } else {
                         client
                             .context("Нет подключения к Telegram")?
-                            .playback_preview(chat, id, progress)
+                            .playback_preview(chat, id, progress, whole)
                             .await
                     }
                 })
@@ -5542,15 +5608,20 @@ impl Ui {
                 player,
             }));
         } else {
-            let viewer = crate::media_viewer::open(&window, context);
+            let viewer = crate::media_viewer::open(
+                &window,
+                context,
+                Some(self.viewer_save(chat, id, "Видео")),
+            );
             self.media_viewer.set(Some(&viewer));
         }
     }
 
     fn open_photo_preview(self: &Rc<Self>, chat: i64, id: i32) {
         let request = self.begin_media_preview();
+        let save = self.viewer_save(chat, id, "Фотография.png");
         if self.is_demo.get() {
-            self.present_photo(self.demo_image.get_or_init(demo_texture).upcast_ref());
+            self.present_photo(self.demo_image.get_or_init(demo_texture).upcast_ref(), save);
         } else if let Some(client) = self.client.borrow().clone() {
             let progress = adw::Toast::new("Загрузка фотографии…");
             self.toasts.add_toast(progress.clone());
@@ -5566,7 +5637,7 @@ impl Ui {
                             .map_err(anyhow::Error::from)
                     });
                     match texture {
-                        Ok(texture) => ui.present_photo(&texture),
+                        Ok(texture) => ui.present_photo(&texture, save),
                         Err(error) => ui.toast(&format!("Не удалось открыть фотографию. {error}")),
                     }
                 },
@@ -5574,29 +5645,20 @@ impl Ui {
         }
     }
 
-    fn present_photo(&self, texture: &gtk::gdk::Texture) {
+    fn present_photo(
+        &self,
+        texture: &gtk::gdk::Texture,
+        save: crate::media_viewer::SaveAttachment,
+    ) {
         let Some(window) = self.window.upgrade() else {
             return;
         };
         let display = gtk::prelude::WidgetExt::display(&window);
-        let monitor = window
-            .surface()
-            .and_then(|surface| display.monitor_at_surface(&surface))
-            .or_else(|| {
-                display
-                    .monitors()
-                    .item(0)
-                    .and_downcast::<gtk::gdk::Monitor>()
-            });
-        let (screen_width, screen_height) = monitor.map_or((640, 480), |monitor| {
-            let bounds = monitor.geometry();
-            (bounds.width(), bounds.height())
-        });
-
-        // GNOME centers a modal toplevel without a transient parent on the current monitor.
+        let screen = crate::media_viewer::monitor_size(&window);
         let viewer = adw::Window::builder()
             .title("Фотография")
             .modal(true)
+            .transient_for(&window)
             .resizable(false)
             .build();
         viewer.set_display(&display);
@@ -5604,12 +5666,35 @@ impl Ui {
         viewer.set_size_request(-1, -1);
         self.media_viewer.set(Some(&viewer));
         let toolbar = adw::ToolbarView::new();
+        let toasts = adw::ToastOverlay::new();
         let header = adw::HeaderBar::builder()
             .show_title(false)
             .decoration_layout(":close")
             .build();
+        let save_button =
+            crate::media_viewer::action_button("document-save-symbolic", "Сохранить вложение");
+        save_button.connect_clicked(glib::clone!(
+            #[weak]
+            viewer,
+            move |_| save(&viewer)
+        ));
+        header.pack_start(&save_button);
+        let copy_button =
+            crate::media_viewer::action_button("edit-copy-symbolic", "Скопировать изображение");
+        copy_button.connect_clicked(glib::clone!(
+            #[strong]
+            texture,
+            #[weak]
+            toasts,
+            move |button| {
+                button.clipboard().set_texture(&texture);
+                toasts.add_toast(adw::Toast::new("Изображение скопировано"));
+            }
+        ));
+        header.pack_start(&copy_button);
         toolbar.add_top_bar(&header);
-        viewer.set_content(Some(&toolbar));
+        toasts.set_child(Some(&toolbar));
+        viewer.set_content(Some(&toasts));
         let picture = gtk::Picture::builder()
             .content_fit(gtk::ContentFit::Contain)
             .can_shrink(true)
@@ -5621,17 +5706,18 @@ impl Ui {
         let (header_height, _, _, _) = header.measure(gtk::Orientation::Vertical, -1);
         let (width, height) = photo_viewport(
             (texture.width(), texture.height()),
-            (screen_width, screen_height),
+            screen,
             (header_width, header_height),
             crate::media_viewer::frame_spacing(&viewer),
         );
         let content = gtk::Overlay::new();
-        content.set_size_request(width, height);
         content.add_overlay(&picture);
         toolbar.set_content(Some(&content));
         viewer.set_default_size(width.max(header_width), height + header_height);
 
+        crate::media_viewer::constrain_to_workspace(&viewer, screen);
         let close = gtk::EventControllerKey::new();
+        close.set_propagation_phase(gtk::PropagationPhase::Capture);
         close.connect_key_pressed(glib::clone!(
             #[weak]
             viewer,

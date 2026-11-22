@@ -11,6 +11,7 @@ publish = false
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6"] }
 anyhow = "1"
 base64 = "0.22"
+bytes = "1"
 grammers-client = { version = "0.12", default-features = false, features = ["proxy"] }
 grammers-session = "0.12"
 gtk = { package = "gtk4", version = "0.10", features = ["v4_16"] }

@@ -6,7 +6,7 @@ use gtk::glib;
 use tokio::sync::watch;
 
 use crate::media_viewer::PlaybackContext;
-use crate::model::{AudioInfo, PlayableMedia, PlaybackFile, PlaybackProgress};
+use crate::model::{AudioInfo, PlayableMedia, PlaybackProgress, PlaybackSource};
 use crate::playback_controls::time_label;
 
 pub fn waveform(input: &[u8]) -> Vec<u8> {
@@ -267,7 +267,7 @@ fn line(text: &str) -> gtk::Label {
 pub struct InlinePlayer {
     context: PlaybackContext,
     card: RefCell<AudioCard>,
-    file: RefCell<Option<PlaybackFile>>,
+    source: RefCell<Option<PlaybackSource>>,
     stream: RefCell<Option<gtk::MediaFile>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     loading: RefCell<Option<String>>,
@@ -280,14 +280,14 @@ impl InlinePlayer {
         let player = Rc::new(Self {
             context,
             card: RefCell::new(card),
-            file: RefCell::new(None),
+            source: RefCell::new(None),
             stream: RefCell::new(None),
             task: RefCell::new(None),
             loading: RefCell::new(None),
             failed: Cell::new(false),
             toasts,
         });
-        player.load();
+        player.load(false);
         player
     }
 
@@ -302,10 +302,17 @@ impl InlinePlayer {
 
     pub fn toggle(self: &Rc<Self>) {
         if self.failed.get() {
-            if self.file.borrow().is_some() {
+            let streaming = matches!(
+                self.source.borrow().as_ref(),
+                Some(PlaybackSource::Stream(..))
+            );
+            if streaming {
+                self.source.take();
+                self.load(true);
+            } else if self.source.borrow().is_some() {
                 self.prepare();
             } else {
-                self.load();
+                self.load(false);
             }
         } else if let Some(stream) = self.stream.borrow().clone() {
             if stream.is_playing() {
@@ -330,10 +337,16 @@ impl InlinePlayer {
         }
     }
 
-    fn load(self: &Rc<Self>) {
+    fn load(self: &Rc<Self>, whole: bool) {
+        if let Some(media) = self.stream.take() {
+            media.clear();
+        }
         self.loading("Загрузка аудио… Нажмите для отмены");
         let (progress, mut updates) = watch::channel(PlaybackProgress::default());
-        let task = self.context.runtime.spawn((self.context.load)(progress));
+        let task = self
+            .context
+            .runtime
+            .spawn((self.context.load)(progress, whole));
         self.task.replace(Some(task.abort_handle()));
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
@@ -358,8 +371,8 @@ impl InlinePlayer {
             let Some(player) = weak.upgrade() else { return };
             player.task.take();
             match result {
-                Ok(file) if file.media == player.context.media => {
-                    player.file.replace(Some(file));
+                Ok(file) if file.media() == player.context.media => {
+                    player.source.replace(Some(file));
                     player.prepare();
                 }
                 Ok(_) => player.error("Аудио в сообщении изменилось. Обновите чат."),
@@ -369,7 +382,12 @@ impl InlinePlayer {
     }
 
     fn prepare(self: &Rc<Self>) {
-        let Some(path) = self.file.borrow().as_ref().map(PlaybackFile::path) else {
+        let Some(file) = self
+            .source
+            .borrow()
+            .as_ref()
+            .map(|source| crate::media_viewer::media_input(source, &self.context.runtime))
+        else {
             return;
         };
         self.loading("Подготовка аудио… Нажмите для отмены");
@@ -397,7 +415,7 @@ impl InlinePlayer {
                 }
             ),
         );
-        stream.set_filename(Some(path));
+        file.bind(&stream);
         stream.set_muted(self.context.muted);
         stream.play();
     }
@@ -433,6 +451,9 @@ impl Drop for InlinePlayer {
     fn drop(&mut self) {
         if let Some(task) = self.task.get_mut().take() {
             task.abort();
+        }
+        if let Some(PlaybackSource::Stream(_, stream)) = self.source.get_mut().as_ref() {
+            stream.cancel();
         }
         if let Some(stream) = self.stream.get_mut().take() {
             stream.pause();

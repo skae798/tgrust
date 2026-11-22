@@ -26,7 +26,7 @@ use crate::model::{
     AttachmentThumbnail, Avatar, BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer, Chat, ChatFolder,
     ChatImage, ChatKind, Contact, DeviceChange, DeviceSession, DeviceSessions, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, OwnProfile,
-    PeerProfile, PlayableMedia, PlaybackFile, PlaybackProgress, Poll, PollChoice, PollDraft,
+    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, Poll, PollChoice, PollDraft,
     PollUpdate, PollVoteCount, PrivacyAudience, PrivacyChange, PrivacyKey, PrivacySetting,
     ProfileDetails, ProfileEdit, ProfileEditResult, Reaction, ReadRequest, ReplyPreview,
     SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
@@ -2158,16 +2158,28 @@ impl Telegram {
     }
 
     pub async fn playback_preview(
-        &self,
+        self: &Arc<Self>,
         chat: i64,
         id: i32,
         progress: watch::Sender<PlaybackProgress>,
-    ) -> Result<PlaybackFile> {
+        whole: bool,
+    ) -> Result<PlaybackSource> {
         let peer = self.peer(chat).await?;
         let mut media = self.attachment_media(peer, id).await?;
         let kind = playable_media(&media).context("Это вложение нельзя воспроизвести")?;
         let identity = attachment_id(&media);
         let expected = media.size().context("Неизвестен размер медиа")? as u64;
+        if !whole && kind != PlayableMedia::Voice {
+            let telegram = self.clone();
+            let cached = Arc::new(Mutex::new(media));
+            let stream = crate::media_stream::StreamSource::new(expected, move |index| {
+                let telegram = telegram.clone();
+                let cached = cached.clone();
+                Box::pin(async move { telegram.playback_chunk(peer, id, index, &cached).await })
+            })?;
+            return Ok(PlaybackSource::Stream(kind, stream));
+        }
+
         let mut output = PlaybackDownload::new(expected)?;
         let mut received = 0;
         let mut retried = false;
@@ -2186,7 +2198,7 @@ impl Telegram {
                         total: expected,
                     });
                 }
-                Ok(None) => return output.finish(kind).await,
+                Ok(None) => return Ok(PlaybackSource::File(output.finish(kind).await?)),
                 Err(error) if !retried && expired_file_reference(&error) => {
                     media = self.attachment_media(peer, id).await?;
                     ensure!(
@@ -2207,6 +2219,39 @@ impl Telegram {
                 Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    async fn playback_chunk(
+        &self,
+        peer: PeerRef,
+        id: i32,
+        index: i32,
+        cached: &Mutex<Media>,
+    ) -> Result<bytes::Bytes> {
+        let mut media = cached.lock().await;
+        for attempt in 0..2 {
+            let mut chunk = self
+                .client
+                .iter_download(&*media)
+                .chunk_size(crate::media_stream::BLOCK_SIZE)
+                .skip_chunks(index);
+            match chunk.next().await {
+                Ok(Some(bytes)) => return Ok(bytes.into()),
+                Ok(None) => bail!("Фрагмент вложения недоступен"),
+                Err(error) if attempt == 0 && expired_file_reference(&error) => {
+                    let refreshed = self.attachment_media(peer, id).await?;
+                    ensure!(
+                        attachment_id(&refreshed) == attachment_id(&media)
+                            && refreshed.size() == media.size()
+                            && playable_media(&refreshed) == playable_media(&media),
+                        "Медиа в сообщении изменилось"
+                    );
+                    *media = refreshed;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!()
     }
 
     pub async fn photo_preview(&self, chat: i64, id: i32) -> Result<Vec<u8>> {
@@ -3581,12 +3626,16 @@ fn playable_media(media: &Media) -> Option<PlayableMedia> {
     if document.raw.voice {
         return Some(PlayableMedia::Voice);
     }
+    let size = u64::try_from(raw.size).unwrap_or_default();
     raw.attributes
         .iter()
         .find_map(|attribute| match attribute {
             enums::DocumentAttribute::Video(video) => Some(PlayableMedia::Video {
                 width: video.w,
                 height: video.h,
+                duration: (video.duration.is_finite() && video.duration > 0.0)
+                    .then(|| video.duration.ceil() as u32),
+                size,
             }),
             enums::DocumentAttribute::Audio(audio) => Some(if audio.voice {
                 PlayableMedia::Voice
@@ -3601,6 +3650,8 @@ fn playable_media(media: &Media) -> Option<PlayableMedia> {
                 Some(PlayableMedia::Video {
                     width: 0,
                     height: 0,
+                    duration: None,
+                    size,
                 })
             } else if mime.starts_with("audio/") {
                 Some(PlayableMedia::Audio)
@@ -3615,6 +3666,8 @@ fn playable_media(media: &Media) -> Option<PlayableMedia> {
                         Some(PlayableMedia::Video {
                             width: 0,
                             height: 0,
+                            duration: None,
+                            size,
                         })
                     }
                     "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" => {
@@ -4109,7 +4162,9 @@ mod tests {
             playable_media(&media("VIDEO/MP4", vec![], None)),
             Some(PlayableMedia::Video {
                 width: 0,
-                height: 0
+                height: 0,
+                duration: None,
+                size: 4,
             })
         );
         assert_eq!(
@@ -4147,7 +4202,9 @@ mod tests {
             )),
             Some(PlayableMedia::Video {
                 width: 0,
-                height: 0
+                height: 0,
+                duration: None,
+                size: 4,
             })
         );
         let video = types::DocumentAttributeVideo {
@@ -4169,7 +4226,9 @@ mod tests {
             )),
             Some(PlayableMedia::Video {
                 width: 720,
-                height: 1280
+                height: 1280,
+                duration: Some(8),
+                size: 4,
             })
         );
         assert_eq!(
