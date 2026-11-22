@@ -414,28 +414,7 @@ impl Members {
         name: &str,
         change: MemberChange,
     ) {
-        let (heading, body) = match change {
-            MemberChange::Remove => (
-                "Удалить участника?",
-                format!("{name} будет удалён из группы. Его сообщения сохранятся."),
-            ),
-            MemberChange::Ban => (
-                "Заблокировать участника?",
-                format!("{name} потеряет доступ к этому чату до снятия блокировки."),
-            ),
-            MemberChange::Unban => (
-                "Снять блокировку?",
-                format!("{name} сможет снова вступить в чат, если у него есть доступ."),
-            ),
-        };
-        let prompt = adw::AlertDialog::new(Some(heading), Some(&body));
-        prompt.set_body_use_markup(false);
-        prompt.add_responses(&[("cancel", "Отмена"), ("confirm", change_label(change))]);
-        if change != MemberChange::Unban {
-            prompt.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
-        }
-        prompt.set_default_response(Some("cancel"));
-        prompt.set_close_response("cancel");
+        let prompt = moderation_prompt(name, change);
         prompt.connect_response(
             Some("confirm"),
             glib::clone!(
@@ -488,10 +467,66 @@ impl Members {
     }
 }
 
+fn moderation_prompt(name: &str, change: MemberChange) -> adw::AlertDialog {
+    let (heading, body) = match change {
+        MemberChange::Remove => (
+            "Удалить участника?",
+            format!("{name} будет удалён из группы. Его сообщения сохранятся."),
+        ),
+        MemberChange::Ban => (
+            "Заблокировать участника?",
+            format!("{name} потеряет доступ к этому чату до снятия блокировки."),
+        ),
+        MemberChange::Unban => (
+            "Снять блокировку?",
+            format!("{name} сможет снова вступить в чат, если у него есть доступ."),
+        ),
+    };
+    let prompt = adw::AlertDialog::new(Some(heading), Some(&body));
+    prompt.set_body_use_markup(false);
+    prompt.add_responses(&[("cancel", "Отмена"), ("confirm", change_label(change))]);
+    if change != MemberChange::Unban {
+        prompt.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
+    }
+    prompt.set_default_response(Some("cancel"));
+    prompt.set_close_response("cancel");
+    // The focused button takes precedence over the default action on Enter.
+    if let Some(cancel) = prompt.default_widget() {
+        prompt.set_focus(Some(&cancel));
+    }
+    prompt
+}
+
 fn change_label(change: MemberChange) -> &'static str {
     match change {
         MemberChange::Remove => "Удалить",
         MemberChange::Ban => "Заблокировать",
         MemberChange::Unban => "Разблокировать",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn moderation_prompt_focuses_cancel_in_a_narrow_window() {
+        gtk::test_synced(|| {
+            adw::init().unwrap();
+            let window = adw::Window::new();
+            window.set_default_size(400, 720);
+            window.present();
+            let prompt = moderation_prompt("Участник", MemberChange::Remove);
+            prompt.present(Some(&window));
+            let cancel = prompt
+                .default_widget()
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            assert_eq!(cancel.label().as_deref(), Some("Отмена"));
+            assert_eq!(prompt.focus(), Some(cancel.upcast::<gtk::Widget>()));
+            prompt.force_close();
+            window.close();
+        });
     }
 }
