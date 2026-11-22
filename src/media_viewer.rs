@@ -41,22 +41,34 @@ struct Viewer {
 
 pub type SaveAttachment = Box<dyn Fn(&adw::Window)>;
 
+pub(crate) fn viewer_window(parent: &adw::ApplicationWindow, title: &str) -> adw::Window {
+    let window = adw::Window::builder()
+        .title(title)
+        .modal(false)
+        .resizable(false)
+        .build();
+    window.set_display(&gtk::prelude::WidgetExt::display(parent));
+    window.set_application(parent.application().as_ref());
+    // Keep this a normal toplevel so the compositor can center it in the work area.
+    let show_chat = gtk::gio::SimpleAction::new("show-chat", None);
+    show_chat.connect_activate(glib::clone!(
+        #[weak]
+        parent,
+        move |_, _| parent.present()
+    ));
+    let actions = gtk::gio::SimpleActionGroup::new();
+    actions.add_action(&show_chat);
+    window.insert_action_group("viewer", Some(&actions));
+    window
+}
+
 pub fn open(
     parent: &adw::ApplicationWindow,
     context: PlaybackContext,
     save: Option<SaveAttachment>,
 ) -> adw::Window {
-    let display = gtk::prelude::WidgetExt::display(parent);
     let screen = monitor_size(parent);
-    let window = adw::Window::builder()
-        .title(context.media.title())
-        .modal(true)
-        .transient_for(parent)
-        .resizable(false)
-        .build();
-    window.set_display(&display);
-    window.set_application(parent.application().as_ref());
-    window.set_size_request(-1, -1);
+    let window = viewer_window(parent, context.media.title());
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::builder()
         .show_title(false)
@@ -442,8 +454,9 @@ impl Viewer {
         );
         let (width, height) = fit_viewport(dimensions, self.screen, chrome, frame_spacing(&window));
         // Wayland places a toplevel on map. Let GNOME centre the final size after
-        // switching from the loading panel or learning the decoded dimensions.
+        // switching sizes, without interrupting input after the chat regains focus.
         let remap = window.is_visible()
+            && window.is_active()
             && (window.default_width() != width.max(chrome.0)
                 || window.default_height() != height + chrome.1);
         if remap {
@@ -646,7 +659,30 @@ pub fn fit_viewport(
 
 #[cfg(test)]
 mod tests {
-    use super::fit_viewport;
+    use super::{fit_viewport, viewer_window};
+    use adw::prelude::*;
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn attachment_viewer_is_a_normal_window_with_a_chat_action() {
+        gtk::test_synced(|| {
+            adw::init().unwrap();
+            let parent = adw::ApplicationWindow::builder().build();
+            let viewer = viewer_window(&parent, "Фото");
+            assert_ne!(
+                viewer.upcast_ref::<gtk::Window>(),
+                parent.upcast_ref::<gtk::Window>()
+            );
+            assert!(!viewer.is_modal());
+            assert!(viewer.transient_for().is_none());
+            assert!(
+                gtk::prelude::WidgetExt::activate_action(&viewer, "viewer.show-chat", None).is_ok()
+            );
+            assert!(parent.is_visible());
+            viewer.close();
+            parent.close();
+        });
+    }
 
     #[test]
     fn frame_and_controls_fit_inside_a_quarter_screen_for_video_audio_and_portraits() {

@@ -5731,17 +5731,8 @@ impl Ui {
         let Some(window) = self.window.upgrade() else {
             return;
         };
-        let display = gtk::prelude::WidgetExt::display(&window);
         let screen = crate::media_viewer::monitor_size(&window);
-        let viewer = adw::Window::builder()
-            .title("Фотография")
-            .modal(true)
-            .transient_for(&window)
-            .resizable(false)
-            .build();
-        viewer.set_display(&display);
-        viewer.set_application(window.application().as_ref());
-        viewer.set_size_request(-1, -1);
+        let viewer = crate::media_viewer::viewer_window(&window, "Фотография");
         self.media_viewer.set(Some(&viewer));
         let toolbar = adw::ToolbarView::new();
         let toasts = adw::ToastOverlay::new();
