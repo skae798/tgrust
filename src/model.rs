@@ -354,7 +354,87 @@ pub struct PeerProfile {
     pub can_edit_chat: bool,
     pub can_view_members: bool,
     pub moderation: Option<MemberModeration>,
+    pub can_manage_invites: bool,
     pub bot_commands: Vec<BotCommand>,
+}
+
+pub const INVITE_PAGE_SIZE: i32 = 25;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct InviteCursor {
+    pub date: i32,
+    pub link: String,
+}
+
+#[derive(Clone)]
+pub struct InviteLink {
+    pub cursor: InviteCursor,
+    pub title: String,
+    pub permanent: bool,
+    pub revoked: bool,
+    pub expires: Option<i32>,
+    pub limit: Option<i32>,
+    pub uses: i32,
+    pub approval: bool,
+    pub pending: i32,
+    pub paid: bool,
+}
+
+impl InviteLink {
+    pub fn expired(&self, now: i64) -> bool {
+        self.expires
+            .is_some_and(|expires| i64::from(expires) <= now)
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.limit.is_some_and(|limit| self.uses >= limit)
+    }
+}
+
+pub struct InvitePage {
+    pub links: Vec<InviteLink>,
+    pub next: Option<InviteCursor>,
+}
+
+pub struct InviteDraft {
+    pub title: String,
+    pub hours: Option<i32>,
+    pub limit: Option<i32>,
+}
+
+impl InviteDraft {
+    pub fn normalize(mut self) -> anyhow::Result<Self> {
+        self.title = self.title.trim().to_owned();
+        anyhow::ensure!(
+            self.title.chars().count() <= 32,
+            "Название должно содержать до 32 символов"
+        );
+        anyhow::ensure!(
+            self.hours.is_none_or(|hours| (1..=168).contains(&hours)),
+            "Неверный срок действия"
+        );
+        anyhow::ensure!(
+            self.limit
+                .is_none_or(|limit| (1..=100_000).contains(&limit)),
+            "Укажите от 1 до 100 000 вступлений или оставьте поле пустым"
+        );
+        Ok(self)
+    }
+
+    pub fn expiration(&self, now: u64) -> anyhow::Result<Option<i32>> {
+        self.hours
+            .map(|hours| {
+                now.checked_add(hours as u64 * 3600)
+                    .and_then(|expires| i32::try_from(expires).ok())
+                    .ok_or_else(|| anyhow::anyhow!("Невозможно установить срок действия"))
+            })
+            .transpose()
+    }
+}
+
+pub enum InviteAction {
+    Create(InviteDraft),
+    Revoke(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1309,6 +1389,32 @@ pub fn prepend_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invite_draft_validates_limits_and_calculates_expiration_at_send_time() {
+        let draft = InviteDraft {
+            title: "  Экскурсия  ".into(),
+            hours: Some(24),
+            limit: Some(3),
+        }
+        .normalize()
+        .unwrap();
+        assert_eq!(draft.title, "Экскурсия");
+        assert_eq!(
+            draft.expiration(1_700_000_000).unwrap(),
+            Some(1_700_086_400)
+        );
+        assert!(draft.expiration(i32::MAX as u64).is_err());
+        assert!(
+            InviteDraft {
+                title: String::new(),
+                hours: None,
+                limit: Some(0),
+            }
+            .normalize()
+            .is_err()
+        );
+    }
 
     #[test]
     fn chat_info_retry_skips_a_confirmed_title_and_preserves_unedited_fields() {

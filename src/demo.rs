@@ -3,9 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
     AttachmentThumbnail, AudioInfo, Avatar, BotCommand, Chat, ChatFolder, ChatImage, ChatKind,
-    ChatMember, Contact, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration,
-    MemberPage, MemberRole, Message, PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource,
-    PollDraft, TextLink,
+    ChatMember, Contact, INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink,
+    InvitePage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
+    MemberRole, Message, PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft,
+    TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -116,6 +117,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             can_edit_chat: false,
             can_view_members: false,
             moderation: None,
+            can_manage_invites: false,
             bot_commands: Vec::new(),
         });
     }
@@ -162,6 +164,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         can_edit_chat: matches!(id, 1 | 3),
         can_view_members: matches!(id, 1 | 3 | 6),
         moderation: demo_moderation(id),
+        can_manage_invites: matches!(id, 1 | 3),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -174,6 +177,115 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             Vec::new()
         },
     })
+}
+
+#[derive(Default)]
+pub struct InviteLinks {
+    links: HashMap<i64, Vec<InviteLink>>,
+    created: u32,
+}
+
+impl InviteLinks {
+    fn links(&mut self, chat: i64) -> &mut Vec<InviteLink> {
+        self.links.entry(chat).or_insert_with(|| {
+            (0..28)
+                .map(|index| InviteLink {
+                    cursor: InviteCursor {
+                        date: 1_700_000_000 - index,
+                        link: format!("https://example.invalid/+demo-{chat}-{index}"),
+                    },
+                    title: match index {
+                        0 => "Основная ссылка".into(),
+                        1 => "Превышен лимит".into(),
+                        27 => "Отозванная ссылка".into(),
+                        _ => format!("Приглашение {index}"),
+                    },
+                    permanent: index == 0,
+                    revoked: index == 27,
+                    expires: None,
+                    limit: (index == 1).then_some(2),
+                    uses: if index == 1 { 2 } else { 0 },
+                    approval: false,
+                    pending: 0,
+                    paid: false,
+                })
+                .collect()
+        })
+    }
+
+    pub fn page(&mut self, chat: i64, revoked: bool, after: Option<InviteCursor>) -> InvitePage {
+        let links = self.links(chat);
+        let offset = after
+            .as_ref()
+            .and_then(|after| links.iter().position(|link| &link.cursor == after))
+            .map_or(0, |index| index + 1);
+        let mut links: Vec<_> = links[offset..]
+            .iter()
+            .filter(|link| link.revoked == revoked)
+            .take(INVITE_PAGE_SIZE as usize + 1)
+            .cloned()
+            .collect();
+        let next = if links.len() > INVITE_PAGE_SIZE as usize {
+            links.pop();
+            links.last().map(|link| link.cursor.clone())
+        } else {
+            None
+        };
+        InvitePage { links, next }
+    }
+
+    pub fn change(&mut self, chat: i64, action: InviteAction) -> anyhow::Result<()> {
+        match action {
+            InviteAction::Create(draft) => {
+                let draft = draft.normalize()?;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let expires = draft.expiration(now)?;
+                self.created += 1;
+                let link = format!("https://example.invalid/+demo-{chat}-new-{}", self.created);
+                self.links(chat).insert(
+                    0,
+                    InviteLink {
+                        cursor: InviteCursor {
+                            date: i32::try_from(now)?,
+                            link,
+                        },
+                        title: draft.title,
+                        permanent: false,
+                        revoked: false,
+                        expires,
+                        limit: draft.limit,
+                        uses: 0,
+                        approval: false,
+                        pending: 0,
+                        paid: false,
+                    },
+                );
+            }
+            InviteAction::Revoke(url) => {
+                let invite = self
+                    .links(chat)
+                    .iter_mut()
+                    .find(|link| link.cursor.link == url)
+                    .ok_or_else(|| anyhow::anyhow!("Ссылка не найдена"))?;
+                if invite.revoked {
+                    return Ok(());
+                }
+                invite.revoked = true;
+                if invite.permanent {
+                    self.change(
+                        chat,
+                        InviteAction::Create(InviteDraft {
+                            title: "Новая основная ссылка".into(),
+                            hours: None,
+                            limit: None,
+                        }),
+                    )?;
+                    self.links(chat)[0].permanent = true;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub type MemberChanges = HashMap<(i64, i64), MemberChange>;

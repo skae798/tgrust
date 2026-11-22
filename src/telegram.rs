@@ -33,8 +33,9 @@ use crate::model::{
     UploadKind, redact_spoilers,
 };
 use crate::model::{
-    AudioInfo, BotCommand, ChatInfo, ChatMember, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
-    MemberModeration, MemberPage, MemberRole, TextLink,
+    AudioInfo, BotCommand, ChatInfo, ChatMember, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
+    InviteLink, InvitePage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration,
+    MemberPage, MemberRole, TextLink,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -931,6 +932,111 @@ impl Telegram {
             self.invalidate_views();
         }
         Ok(current)
+    }
+
+    async fn invite_peer(&self, chat: i64) -> Result<PeerRef> {
+        let reference = self.peer(chat).await?;
+        let full = self.full_chat(reference).await?;
+        ensure!(
+            self.chat_profile_view(reference, full.chats)?
+                .can_manage_invites,
+            "Telegram не разрешает управлять ссылками этого чата"
+        );
+        Ok(reference)
+    }
+
+    pub async fn invite_links(
+        &self,
+        chat: i64,
+        revoked: bool,
+        cursor: Option<InviteCursor>,
+    ) -> Result<InvitePage> {
+        use grammers_client::tl::functions::messages::GetExportedChatInvites;
+        let peer = self.invite_peer(chat).await?;
+        let enums::messages::ExportedChatInvites::Invites(result) = self
+            .client
+            .invoke(&GetExportedChatInvites {
+                revoked,
+                peer: peer.into(),
+                admin_id: enums::InputUser::UserSelf,
+                offset_date: cursor.as_ref().map(|cursor| cursor.date),
+                offset_link: cursor.as_ref().map(|cursor| cursor.link.clone()),
+                limit: INVITE_PAGE_SIZE,
+            })
+            .await?;
+        Ok(exported_invite_page(result, cursor.as_ref(), revoked))
+    }
+
+    pub async fn change_invite(&self, chat: i64, action: InviteAction) -> Result<()> {
+        use grammers_client::tl::functions::messages::{
+            EditExportedChatInvite, ExportChatInvite, GetExportedChatInvite,
+        };
+        let _settings = self.dialog_settings.lock().await;
+        let peer = self.invite_peer(chat).await?;
+        match action {
+            InviteAction::Create(draft) => {
+                let draft = draft.normalize()?;
+                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+                let invite = self
+                    .client
+                    .invoke(&ExportChatInvite {
+                        legacy_revoke_permanent: false,
+                        request_needed: false,
+                        peer: peer.into(),
+                        expire_date: draft.expiration(now)?,
+                        usage_limit: draft.limit,
+                        title: (!draft.title.is_empty()).then_some(draft.title),
+                        subscription_pricing: None,
+                    })
+                    .await?;
+                ensure!(
+                    invite_link(invite).is_some_and(|link| !link.revoked),
+                    "Telegram не подтвердил создание ссылки"
+                );
+            }
+            InviteAction::Revoke(link) => {
+                let current = self
+                    .client
+                    .invoke(&GetExportedChatInvite {
+                        peer: peer.into(),
+                        link: link.clone(),
+                    })
+                    .await?
+                    .invite();
+                let account = match self.self_id().await? {
+                    Some(account) => account,
+                    None => self
+                        .profile()
+                        .await
+                        .context("Не удалось проверить владельца ссылки")?
+                        .id(),
+                };
+                let account = account
+                    .bare_id()
+                    .context("Не удалось проверить владельца ссылки")?;
+                if !needs_invite_revocation(&current, account, &link)? {
+                    return Ok(());
+                }
+                let result = self
+                    .client
+                    .invoke(&EditExportedChatInvite {
+                        revoked: true,
+                        peer: peer.into(),
+                        link: link.clone(),
+                        expire_date: None,
+                        usage_limit: None,
+                        request_needed: None,
+                        title: None,
+                    })
+                    .await?;
+                ensure!(
+                    invite_link(result.invite())
+                        .is_some_and(|old| old.revoked && old.cursor.link == link),
+                    "Telegram не подтвердил отзыв ссылки"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub async fn chat_members(
@@ -2949,6 +3055,65 @@ fn can_moderate_chat(creator: bool, rights: Option<&enums::ChatAdminRights>) -> 
     creator || rights.is_some_and(|enums::ChatAdminRights::Rights(rights)| rights.ban_users)
 }
 
+fn can_manage_invites(creator: bool, rights: Option<&enums::ChatAdminRights>) -> bool {
+    creator || rights.is_some_and(|enums::ChatAdminRights::Rights(rights)| rights.invite_users)
+}
+
+fn invite_link(raw: enums::ExportedChatInvite) -> Option<InviteLink> {
+    let enums::ExportedChatInvite::ChatInviteExported(raw) = raw else {
+        return None;
+    };
+    (!raw.link.is_empty()).then_some(InviteLink {
+        cursor: InviteCursor {
+            date: raw.date,
+            link: raw.link,
+        },
+        title: raw.title.unwrap_or_default(),
+        permanent: raw.permanent,
+        revoked: raw.revoked,
+        expires: raw.expire_date.filter(|date| *date > 0),
+        limit: raw.usage_limit.filter(|limit| *limit > 0),
+        uses: raw.usage.unwrap_or_default().max(0),
+        approval: raw.request_needed,
+        pending: raw.requested.unwrap_or_default().max(0),
+        paid: raw.subscription_pricing.is_some(),
+    })
+}
+
+fn exported_invite_page(
+    raw: types::messages::ExportedChatInvites,
+    cursor: Option<&InviteCursor>,
+    revoked: bool,
+) -> InvitePage {
+    let received = raw.invites.len();
+    let mut links: Vec<_> = raw.invites.into_iter().filter_map(invite_link).collect();
+    let next = (received >= INVITE_PAGE_SIZE as usize || received < raw.count.max(0) as usize)
+        .then(|| links.last().map(|link| link.cursor.clone()))
+        .flatten()
+        .filter(|next| Some(next) != cursor);
+    links.retain(|link| link.revoked == revoked);
+    InvitePage { links, next }
+}
+
+fn needs_invite_revocation(
+    raw: &enums::ExportedChatInvite,
+    account: i64,
+    link: &str,
+) -> Result<bool> {
+    let enums::ExportedChatInvite::ChatInviteExported(raw) = raw else {
+        bail!("Telegram вернул неизвестную ссылку");
+    };
+    ensure!(
+        raw.link == link && raw.admin_id == account,
+        "Ссылка принадлежит другому администратору"
+    );
+    ensure!(
+        raw.subscription_pricing.is_none(),
+        "Эта ссылка связана с подпиской Telegram Stars"
+    );
+    Ok(!raw.revoked)
+}
+
 fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     let mut profile = PeerProfile {
         id: peer.id().bot_api_dialog_id().context("Чат не найден")?,
@@ -2972,6 +3137,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         can_edit_chat: false,
         can_view_members: false,
         moderation: None,
+        can_manage_invites: false,
         bot_commands: Vec::new(),
     };
     let channel = match peer {
@@ -2982,6 +3148,8 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
                 profile.members = u32::try_from(chat.participants_count).ok();
                 if !chat.left && !chat.deactivated && chat.migrated_to.is_none() {
                     profile.can_edit_chat = can_edit_chat(chat.creator, chat.admin_rights.as_ref());
+                    profile.can_manage_invites =
+                        can_manage_invites(chat.creator, chat.admin_rights.as_ref());
                     profile.moderation =
                         can_moderate_chat(chat.creator, chat.admin_rights.as_ref())
                             .then_some(MemberModeration::Remove);
@@ -3018,6 +3186,10 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     if let Some(channel) = channel {
         profile.can_edit_chat =
             !channel.left && can_edit_chat(channel.creator, channel.admin_rights.as_ref());
+        profile.can_manage_invites = !channel.left
+            && !channel.min
+            && !channel.monoforum
+            && can_manage_invites(channel.creator, channel.admin_rights.as_ref());
         profile.moderation = (!channel.left
             && !channel.min
             && can_moderate_chat(channel.creator, channel.admin_rights.as_ref()))
@@ -3946,6 +4118,73 @@ mod tests {
         assert_eq!(member_next(40, 0, 120), None);
         assert_eq!(member_next(40, 37, 77), None);
         assert_eq!(member_next(i32::MAX, 1, i32::MAX), None);
+    }
+
+    fn test_invite(link: &str, revoked: bool) -> types::ChatInviteExported {
+        types::ChatInviteExported {
+            revoked,
+            permanent: true,
+            request_needed: false,
+            link: link.into(),
+            admin_id: 123,
+            date: 100,
+            start_date: None,
+            expire_date: None,
+            usage_limit: None,
+            usage: None,
+            requested: None,
+            subscription_expired: None,
+            title: None,
+            subscription_pricing: None,
+        }
+    }
+
+    #[test]
+    fn exported_invites_advance_both_cursor_fields_despite_equal_dates() {
+        let last = InviteCursor {
+            date: 100,
+            link: "second".into(),
+        };
+        let page = || types::messages::ExportedChatInvites {
+            count: 5,
+            invites: vec![
+                test_invite("first", false).into(),
+                test_invite("second", false).into(),
+                enums::ExportedChatInvite::ChatInvitePublicJoinRequests,
+            ],
+            users: Vec::new(),
+        };
+        let previous = InviteCursor {
+            date: 100,
+            link: "previous".into(),
+        };
+        let first = exported_invite_page(page(), Some(&previous), false);
+        assert_eq!(first.links.len(), 2);
+        assert!(first.next.as_ref() == Some(&last));
+        assert!(
+            exported_invite_page(page(), Some(&last), false)
+                .next
+                .is_none()
+        );
+        assert!(exported_invite_page(page(), None, true).links.is_empty());
+    }
+
+    #[test]
+    fn revoke_checks_ownership_and_preserves_paid_links() {
+        let mut raw = test_invite("link", false);
+        assert!(needs_invite_revocation(&raw.clone().into(), 123, "link").unwrap());
+        assert!(needs_invite_revocation(&raw.clone().into(), 123, "other").is_err());
+        assert!(needs_invite_revocation(&raw.clone().into(), 124, "link").is_err());
+        raw.revoked = true;
+        assert!(!needs_invite_revocation(&raw.clone().into(), 123, "link").unwrap());
+        raw.subscription_pricing = Some(
+            types::StarsSubscriptionPricing {
+                period: 2592000,
+                amount: 4,
+            }
+            .into(),
+        );
+        assert!(needs_invite_revocation(&raw.into(), 123, "link").is_err());
     }
 
     #[test]
