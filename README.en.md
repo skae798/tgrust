@@ -22,7 +22,7 @@ The prebuilt client checks for updates automatically and opens the new build on 
 
 - **Messages** — scroll to load history, search, reply, edit, react, and vote in polls.
 - **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers.
-- **Chats** — folders, archive, GNOME notifications, member moderation, administrator permissions, invite links, and join requests.
+- **Chats** — folders, archive, GNOME notifications, moderation, administrator permissions, invitations, join requests, and recent actions.
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.
 
 ## Documentation

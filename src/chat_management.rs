@@ -21,6 +21,11 @@ pub type MemberFuture = Pin<Box<dyn Future<Output = Result<MemberPage>> + Send>>
 pub type MemberChangeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 pub(crate) fn dialog(title: &str) -> (adw::Dialog, gtk::Box) {
+    let (dialog, _, body) = dialog_with_toolbar(title);
+    (dialog, body)
+}
+
+pub(crate) fn dialog_with_toolbar(title: &str) -> (adw::Dialog, adw::ToolbarView, gtk::Box) {
     let dialog = adw::Dialog::builder()
         .title(title)
         .content_width(440)
@@ -39,7 +44,7 @@ pub(crate) fn dialog(title: &str) -> (adw::Dialog, gtk::Box) {
         .build();
     toolbar.set_content(Some(&scroll));
     dialog.set_child(Some(&toolbar));
-    (dialog, body)
+    (dialog, toolbar, body)
 }
 
 fn status_label() -> gtk::Label {
@@ -500,7 +505,7 @@ impl Members {
         }
         let group = adw::PreferencesGroup::new();
         let mut options = Vec::new();
-        for (right, title) in ADMIN_OPTIONS {
+        for (right, title) in AdminRight::OPTIONS {
             let selected = original.rights().has(right);
             let editable = allowed.has(right);
             if selected || editable {
@@ -655,30 +660,6 @@ struct AdminEditor {
     dialog: adw::Dialog,
     status: gtk::Label,
 }
-
-const ADMIN_OPTIONS: [(AdminRight, &str); 18] = {
-    use AdminRight::*;
-    [
-        (ChangeInfo, "Изменять информацию"),
-        (PostMessages, "Публиковать сообщения"),
-        (EditMessages, "Редактировать сообщения"),
-        (DeleteMessages, "Удалять сообщения"),
-        (BanUsers, "Блокировать участников"),
-        (InviteUsers, "Приглашать участников"),
-        (PinMessages, "Закреплять сообщения"),
-        (ManageTopics, "Управлять темами"),
-        (ManageCall, "Управлять видеочатами"),
-        (Anonymous, "Сохранять анонимность"),
-        (PostStories, "Публиковать истории"),
-        (EditStories, "Редактировать истории"),
-        (DeleteStories, "Удалять истории"),
-        (ManageDirectMessages, "Управлять личными сообщениями канала"),
-        (ManageRanks, "Менять теги участников"),
-        (ManageLinkedPeers, "Управлять связанными чатами"),
-        (ManageWelcomeMessages, "Менять приветственные сообщения"),
-        (AddAdmins, "Назначать администраторов"),
-    ]
-};
 
 fn moderation_prompt(name: &str, change: MemberChange) -> adw::AlertDialog {
     let (heading, body) = match change {

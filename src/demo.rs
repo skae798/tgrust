@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
+    ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
     BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, INVITE_PAGE_SIZE,
     InviteAction, InviteCursor, InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE,
@@ -120,6 +121,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             moderation: None,
             admin_policy: None,
             can_manage_invites: false,
+            can_read_admin_log: false,
             bot_commands: Vec::new(),
         });
     }
@@ -168,6 +170,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         moderation: demo_moderation(id),
         admin_policy: demo_admin_policy(id),
         can_manage_invites: matches!(id, 1 | 3),
+        can_read_admin_log: id == 3,
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -370,6 +373,81 @@ impl JoinRequests {
 }
 
 pub type MemberChanges = HashMap<(i64, i64), MemberChange>;
+
+pub fn admin_log(chat: i64, query: AdminLogQuery, before: Option<i64>) -> AdminLogPage {
+    use AdminLogFilter as F;
+    let query_text = query.text.to_lowercase();
+    let now = now();
+    let entries = (1..=43)
+        .rev()
+        .filter(|&id| chat == 3 && before.is_none_or(|before| id < before))
+        .filter_map(|id| {
+            let (filter, actor, action, details) = match id {
+                43 => (
+                    F::Settings,
+                    1,
+                    "Изменено название",
+                    Some("Было\nВести проекта\n\nСтало\nНовости проекта".to_owned()),
+                ),
+                42 => (
+                    F::Permissions,
+                    2,
+                    "Назначен администратор",
+                    Some("Бот проекта\n\nСтало\nПубликовать сообщения".to_owned()),
+                ),
+                41 => (
+                    F::Messages,
+                    1,
+                    "Сообщение удалено",
+                    Some("Черновик афиши для демонстрации".to_owned()),
+                ),
+                40 => (
+                    F::Invites,
+                    2,
+                    "Пригласительная ссылка отозвана",
+                    Some("Приглашение на встречу".to_owned()),
+                ),
+                39 => (
+                    F::Topics,
+                    1,
+                    "Тема создана",
+                    Some("Подготовка мероприятия".to_owned()),
+                ),
+                38 => (F::Calls, 2, "Начат видеочат", None),
+                2 => (F::Members, 4, "Участник вступил в чат", None),
+                1 => (F::Members, 2, "Участник вышел из чата", None),
+                _ => (F::Members, 1 + id % 2, "Участник вступил в чат", None),
+            };
+            let name = match (id, actor) {
+                (2, _) => "Гость второй страницы",
+                (_, 1) => "Алексей",
+                _ => "Анна",
+            };
+            let matches_text = query_text.is_empty()
+                || name.to_lowercase().contains(&query_text)
+                || action.to_lowercase().contains(&query_text)
+                || details
+                    .as_ref()
+                    .is_some_and(|text| text.to_lowercase().contains(&query_text));
+            (matches_text
+                && (query.filter == F::All || filter == query.filter)
+                && query.actor.is_none_or(|value| value == actor))
+            .then(|| AdminLogEntry {
+                id,
+                date: i32::try_from(now - (44 - id) * 60).unwrap_or_default(),
+                actor: AdminLogActor {
+                    filter_id: Some(actor),
+                    name: name.to_owned(),
+                    avatar: (actor == 1 && id != 2).then_some(OWN_AVATAR),
+                },
+                action: action.to_owned(),
+                details,
+            })
+        })
+        .take(ADMIN_LOG_PAGE_SIZE)
+        .collect();
+    AdminLogPage::new(entries, before)
+}
 
 fn demo_moderation(chat: i64) -> Option<MemberModeration> {
     match chat {

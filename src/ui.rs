@@ -2979,6 +2979,11 @@ impl Ui {
                     self,
                     move |button| ui.open_join_requests(id, button)
                 )),
+                admin_log: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |button| ui.open_admin_log(id, button)
+                )),
                 command: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
@@ -3096,6 +3101,36 @@ impl Ui {
                     move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
                 )),
                 updates,
+            },
+        );
+    }
+
+    fn open_admin_log(self: &Rc<Self>, chat: i64, anchor: &gtk::Button) {
+        use crate::admin_log::{self, AdminLogContext};
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        admin_log::open(
+            anchor,
+            AdminLogContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |query, before| {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            tokio::time::sleep(Duration::from_millis(180)).await;
+                            return Ok(demo::admin_log(chat, query, before));
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .admin_log(chat, query, before)
+                            .await
+                    })
+                }),
+                avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
+                )),
             },
         );
     }

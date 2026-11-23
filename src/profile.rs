@@ -29,6 +29,7 @@ pub struct ProfileContext {
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
     pub invites: Box<dyn Fn(&gtk::Button)>,
     pub join_requests: Box<dyn Fn(&gtk::Button)>,
+    pub admin_log: Box<dyn Fn(&gtk::Button)>,
     pub command: Box<dyn Fn(String)>,
 }
 
@@ -248,6 +249,16 @@ impl ProfileDialog {
     }
 
     fn add_management(self: &Rc<Self>, profile: &PeerProfile) {
+        if profile.can_read_admin_log {
+            let button = gtk::Button::with_label("Недавние действия");
+            button.set_halign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| (state.context.admin_log)(button)
+            ));
+            self.body.append(&button);
+        }
         if profile.can_manage_invites {
             let button = gtk::Button::with_label("Пригласительные ссылки");
             button.set_halign(gtk::Align::Center);

@@ -1,3 +1,5 @@
+mod admin_log;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3490,6 +3492,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         moderation: None,
         admin_policy: None,
         can_manage_invites: false,
+        can_read_admin_log: false,
         bot_commands: Vec::new(),
     };
     let channel = match peer {
@@ -3538,6 +3541,10 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
     };
     if let Some(channel) = channel {
         profile.admin_policy = channel_admin_policy(channel);
+        profile.can_read_admin_log = !channel.left
+            && !channel.min
+            && !channel.monoforum
+            && (channel.creator || channel.admin_rights.is_some());
         profile.can_edit_chat =
             !channel.left && can_edit_chat(channel.creator, channel.admin_rights.as_ref());
         profile.can_manage_invites = !channel.left

@@ -356,7 +356,59 @@ pub struct PeerProfile {
     pub moderation: Option<MemberModeration>,
     pub admin_policy: Option<AdminPolicy>,
     pub can_manage_invites: bool,
+    pub can_read_admin_log: bool,
     pub bot_commands: Vec<BotCommand>,
+}
+
+pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdminLogFilter {
+    #[default]
+    All,
+    Members,
+    Permissions,
+    Messages,
+    Settings,
+    Invites,
+    Topics,
+    Calls,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AdminLogQuery {
+    pub text: String,
+    pub filter: AdminLogFilter,
+    pub actor: Option<i64>,
+}
+
+pub struct AdminLogActor {
+    pub filter_id: Option<i64>,
+    pub name: String,
+    pub avatar: Option<Avatar>,
+}
+
+pub struct AdminLogEntry {
+    pub id: i64,
+    pub date: i32,
+    pub actor: AdminLogActor,
+    pub action: String,
+    pub details: Option<String>,
+}
+
+pub struct AdminLogPage {
+    pub entries: Vec<AdminLogEntry>,
+    pub next: Option<i64>,
+}
+
+impl AdminLogPage {
+    pub fn new(mut entries: Vec<AdminLogEntry>, before: Option<i64>) -> Self {
+        entries.retain(|entry| entry.id > 0 && before.is_none_or(|before| entry.id < before));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.id));
+        entries.dedup_by_key(|entry| entry.id);
+        let next = entries.last().map(|entry| entry.id).filter(|&id| id > 1);
+        Self { entries, next }
+    }
 }
 
 pub const INVITE_PAGE_SIZE: i32 = 25;
@@ -678,6 +730,32 @@ pub enum AdminRight {
     ManageRanks,
     ManageLinkedPeers,
     ManageWelcomeMessages,
+}
+
+impl AdminRight {
+    pub const OPTIONS: [(Self, &'static str); 18] = {
+        use AdminRight::*;
+        [
+            (ChangeInfo, "Изменять информацию"),
+            (PostMessages, "Публиковать сообщения"),
+            (EditMessages, "Редактировать сообщения"),
+            (DeleteMessages, "Удалять сообщения"),
+            (BanUsers, "Блокировать участников"),
+            (InviteUsers, "Приглашать участников"),
+            (PinMessages, "Закреплять сообщения"),
+            (ManageTopics, "Управлять темами"),
+            (ManageCall, "Управлять видеочатами"),
+            (Anonymous, "Сохранять анонимность"),
+            (PostStories, "Публиковать истории"),
+            (EditStories, "Редактировать истории"),
+            (DeleteStories, "Удалять истории"),
+            (ManageDirectMessages, "Управлять личными сообщениями канала"),
+            (ManageRanks, "Менять теги участников"),
+            (ManageLinkedPeers, "Управлять связанными чатами"),
+            (ManageWelcomeMessages, "Менять приветственные сообщения"),
+            (AddAdmins, "Назначать администраторов"),
+        ]
+    };
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1670,6 +1748,29 @@ pub fn prepend_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admin_log_pages_skip_overlap_and_stop_at_zero_or_no_progress() {
+        let entry = |id| AdminLogEntry {
+            id,
+            date: 100,
+            actor: AdminLogActor {
+                name: "Пример".into(),
+                filter_id: None,
+                avatar: None,
+            },
+            action: "Изменено название".into(),
+            details: None,
+        };
+        let page = AdminLogPage::new([40, 35, 48, 39, 35, 0].map(entry).into(), Some(40));
+        assert_eq!(
+            page.entries.iter().map(|e| e.id).collect::<Vec<_>>(),
+            [39, 35]
+        );
+        assert_eq!(page.next, Some(35));
+        assert_eq!(AdminLogPage::new(vec![entry(1)], Some(35)).next, None);
+        assert_eq!(AdminLogPage::new(vec![entry(40)], Some(40)).next, None);
+    }
 
     #[test]
     fn channel_admin_changes_preserve_locked_rights_and_reject_stale_roles() {
