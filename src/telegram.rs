@@ -1,6 +1,7 @@
 mod admin_log;
 mod chat_addresses;
 mod create_chat;
+mod group_permissions;
 mod invite_members;
 use invite_members::invite_restricted;
 
@@ -3501,6 +3502,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         can_add_members: false,
         can_read_admin_log: false,
         addresses: None,
+        group_permissions: group_permissions::group_permissions(peer).map(|(settings, _)| settings),
         bot_commands: Vec::new(),
     };
     let channel = match peer {

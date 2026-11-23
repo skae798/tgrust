@@ -5,11 +5,11 @@ use crate::model::{
     ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
     BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, CreatedChat,
-    INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink, InvitePage,
-    JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor, JoinRequestPage,
-    MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole,
-    Message, NewChatDraft, NewChatKind, NewChatResult, PeerProfile, PlayableMedia,
-    PlaybackProgress, PlaybackSource, PollDraft, TextLink,
+    GroupPermission, GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction,
+    InviteCursor, InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome,
+    JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
+    MemberModeration, MemberPage, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
+    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -126,6 +126,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             can_add_members: false,
             can_read_admin_log: false,
             addresses: None,
+            group_permissions: None,
             bot_commands: Vec::new(),
         });
     }
@@ -191,6 +192,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
                 },
             ],
         }),
+        group_permissions: (id == 1).then(|| group_permissions(GroupPermissions::all(), false)),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -264,7 +266,23 @@ pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
             primary: draft.username.clone(),
             aliases: Vec::new(),
         }),
+        group_permissions: (!broadcast)
+            .then(|| group_permissions(GroupPermissions::all(), !draft.username.is_empty())),
         bot_commands: Vec::new(),
+    }
+}
+
+pub fn group_permissions(allowed: GroupPermissions, public: bool) -> GroupPermissionSettings {
+    use GroupPermission::{ChangeInfo, Pin, Topics};
+    GroupPermissionSettings {
+        allowed: allowed
+            .with(Pin, !public && allowed.has(Pin))
+            .with(ChangeInfo, !public && allowed.has(ChangeInfo)),
+        editable: GroupPermissions::all()
+            .with(Topics, false)
+            .with(Pin, !public)
+            .with(ChangeInfo, !public),
+        forum: false,
     }
 }
 
