@@ -1,47 +1,70 @@
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result, ensure};
 use grammers_client::peer::Peer;
+use grammers_client::tl::functions::channels::ToggleSlowMode;
 use grammers_client::tl::functions::messages::EditChatDefaultBannedRights;
 use tokio::time::timeout;
 
 use super::chat_addresses::channel_addresses;
 use super::create_chat::RPC_TIMEOUT;
-use super::{PeerRef, Telegram, can_moderate_chat, enums, membership_banned_rights, types};
-use crate::model::{GroupPermission, GroupPermissionSettings, GroupPermissions};
+use super::{
+    InvocationError, PeerKind, PeerRef, Telegram, can_moderate_chat, enums,
+    membership_banned_rights, types,
+};
+use crate::model::{
+    GroupPermission, GroupPermissionEdit, GroupPermissionSettings, GroupPermissions,
+    slow_mode_change,
+};
 
 impl Telegram {
     pub async fn edit_group_permissions(
         &self,
         id: i64,
         original: GroupPermissionSettings,
-        requested: GroupPermissions,
+        requested: GroupPermissionEdit,
     ) -> Result<()> {
         let _serial = self.dialog_settings.lock().await;
         let reference = self.peer(id).await?;
         let (current, mut raw) = self.current_group_permissions(reference).await?;
-        let changes = current.changes(original, requested)?;
-        if changes.is_empty() {
+        let changes = current.changes(original, requested.allowed)?;
+        let slow_mode =
+            slow_mode_change(current.slow_mode, original.slow_mode, requested.slow_mode)?;
+        if changes.is_empty() && slow_mode.is_none() {
             return Ok(());
         }
 
-        apply_changes(&mut raw, &changes);
-        let result = timeout(
-            RPC_TIMEOUT,
-            self.client.invoke(&EditChatDefaultBannedRights {
-                peer: reference.into(),
-                banned_rights: raw.into(),
-            }),
-        )
-        .await;
-        // A timed-out request may still have been applied.
-        self.invalidate_views();
-        if let Err(error) = result.context("Telegram не подтвердил сохранение вовремя")?
-            && !error.is("CHAT_NOT_MODIFIED")
-        {
-            return Err(error.into());
+        if !changes.is_empty() {
+            apply_changes(&mut raw, &changes);
+            let result = timeout(
+                RPC_TIMEOUT,
+                self.client.invoke(&EditChatDefaultBannedRights {
+                    peer: reference.into(),
+                    banned_rights: raw.into(),
+                }),
+            )
+            .await;
+            // A timed-out request may still have been applied.
+            self.invalidate_views();
+            permission_result(result).context("Не удалось изменить общие разрешения")?;
+        }
+        if let Some(seconds) = slow_mode {
+            let result = timeout(
+                RPC_TIMEOUT,
+                self.client.invoke(&ToggleSlowMode {
+                    channel: reference.into(),
+                    seconds,
+                }),
+            )
+            .await;
+            self.invalidate_views();
+            permission_result(result).context("Не удалось изменить медленный режим")?;
         }
         let (saved, _) = self.current_group_permissions(reference).await?;
         ensure!(
-            saved.changes(original, requested)?.is_empty(),
+            saved.changes(original, requested.allowed)?.is_empty()
+                && slow_mode_change(saved.slow_mode, original.slow_mode, requested.slow_mode)?
+                    .is_none(),
             "Telegram не подтвердил все изменения разрешений. Повторите сохранение"
         );
         Ok(())
@@ -60,8 +83,54 @@ impl Telegram {
             .map(|chat| Peer::from_raw(&self.client, chat))
             .find(|peer| peer.id() == reference.id)
             .context("Группа не найдена")?;
-        group_permissions(&peer).context("Telegram не разрешает менять разрешения этой группы")
+        let (mut settings, raw) = group_permissions(&peer)
+            .context("Telegram не разрешает менять разрешения этой группы")?;
+        if let enums::ChatFull::ChannelFull(full) = full.full_chat {
+            settings.slow_mode = Some(full.slowmode_seconds.unwrap_or_default());
+        }
+        Ok((settings, raw))
     }
+
+    pub async fn slow_mode_remaining(&self, id: i64) -> Result<Duration> {
+        let reference = self.peer(id).await?;
+        if reference.id.kind() != PeerKind::Channel {
+            return Ok(Duration::ZERO);
+        }
+        let full = timeout(RPC_TIMEOUT, self.full_chat(reference)).await??;
+        let enums::ChatFull::ChannelFull(full) = full.full_chat else {
+            return Ok(Duration::ZERO);
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+        let until = full.slowmode_next_send_date.unwrap_or_default();
+        let until = Duration::from_secs(u64::try_from(until).unwrap_or_default());
+        Ok(until.saturating_sub(now))
+    }
+}
+
+fn permission_result(
+    result: Result<Result<enums::Updates, InvocationError>, tokio::time::error::Elapsed>,
+) -> Result<()> {
+    if let Err(error) = result.context("Telegram не подтвердил сохранение вовремя")?
+        && !error.is("CHAT_NOT_MODIFIED")
+    {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+pub(super) fn slow_mode_enabled(peer: &Peer) -> bool {
+    matches!(peer, Peer::Group(group) if matches!(&group.raw, enums::Chat::Channel(channel)
+        if channel.slowmode_enabled && !channel.creator && channel.admin_rights.is_none()))
+}
+
+pub fn slow_mode_wait(error: &anyhow::Error) -> Option<Duration> {
+    let InvocationError::Rpc(error) = error.downcast_ref::<InvocationError>()? else {
+        return None;
+    };
+    let seconds = error.value.filter(|seconds| *seconds > 0)?;
+    error
+        .is("SLOWMODE_WAIT")
+        .then(|| Duration::from_secs(seconds.into()))
 }
 
 pub(super) fn group_permissions(
@@ -177,6 +246,7 @@ fn settings(
         allowed,
         editable,
         forum,
+        slow_mode: None,
     }
 }
 
@@ -242,6 +312,48 @@ fn apply_changes(raw: &mut types::ChatBannedRights, changes: &[(GroupPermission,
 mod tests {
     use super::*;
     use GroupPermission::*;
+    use grammers_client::sender::RpcError;
+
+    #[test]
+    fn slow_mode_edits_ignore_unchanged_fields_and_acknowledged_retries() {
+        assert_eq!(
+            slow_mode_change(Some(30), Some(10), Some(10)).unwrap(),
+            None
+        );
+        assert_eq!(
+            slow_mode_change(Some(30), Some(10), Some(30)).unwrap(),
+            None
+        );
+        assert_eq!(
+            slow_mode_change(Some(30), Some(10), Some(5)).unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            slow_mode_change(Some(30), Some(10), Some(0)).unwrap(),
+            Some(0)
+        );
+        assert!(slow_mode_change(None, Some(10), Some(0)).is_err());
+        assert!(slow_mode_change(Some(10), Some(10), Some(25)).is_err());
+    }
+
+    #[test]
+    fn only_a_positive_slow_mode_rpc_wait_blocks_the_composer() {
+        let make_error = |name: &str, value: Option<u32>| {
+            anyhow::Error::from(InvocationError::Rpc(RpcError {
+                code: 420,
+                name: name.into(),
+                value,
+                caused_by: None,
+            }))
+        };
+        assert_eq!(
+            slow_mode_wait(&make_error("SLOWMODE_WAIT", Some(12))),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(slow_mode_wait(&make_error("SLOWMODE_WAIT", Some(0))), None);
+        assert_eq!(slow_mode_wait(&make_error("SLOWMODE_WAIT", None)), None);
+        assert_eq!(slow_mode_wait(&make_error("FLOOD_WAIT", Some(12))), None);
+    }
 
     #[test]
     fn a_media_edit_preserves_other_legacy_restrictions_and_server_fields() {

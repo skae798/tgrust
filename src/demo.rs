@@ -20,6 +20,8 @@ pub const OWN_AVATAR: Avatar = Avatar {
 };
 pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
+pub const SLOW_MODE_GROUP: i64 = 8;
+pub const SLOW_MODE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
     chat == 1 && message == 83
@@ -33,6 +35,13 @@ pub fn chats() -> Vec<Chat> {
         (5, "Демомедиа", "Видео и аудио", 0, false),
         (6, "Демоопросы", "Опрос · Когда провести встречу?", 0, false),
         (7, "Бот проекта", "Доступные команды проекта", 0, false),
+        (
+            SLOW_MODE_GROUP,
+            "Демо медленного режима",
+            "Интервал между сообщениями — 10 секунд",
+            0,
+            false,
+        ),
     ]
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
@@ -41,18 +50,19 @@ pub fn chats() -> Vec<Chat> {
         last_activity: now() - id,
         title: title.to_owned(),
         preview: preview.to_owned(),
-        preview_sender: matches!(id, 1 | 6).then(|| "Анна".to_owned()),
+        preview_sender: matches!(id, 1 | 6 | SLOW_MODE_GROUP).then(|| "Анна".to_owned()),
         preview_image: history(id).last().and_then(|message| {
             message
                 .thumbnail
                 .map(|media| ChatImage::attachment(id, message.id, media))
         }),
-        group: matches!(id, 1 | 6),
+        group: matches!(id, 1 | 6 | SLOW_MODE_GROUP),
         unread,
         unread_mark: false,
         last_message_id: history(id).last().map_or(0, |message| message.id),
         broadcast,
         can_write: !broadcast,
+        slow_mode_enabled: false,
         saved_messages: id == 2,
         avatar: (id != 2).then_some(Avatar {
             peer: id,
@@ -61,7 +71,7 @@ pub fn chats() -> Vec<Chat> {
         }),
         archived: id == 3,
         kind: match id {
-            1 | 6 => ChatKind::Group,
+            1 | 6 | SLOW_MODE_GROUP => ChatKind::Group,
             3 => ChatKind::Broadcast,
             7 => ChatKind::Bot,
             _ => ChatKind::User,
@@ -151,6 +161,9 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             2 => "Демонстрационные данные аккаунта.",
             6 => "Демонстрационная группа с опросами и викториной.",
             7 => "Демонстрационный бот для команд проекта.",
+            SLOW_MODE_GROUP => {
+                "В этой демонстрационной группе участники отправляют сообщения раз в 10 секунд."
+            }
             _ => "Объявления и новости проекта. Демонстрационный канал.",
         }
         .to_owned(),
@@ -160,6 +173,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
                 2 => "@demo_tgrust_account",
                 6 => "@demo_tgrust_polls",
                 7 => "@demo_tgrust_bot",
+                SLOW_MODE_GROUP => "@demo_tgrust_slow_mode",
                 _ => "@demo_tgrust_news",
             }
             .to_owned(),
@@ -266,8 +280,10 @@ pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
             primary: draft.username.clone(),
             aliases: Vec::new(),
         }),
-        group_permissions: (!broadcast)
-            .then(|| group_permissions(GroupPermissions::all(), !draft.username.is_empty())),
+        group_permissions: (!broadcast).then(|| GroupPermissionSettings {
+            slow_mode: (draft.kind == NewChatKind::Supergroup).then_some(0),
+            ..group_permissions(GroupPermissions::all(), !draft.username.is_empty())
+        }),
         bot_commands: Vec::new(),
     }
 }
@@ -283,6 +299,7 @@ pub fn group_permissions(allowed: GroupPermissions, public: bool) -> GroupPermis
             .with(Pin, !public)
             .with(ChangeInfo, !public),
         forum: false,
+        slow_mode: None,
     }
 }
 
@@ -951,6 +968,12 @@ pub fn history(chat: i64) -> Vec<Message> {
         ],
         3 => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
         7 => vec![("Бот проекта", "Доступные команды проекта", false, None)],
+        SLOW_MODE_GROUP => vec![(
+            "Анна",
+            "Интервал между сообщениями — 10 секунд",
+            false,
+            None,
+        )],
         5 => vec![
             ("Анна", "", false, Some("demo-audio.wav")),
             (OWN_NAME, "", true, Some("demo-video.webm")),

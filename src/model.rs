@@ -26,6 +26,7 @@ pub struct Chat {
     pub last_message_id: i32,
     pub broadcast: bool,
     pub can_write: bool,
+    pub slow_mode_enabled: bool,
     pub saved_messages: bool,
     pub archived: bool,
     pub kind: ChatKind,
@@ -100,6 +101,7 @@ impl Contact {
             last_message_id: 0,
             broadcast: false,
             can_write: true,
+            slow_mode_enabled: false,
             saved_messages: self.is_self,
             archived: false,
             kind: self.kind,
@@ -444,6 +446,44 @@ pub struct GroupPermissionSettings {
     pub allowed: GroupPermissions,
     pub editable: GroupPermissions,
     pub forum: bool,
+    pub slow_mode: Option<i32>,
+}
+
+pub const SLOW_MODE_OPTIONS: [(i32, &str); 8] = [
+    (0, "Выключен"),
+    (5, "5 секунд"),
+    (10, "10 секунд"),
+    (30, "30 секунд"),
+    (60, "1 минута"),
+    (300, "5 минут"),
+    (900, "15 минут"),
+    (3600, "1 час"),
+];
+
+#[derive(Clone, Copy)]
+pub struct GroupPermissionEdit {
+    pub allowed: GroupPermissions,
+    pub slow_mode: Option<i32>,
+}
+
+pub fn slow_mode_change(
+    current: Option<i32>,
+    original: Option<i32>,
+    requested: Option<i32>,
+) -> anyhow::Result<Option<i32>> {
+    if requested == original {
+        return Ok(None);
+    }
+    let seconds = requested.filter(|seconds| {
+        SLOW_MODE_OPTIONS
+            .iter()
+            .any(|(option, _)| option == seconds)
+    });
+    anyhow::ensure!(
+        original.is_some() && current.is_some() && seconds.is_some(),
+        "Настройка медленного режима недоступна. Откройте разрешения группы снова"
+    );
+    Ok(seconds.filter(|_| seconds != current))
 }
 
 impl GroupPermissionSettings {
@@ -1017,6 +1057,7 @@ impl NewChatDraft {
             last_message_id: 0,
             broadcast: self.kind == NewChatKind::Channel,
             can_write: true,
+            slow_mode_enabled: false,
             saved_messages: false,
             avatar: None,
             archived: false,
@@ -2711,6 +2752,7 @@ mod tests {
             last_message_id: 0,
             broadcast: false,
             can_write: true,
+            slow_mode_enabled: false,
             saved_messages: false,
             archived: true,
             kind: ChatKind::Group,
