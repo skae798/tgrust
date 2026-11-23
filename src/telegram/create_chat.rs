@@ -8,9 +8,9 @@ use grammers_client::tl::functions::{
 use grammers_client::tl::{Deserializable, RemoteCall};
 
 use super::{InvocationError, Peer, PeerId, PeerKind, PeerRef, Session, Telegram, enums};
-use crate::model::{CreatedChat, NewChatDraft, NewChatKind, NewChatResult, new_chat_username};
+use crate::model::{CreatedChat, NewChatDraft, NewChatKind, NewChatResult, chat_username};
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+pub(super) const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Telegram {
     pub async fn create_chat(&self, mut draft: NewChatDraft) -> NewChatResult {
@@ -113,7 +113,7 @@ impl Telegram {
         let public_error = if draft.username.is_empty() {
             None
         } else {
-            self.update_new_chat_username(reference, &draft.username)
+            self.update_channel_username(reference, &draft.username)
                 .await
                 .err()
                 .map(|error| error.to_string())
@@ -218,7 +218,7 @@ impl Telegram {
     }
 
     pub async fn set_created_chat_username(&self, chat: i64, username: &str) -> Result<()> {
-        let username = new_chat_username(username)?;
+        let username = chat_username(username)?;
         ensure!(!username.is_empty(), "Введите публичное имя.");
         let _serial = self.dialog_settings.lock().await;
         let reference = self.peer(chat).await?;
@@ -226,12 +226,16 @@ impl Telegram {
             reference.id.kind() == PeerKind::Channel,
             "У этого чата нет публичного имени."
         );
-        self.update_new_chat_username(reference, &username).await?;
+        self.update_channel_username(reference, &username).await?;
         self.invalidate_views();
         Ok(())
     }
 
-    async fn update_new_chat_username(&self, channel: PeerRef, username: &str) -> Result<()> {
+    pub(super) async fn update_channel_username(
+        &self,
+        channel: PeerRef,
+        username: &str,
+    ) -> Result<()> {
         let result = tokio::time::timeout(
             RPC_TIMEOUT,
             self.client.invoke(&UpdateUsername {
@@ -251,7 +255,7 @@ impl Telegram {
     }
 }
 
-fn accepted(
+pub(super) fn accepted(
     result: &Result<Result<bool, InvocationError>, tokio::time::error::Elapsed>,
     already_set: &[&str],
 ) -> bool {
@@ -262,11 +266,13 @@ fn accepted(
     }
 }
 
-fn username_error(error: InvocationError) -> String {
+pub(super) fn username_error(error: InvocationError) -> String {
     if error.is("USERNAME_OCCUPIED") {
         "Это публичное имя занято.".into()
     } else if error.is("USERNAME_INVALID") {
         "Telegram считает это публичное имя недопустимым.".into()
+    } else if error.is("USERNAME_PURCHASE_AVAILABLE") {
+        "Telegram предлагает это публичное имя на Fragment.".into()
     } else if error.is("CHANNELS_ADMIN_PUBLIC_TOO_MUCH") {
         "Достигнут лимит публичных чатов Telegram.".into()
     } else {

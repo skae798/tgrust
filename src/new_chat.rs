@@ -10,7 +10,7 @@ use tokio::runtime::Handle;
 
 use crate::contact_picker::{ContactPicker, LoadContacts, caption};
 use crate::model::{
-    ChatInfo, CreatedChat, NewChatDraft, NewChatKind, NewChatResult, new_chat_username,
+    ChatInfo, CreatedChat, NewChatDraft, NewChatKind, NewChatResult, chat_username,
 };
 
 type Create = Pin<Box<dyn Future<Output = NewChatResult> + Send>>;
@@ -314,7 +314,7 @@ impl Form {
         else {
             return;
         };
-        let username = match new_chat_username(&self.retry_name.text()) {
+        let username = match chat_username(&self.retry_name.text()) {
             Ok(username) if !username.is_empty() => username,
             Ok(_) => {
                 self.set_status("Введите публичное имя.");

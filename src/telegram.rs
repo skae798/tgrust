@@ -1,4 +1,5 @@
 mod admin_log;
+mod chat_addresses;
 mod create_chat;
 mod invite_members;
 use invite_members::invite_restricted;
@@ -3499,6 +3500,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         can_manage_invites: false,
         can_add_members: false,
         can_read_admin_log: false,
+        addresses: None,
         bot_commands: Vec::new(),
     };
     let channel = match peer {
@@ -3572,6 +3574,12 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         .then_some(MemberModeration::Ban);
         profile.usernames =
             public_usernames(channel.username.as_deref(), channel.usernames.as_deref());
+        if channel.creator && !channel.left && !channel.min && !channel.monoforum {
+            profile.addresses = Some(chat_addresses::channel_addresses(
+                channel.username.as_deref(),
+                channel.usernames.as_deref(),
+            ));
+        }
         profile.members = channel
             .participants_count
             .and_then(|count| u32::try_from(count).ok());

@@ -95,6 +95,7 @@ struct Ui {
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
+    demo_chat_addresses: Rc<RefCell<HashMap<i64, crate::model::ChatAddresses>>>,
     demo_created_chats: Rc<RefCell<HashMap<i64, crate::model::NewChatDraft>>>,
     create_chat_dialog: glib::WeakRef<adw::Dialog>,
     demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
@@ -584,6 +585,7 @@ pub fn open(
         profile_button,
         profile_dialog: glib::WeakRef::new(),
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
+        demo_chat_addresses: Rc::new(RefCell::new(HashMap::new())),
         demo_created_chats: Rc::new(RefCell::new(HashMap::new())),
         create_chat_dialog: glib::WeakRef::new(),
         demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::default())),
@@ -2973,10 +2975,12 @@ impl Ui {
         }
         let client = self.client.borrow().clone();
         let edit_client = client.clone();
+        let address_client = client.clone();
         let member_client = client.clone();
         let moderation_client = client.clone();
         let demo = self.is_demo.get();
         let demo_chat_info = self.demo_chat_info.clone();
+        let demo_chat_addresses = self.demo_chat_addresses.clone();
         let demo_created_chats = self.demo_created_chats.clone();
         let demo_members = self.demo_member_changes.clone();
         let demo_blocked = self.demo_blocked.clone();
@@ -2990,6 +2994,7 @@ impl Ui {
                     let own = demo.then(|| demo_profile.borrow().clone());
                     let client = client.clone();
                     let chat_info = demo_chat_info.borrow().get(&id).cloned();
+                    let chat_addresses = demo_chat_addresses.borrow().get(&id).cloned();
                     let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
                     let created = demo_created_chats.borrow().get(&id).cloned();
                     let added = demo_members.borrow().invited_count(id);
@@ -3006,6 +3011,10 @@ impl Ui {
                                 profile
                             };
                             profile.blocked = profile.blocked.map(|_| blocked);
+                            if let Some(addresses) = chat_addresses.or(profile.addresses.take()) {
+                                profile.usernames = addresses.active_usernames();
+                                profile.addresses = Some(addresses);
+                            }
                             if let Some(info) = chat_info {
                                 profile.title = info.title;
                                 profile.about = info.about;
@@ -3061,6 +3070,33 @@ impl Ui {
                     self,
                     move |info| ui.apply_chat_info(id, info)
                 )),
+                edit_addresses: Box::new({
+                    let demo_addresses = self.demo_chat_addresses.clone();
+                    move |original, proposed| {
+                        let client = address_client.clone();
+                        if demo {
+                            let mut demo_addresses = demo_addresses.borrow_mut();
+                            let current =
+                                demo_addresses.entry(id).or_insert_with(|| original.clone());
+                            let result = proposed.changes(&original, current).and_then(|changes| {
+                                for change in changes {
+                                    if matches!(&change, crate::model::ChatAddressChange::Primary(name) if name == "demo_taken") {
+                                        anyhow::bail!("Это публичное имя занято.");
+                                    }
+                                    current.apply(change);
+                                }
+                                Ok(())
+                            });
+                            return Box::pin(async { result });
+                        }
+                        Box::pin(async move {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .edit_chat_addresses(id, original, proposed)
+                                .await
+                        })
+                    }
+                }),
                 members: Box::new({
                     let demo_members = self.demo_member_changes.clone();
                     let demo_created_chats = self.demo_created_chats.clone();
