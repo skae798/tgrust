@@ -360,10 +360,159 @@ pub struct PeerProfile {
     pub can_manage_invites: bool,
     pub can_add_members: bool,
     pub can_read_admin_log: bool,
+    pub addresses: Option<ChatAddresses>,
     pub bot_commands: Vec<BotCommand>,
 }
 
 pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatAddresses {
+    pub primary: String,
+    pub aliases: Vec<AttachedAddress>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachedAddress {
+    pub name: String,
+    pub active: bool,
+    pub can_toggle: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatAddressChange {
+    Primary(String),
+    Alias(AttachedAddress),
+}
+
+impl ChatAddresses {
+    pub fn is_public(&self) -> bool {
+        !self.primary.is_empty() || self.aliases.iter().any(|address| address.active)
+    }
+
+    pub fn active_usernames(&self) -> Vec<String> {
+        std::iter::once(self.primary.as_str())
+            .filter(|name| !name.is_empty())
+            .chain(
+                self.aliases
+                    .iter()
+                    .filter(|address| address.active)
+                    .map(|address| address.name.as_str()),
+            )
+            .map(|name| format!("@{name}"))
+            .collect()
+    }
+
+    pub fn changes(
+        &self,
+        original: &Self,
+        current: &Self,
+    ) -> anyhow::Result<Vec<ChatAddressChange>> {
+        let primary = if self.primary == original.primary {
+            original.primary.clone()
+        } else {
+            chat_username(&self.primary)?
+        };
+        let make_private = original.is_public()
+            && primary.is_empty()
+            && self.aliases.iter().all(|address| !address.active);
+        let changed_primary = !primary.eq_ignore_ascii_case(&original.primary)
+            && !primary.eq_ignore_ascii_case(&current.primary);
+        if changed_primary {
+            anyhow::ensure!(
+                original.primary.eq_ignore_ascii_case(&current.primary),
+                "Основное имя уже изменилось. Откройте редактор снова"
+            );
+            anyhow::ensure!(
+                !current
+                    .aliases
+                    .iter()
+                    .any(|address| address.name.eq_ignore_ascii_case(&primary)),
+                "Это коллекционное имя. Измените его состояние в списке ниже"
+            );
+        }
+
+        let mut enable = Vec::new();
+        let mut disable = Vec::new();
+        for desired in &self.aliases {
+            let same_name =
+                |address: &&AttachedAddress| address.name.eq_ignore_ascii_case(&desired.name);
+            let baseline = original.aliases.iter().find(same_name);
+            if baseline.is_some_and(|address| address.active == desired.active) {
+                continue;
+            }
+            let latest = current
+                .aliases
+                .iter()
+                .find(same_name)
+                .filter(|_| baseline.is_some())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Список коллекционных имён изменился. Откройте редактор снова")
+                })?;
+            if desired.active != latest.active {
+                anyhow::ensure!(
+                    latest.can_toggle && baseline.is_some_and(|address| address.can_toggle),
+                    "Telegram не разрешает менять состояние этого имени"
+                );
+                let change = ChatAddressChange::Alias(AttachedAddress {
+                    name: latest.name.clone(),
+                    active: desired.active,
+                    can_toggle: latest.can_toggle,
+                });
+                if desired.active {
+                    enable.push(change);
+                } else {
+                    disable.push(change);
+                }
+            }
+        }
+
+        let mut changes = Vec::new();
+        if changed_primary && !primary.is_empty() {
+            changes.push(ChatAddressChange::Primary(primary.clone()));
+        }
+        let has_active_remaining = current.aliases.iter().any(|address| {
+            address.active && !disable.iter().any(|change| {
+                matches!(change, ChatAddressChange::Alias(removed) if removed.name == address.name)
+            })
+        });
+        // Free slots before activating other aliases when an address can stay active.
+        if has_active_remaining || !current.primary.is_empty() || !changes.is_empty() {
+            changes.append(&mut disable);
+        }
+        changes.append(&mut enable);
+        if changed_primary && primary.is_empty() {
+            changes.push(ChatAddressChange::Primary(primary));
+        }
+        changes.append(&mut disable);
+        if make_private {
+            let mut remaining = current.clone();
+            for change in &changes {
+                remaining.apply(change.clone());
+            }
+            anyhow::ensure!(
+                !remaining.is_public(),
+                "Список публичных адресов изменился. Откройте редактор снова"
+            );
+        }
+        Ok(changes)
+    }
+
+    pub fn apply(&mut self, change: ChatAddressChange) {
+        match change {
+            ChatAddressChange::Primary(name) => self.primary = name,
+            ChatAddressChange::Alias(desired) => {
+                if let Some(address) = self
+                    .aliases
+                    .iter_mut()
+                    .find(|address| address.name == desired.name)
+                {
+                    address.active = desired.active;
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AdminLogFilter {
@@ -705,7 +854,7 @@ impl NewChatDraft {
             self.info.title.chars().count() <= 128 && self.info.about.chars().count() <= 255,
             "Название должно содержать до 128 символов, описание до 255"
         );
-        self.username = new_chat_username(&self.username)?;
+        self.username = chat_username(&self.username)?;
         let mut seen = HashSet::new();
         self.members.retain(|member| {
             member.id > 0 && !member.is_self && member.available && seen.insert(member.id)
@@ -757,7 +906,7 @@ impl NewChatDraft {
     }
 }
 
-pub fn new_chat_username(value: &str) -> anyhow::Result<String> {
+pub fn chat_username(value: &str) -> anyhow::Result<String> {
     let value = value.trim();
     let username = value.strip_prefix('@').unwrap_or(value);
     anyhow::ensure!(
@@ -1871,6 +2020,82 @@ pub fn prepend_history_page(
 mod tests {
     use super::*;
 
+    fn chat_addresses() -> ChatAddresses {
+        ChatAddresses {
+            primary: "demo_primary".into(),
+            aliases: vec![
+                AttachedAddress {
+                    name: "demo_first".into(),
+                    active: true,
+                    can_toggle: true,
+                },
+                AttachedAddress {
+                    name: "demo_second".into(),
+                    active: false,
+                    can_toggle: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn chat_address_edits_reconcile_retries_and_preserve_unmodified_remote_names() {
+        let original = chat_addresses();
+        let mut proposed = original.clone();
+        proposed.primary = "@demo_renamed".into();
+        let mut current = original.clone();
+        current.aliases[1].active = true;
+        let changes = proposed.changes(&original, &current).unwrap();
+        assert_eq!(changes, [ChatAddressChange::Primary("demo_renamed".into())]);
+        current.apply(changes.into_iter().next().unwrap());
+        assert!(current.aliases[1].active);
+        assert!(proposed.changes(&original, &current).unwrap().is_empty());
+        current.primary = "someone_renamed".into();
+        assert!(proposed.changes(&original, &current).is_err());
+    }
+
+    #[test]
+    fn making_chat_private_refuses_to_leave_an_unseen_address_active() {
+        let original = chat_addresses();
+        let mut proposed = original.clone();
+        proposed.primary.clear();
+        proposed.aliases[0].active = false;
+        let changes = proposed.changes(&original, &original).unwrap();
+        let mut output = original.clone();
+        for change in changes {
+            output.apply(change);
+        }
+        assert!(!output.is_public());
+        assert_eq!(output.aliases.len(), 2);
+        assert!(proposed.changes(&original, &output).unwrap().is_empty());
+        let mut current = original.clone();
+        current.aliases[1].active = true;
+        assert!(proposed.changes(&original, &current).is_err());
+    }
+
+    #[test]
+    fn exchanging_the_only_active_address_activates_the_replacement_first() {
+        let mut original = chat_addresses();
+        original.primary.clear();
+        let mut proposed = original.clone();
+        proposed.aliases[0].active = false;
+        proposed.aliases[1].active = true;
+        let edits = proposed.changes(&original, &original).unwrap();
+        assert_eq!(
+            edits,
+            [
+                ChatAddressChange::Alias(proposed.aliases[1].clone()),
+                ChatAddressChange::Alias(proposed.aliases[0].clone()),
+            ]
+        );
+        let mut current = original.clone();
+        current.aliases.remove(1);
+        assert!(proposed.changes(&original, &current).is_err());
+        let mut current = original.clone();
+        current.aliases[1].can_toggle = false;
+        assert!(proposed.changes(&original, &current).is_err());
+    }
+
     #[test]
     fn chat_creation_validates_type_address_and_unique_contacts() {
         let mut draft = NewChatDraft {
@@ -1914,7 +2139,7 @@ mod tests {
             "valid_",
             "test__project",
         ] {
-            assert!(new_chat_username(invalid).is_err());
+            assert!(chat_username(invalid).is_err());
         }
     }
 

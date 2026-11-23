@@ -10,6 +10,7 @@ use tokio::runtime::Handle;
 
 use crate::blocked::{self, BlockAction};
 use crate::chat_management::{self, EditFuture, MemberChangeFuture, MemberFuture, MembersContext};
+use crate::model::ChatAddresses;
 use crate::model::{
     Avatar, ChatInfo, ChatKind, MemberChange, MemberFilter, MemberModeration, PeerProfile,
 };
@@ -24,6 +25,8 @@ pub struct ProfileContext {
     pub set_blocked: BlockAction,
     pub edit: Box<dyn Fn()>,
     pub edit_chat: Box<dyn Fn(ChatInfo, ChatInfo) -> EditFuture>,
+    pub edit_addresses:
+        Box<dyn Fn(ChatAddresses, ChatAddresses) -> crate::chat_addresses::EditAddressesFuture>,
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
@@ -250,6 +253,38 @@ impl ProfileDialog {
     }
 
     fn add_management(self: &Rc<Self>, profile: &PeerProfile) {
+        if let Some(addresses) = profile.addresses.clone() {
+            let button = gtk::Button::with_label("Публичные адреса");
+            button.set_halign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| {
+                    let edit = Rc::downgrade(&state);
+                    let refresh = edit.clone();
+                    crate::chat_addresses::open(
+                        button,
+                        state.context.runtime.clone(),
+                        addresses.clone(),
+                        move |original, proposed| {
+                            if let Some(state) = edit.upgrade() {
+                                (state.context.edit_addresses)(original, proposed)
+                            } else {
+                                Box::pin(async {
+                                    anyhow::bail!("Профиль чата закрыт")
+                                })
+                            }
+                        },
+                        move || {
+                            if let Some(state) = refresh.upgrade() {
+                                state.load();
+                            }
+                        },
+                    );
+                }
+            ));
+            self.body.append(&button);
+        }
         if profile.can_read_admin_log {
             let button = gtk::Button::with_label("Недавние действия");
             button.set_halign(gtk::Align::Center);

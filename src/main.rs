@@ -2,6 +2,7 @@ mod accounts;
 mod admin_log;
 mod audio;
 mod blocked;
+mod chat_addresses;
 mod chat_management;
 mod contact_picker;
 mod contacts;

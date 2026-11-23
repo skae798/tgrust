@@ -125,6 +125,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             can_manage_invites: false,
             can_add_members: false,
             can_read_admin_log: false,
+            addresses: None,
             bot_commands: Vec::new(),
         });
     }
@@ -175,6 +176,21 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         can_manage_invites: matches!(id, 1 | 3),
         can_add_members: matches!(id, 1 | 3),
         can_read_admin_log: id == 3,
+        addresses: (id == 3).then(|| crate::model::ChatAddresses {
+            primary: "demo_tgrust_news".into(),
+            aliases: vec![
+                crate::model::AttachedAddress {
+                    name: "demo_news_archive".into(),
+                    active: true,
+                    can_toggle: true,
+                },
+                crate::model::AttachedAddress {
+                    name: "demo_extra_news".into(),
+                    active: false,
+                    can_toggle: true,
+                },
+            ],
+        }),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -244,6 +260,10 @@ pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
         can_manage_invites: true,
         can_add_members: true,
         can_read_admin_log: draft.kind != NewChatKind::Group,
+        addresses: (draft.kind != NewChatKind::Group).then(|| crate::model::ChatAddresses {
+            primary: draft.username.clone(),
+            aliases: Vec::new(),
+        }),
         bot_commands: Vec::new(),
     }
 }
