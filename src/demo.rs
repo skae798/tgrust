@@ -198,6 +198,7 @@ impl InviteLinks {
                     title: match index {
                         0 => "Основная ссылка".into(),
                         1 => "Превышен лимит".into(),
+                        2 => "Подписка проекта".into(),
                         27 => "Отозванная ссылка".into(),
                         _ => format!("Приглашение {index}"),
                     },
@@ -208,7 +209,7 @@ impl InviteLinks {
                     uses: if index == 1 { 2 } else { 0 },
                     approval: false,
                     pending: 0,
-                    paid: false,
+                    paid: index == 2,
                 })
                 .collect()
         })
@@ -261,6 +262,26 @@ impl InviteLinks {
                         paid: false,
                     },
                 );
+            }
+            InviteAction::Edit(original, edit) => {
+                let link = self
+                    .links(chat)
+                    .iter_mut()
+                    .find(|link| link.cursor.link == original.cursor.link)
+                    .ok_or_else(|| anyhow::anyhow!("Ссылка не найдена"))?;
+                let changes = edit.changes(&original, link)?;
+                if let Some(title) = changes.title {
+                    link.title = title;
+                }
+                if let Some(expires) = changes.expire_date {
+                    link.expires = (expires > 0).then_some(expires);
+                }
+                if let Some(limit) = changes.usage_limit {
+                    link.limit = (limit > 0).then_some(limit);
+                }
+                if let Some(approval) = changes.request_needed {
+                    link.approval = approval;
+                }
             }
             InviteAction::Revoke(url) => {
                 let invite = self

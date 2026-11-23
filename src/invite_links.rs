@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 use gtk::glib;
 use tokio::runtime::Handle;
 
-use crate::model::{InviteAction, InviteCursor, InviteDraft, InviteLink, InvitePage};
+use crate::model::{
+    InviteAction, InviteChanges, InviteCursor, InviteDraft, InviteEdit, InviteLink, InvitePage,
+};
 
 type PageFuture = Pin<Box<dyn Future<Output = Result<InvitePage>> + Send>>;
 type WriteFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -19,6 +21,148 @@ pub struct InviteContext {
     pub runtime: Handle,
     pub load: Box<dyn Fn(bool, Option<InviteCursor>) -> PageFuture>,
     pub write: Box<dyn Fn(InviteAction) -> WriteFuture>,
+}
+
+struct InviteFields {
+    name: adw::EntryRow,
+    hours: gtk::DropDown,
+    approval: adw::SwitchRow,
+    limit: adw::EntryRow,
+    editing: bool,
+}
+
+fn invite_form(
+    original: Option<&InviteLink>,
+) -> (adw::PreferencesGroup, InviteFields, gtk::Button) {
+    let editing = original.is_some();
+    let paid = original.is_some_and(|link| link.paid);
+    let name = adw::EntryRow::builder()
+        .title("Название (необязательно)")
+        .build();
+    let duration = adw::ActionRow::builder()
+        .title("Срок действия")
+        .subtitle_lines(1)
+        .build();
+    let mut choices = vec!["Без срока", "1 час", "1 день", "1 неделя"];
+    if editing {
+        choices.insert(0, "Оставить как есть");
+    }
+    let hours = gtk::DropDown::from_strings(&choices);
+    hours.update_property(&[gtk::accessible::Property::Label("Срок действия")]);
+    hours.set_valign(gtk::Align::Center);
+    duration.add_suffix(&hours);
+    let limit = adw::EntryRow::builder()
+        .title("Лимит вступлений (необязательно)")
+        .input_purpose(gtk::InputPurpose::Digits)
+        .build();
+    let approval = adw::SwitchRow::builder()
+        .title("Одобрение администратора")
+        .build();
+    approval.connect_active_notify(glib::clone!(
+        #[weak]
+        limit,
+        move |approval| limit.set_visible(!paid && !approval.is_active())
+    ));
+    if let Some(link) = original {
+        name.set_text(&link.title);
+        duration.set_subtitle(&expiry_caption(link.expires).unwrap_or_else(|| "Без срока".into()));
+        if let Some(value) = link.limit {
+            limit.set_text(&value.to_string());
+        }
+        approval.set_active(link.approval);
+    }
+    duration.set_visible(!paid);
+    approval.set_visible(!paid);
+    limit.set_visible(!paid && !approval.is_active());
+    let submit_row = adw::ActionRow::new();
+    let submit = gtk::Button::builder()
+        .label(if editing {
+            "Сохранить изменения"
+        } else {
+            "Создать ссылку"
+        })
+        .valign(gtk::Align::Center)
+        .css_classes(["suggested-action"])
+        .build();
+    submit_row.add_suffix(&submit);
+    let group = adw::PreferencesGroup::new();
+    for row in [
+        name.upcast_ref::<gtk::Widget>(),
+        duration.upcast_ref(),
+        approval.upcast_ref(),
+        limit.upcast_ref(),
+        submit_row.upcast_ref(),
+    ] {
+        group.add(row);
+    }
+    (
+        group,
+        InviteFields {
+            name,
+            hours,
+            approval,
+            limit,
+            editing,
+        },
+        submit,
+    )
+}
+
+impl InviteFields {
+    fn draft(&self) -> Result<InviteDraft> {
+        let approval = self.approval.is_active();
+        let limit = self.limit.text();
+        let limit = match limit.trim() {
+            "" => None,
+            _ if approval => None,
+            raw => Some(
+                raw.parse::<i32>()
+                    .context("Укажите целое число вступлений.")?,
+            ),
+        };
+        let selected = self
+            .hours
+            .selected()
+            .saturating_sub(u32::from(self.editing))
+            .min(3);
+        Ok(InviteDraft {
+            title: self.name.text().into(),
+            hours: [None, Some(1), Some(24), Some(168)][selected as usize],
+            limit,
+            approval,
+        })
+    }
+
+    fn edit(&self, original: &InviteLink) -> Result<InviteEdit> {
+        let draft = self.draft()?;
+        let expires = if self.hours.selected() == 0 {
+            original.expires
+        } else {
+            draft.expiration(u64::try_from(unix_now())?)?
+        };
+        Ok(InviteEdit {
+            title: draft.title,
+            expires,
+            limit: if original.paid {
+                original.limit
+            } else {
+                draft.limit
+            },
+            approval: draft.approval,
+        })
+    }
+
+    fn clear(&self) {
+        self.name.set_text("");
+        self.hours.set_selected(0);
+        self.limit.set_text("");
+        self.approval.set_active(false);
+    }
+}
+
+struct InviteEditor {
+    dialog: adw::Dialog,
+    status: gtk::Label,
 }
 
 pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
@@ -35,44 +179,8 @@ pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
     let form = gtk::ToggleButton::with_label("Новая ссылка");
     form.set_halign(gtk::Align::Start);
     body.append(&form);
-    let name = adw::EntryRow::builder()
-        .title("Название (необязательно)")
-        .build();
-    let duration = adw::ActionRow::builder().title("Срок действия").build();
-    let hours = gtk::DropDown::from_strings(&["Без срока", "1 час", "1 день", "1 неделя"]);
-    hours.update_property(&[gtk::accessible::Property::Label("Срок действия")]);
-    hours.set_valign(gtk::Align::Center);
-    duration.add_suffix(&hours);
-    let limit = adw::EntryRow::builder()
-        .title("Лимит вступлений (необязательно)")
-        .input_purpose(gtk::InputPurpose::Digits)
-        .build();
-    let approval = adw::SwitchRow::builder()
-        .title("Одобрение администратора")
-        .build();
-    approval.connect_active_notify(glib::clone!(
-        #[weak]
-        limit,
-        move |approval| limit.set_visible(!approval.is_active())
-    ));
-    let submit_row = adw::ActionRow::new();
-    let submit = gtk::Button::builder()
-        .label("Создать ссылку")
-        .valign(gtk::Align::Center)
-        .css_classes(["suggested-action"])
-        .build();
-    submit_row.add_suffix(&submit);
-    let form_group = adw::PreferencesGroup::new();
+    let (form_group, create_fields, submit) = invite_form(None);
     form_group.set_visible(false);
-    for row in [
-        name.upcast_ref::<gtk::Widget>(),
-        duration.upcast_ref(),
-        approval.upcast_ref(),
-        limit.upcast_ref(),
-        submit_row.upcast_ref(),
-    ] {
-        form_group.add(row);
-    }
     body.append(&form_group);
     let feedback = status_label();
     body.append(&feedback);
@@ -89,10 +197,7 @@ pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
         filter,
         refresh,
         form,
-        name,
-        hours,
-        approval,
-        limit,
+        create_fields,
         form_group,
         feedback,
         status,
@@ -125,7 +230,7 @@ pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
         move |form| {
             state.form_group.set_visible(form.is_active());
             if form.is_active() {
-                state.name.grab_focus();
+                state.create_fields.name.grab_focus();
             }
         }
     ));
@@ -163,10 +268,7 @@ struct Invites {
     filter: gtk::DropDown,
     refresh: gtk::Button,
     form: gtk::ToggleButton,
-    name: adw::EntryRow,
-    hours: gtk::DropDown,
-    approval: adw::SwitchRow,
-    limit: adw::EntryRow,
+    create_fields: InviteFields,
     form_group: adw::PreferencesGroup,
     feedback: gtk::Label,
     status: gtk::Label,
@@ -300,6 +402,16 @@ impl Invites {
             ));
             row.add_suffix(&copy);
         }
+        if link.editable() {
+            let edit = icon_button("document-edit-symbolic", "Редактировать ссылку");
+            let edit_link = link.clone();
+            edit.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| state.open_editor(button, edit_link.clone())
+            ));
+            row.add_suffix(&edit);
+        }
         if !link.revoked && !link.paid {
             let revoke = icon_button("user-trash-symbolic", "Отозвать ссылку");
             revoke.connect_clicked(glib::clone!(
@@ -313,32 +425,41 @@ impl Invites {
     }
 
     fn create(self: &Rc<Self>) {
-        let approval = self.approval.is_active();
-        let limit = if approval {
-            glib::GString::from("")
-        } else {
-            self.limit.text()
-        };
-        let limit = match limit.trim() {
-            "" => None,
-            raw => match raw.parse::<i32>() {
-                Ok(limit) => Some(limit),
-                Err(_) => {
-                    set_status(&self.feedback, "Укажите целое число вступлений.");
-                    return;
-                }
-            },
-        };
-        let draft = InviteDraft {
-            title: self.name.text().into(),
-            hours: [None, Some(1), Some(24), Some(168)][self.hours.selected().min(3) as usize],
-            limit,
-            approval,
-        };
-        match draft.normalize() {
-            Ok(draft) => self.write(InviteAction::Create(draft)),
+        match self.create_fields.draft().and_then(InviteDraft::normalize) {
+            Ok(draft) => self.write(InviteAction::Create(draft), None),
             Err(error) => set_status(&self.feedback, &error.to_string()),
         }
+    }
+
+    fn open_editor(self: &Rc<Self>, anchor: &gtk::Button, original: InviteLink) {
+        let (dialog, body) = crate::chat_management::dialog("Редактирование ссылки");
+        let (group, fields, submit) = invite_form(Some(&original));
+        let status = status_label();
+        body.append(&group);
+        body.append(&status);
+        dialog.set_focus(Some(&fields.name));
+        submit.connect_clicked(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            #[weak]
+            dialog,
+            #[weak]
+            status,
+            move |_| match fields.edit(&original).and_then(|edit| {
+                let changes = edit.changes(&original, &original)?;
+                Ok((edit, changes))
+            }) {
+                Ok((_, changes)) if changes == InviteChanges::default() => {
+                    set_status(&status, "Нет изменений.");
+                }
+                Ok((edit, _)) => state.write(
+                    InviteAction::Edit(original.clone(), edit),
+                    Some(InviteEditor { dialog, status }),
+                ),
+                Err(error) => set_status(&status, &error.to_string()),
+            }
+        ));
+        dialog.present(Some(anchor));
     }
 
     fn confirm_revoke(self: &Rc<Self>, anchor: &gtk::Button, link: &InviteLink) {
@@ -361,27 +482,31 @@ impl Invites {
             glib::clone!(
                 #[weak(rename_to = state)]
                 self,
-                move |_, _| state.write(InviteAction::Revoke(url.clone()))
+                move |_, _| state.write(InviteAction::Revoke(url.clone()), None)
             ),
         );
         prompt.present(Some(anchor));
     }
 
-    fn write(self: &Rc<Self>, action: InviteAction) {
+    fn write(self: &Rc<Self>, action: InviteAction, editor: Option<InviteEditor>) {
         if self.closed.get() || self.writing.replace(true) {
             return;
         }
         self.cancel_read();
         self.set_sensitive(false);
-        let create = matches!(action, InviteAction::Create(_));
-        set_status(
-            &self.feedback,
-            if create {
-                "Создание ссылки…"
-            } else {
-                "Отзыв ссылки…"
-            },
-        );
+        let (create, progress, success) = match &action {
+            InviteAction::Create(_) => (true, "Создание ссылки…", "Ссылка создана."),
+            InviteAction::Edit(..) => (false, "Сохранение изменений…", "Ссылка обновлена."),
+            InviteAction::Revoke(_) => (false, "Отзыв ссылки…", "Ссылка отозвана."),
+        };
+        let feedback = if let Some(editor) = editor.as_ref() {
+            editor.dialog.set_can_close(false);
+            editor.dialog.set_sensitive(false);
+            &editor.status
+        } else {
+            &self.feedback
+        };
+        set_status(feedback, progress);
         let request = (self.context.write)(action);
         let task = self.context.runtime.spawn(async move {
             tokio::time::timeout(Duration::from_secs(25), request)
@@ -399,23 +524,25 @@ impl Invites {
             };
             state.writing.set(false);
             state.set_sensitive(true);
+            if let Some(editor) = editor.as_ref() {
+                editor.dialog.set_sensitive(true);
+                editor.dialog.set_can_close(true);
+                if let Err(error) = &result {
+                    set_status(
+                        &editor.status,
+                        &format!("Не удалось сохранить ссылку. {error}"),
+                    );
+                    return;
+                }
+                editor.dialog.close();
+            }
             state.filter.grab_focus();
             match result {
                 Ok(()) => {
                     if create {
-                        state.name.set_text("");
-                        state.hours.set_selected(0);
-                        state.limit.set_text("");
-                        state.approval.set_active(false);
+                        state.create_fields.clear();
                     }
-                    set_status(
-                        &state.feedback,
-                        if create {
-                            "Ссылка создана."
-                        } else {
-                            "Ссылка отозвана."
-                        },
-                    );
+                    set_status(&state.feedback, success);
                 }
                 Err(error) => set_status(
                     &state.feedback,
@@ -423,7 +550,9 @@ impl Invites {
                 ),
             }
             // A lost response can still mean the server applied the change.
-            state.form.set_active(false);
+            if editor.is_none() {
+                state.form.set_active(false);
+            }
             state.reset();
         });
     }
@@ -461,13 +590,15 @@ fn link_details(link: &InviteLink, now: i64) -> String {
         Some(limit) => format!("Вступили {} из {limit}", link.uses),
         None => format!("Вступили {}", link.uses),
     });
-    if let Some(expires) = link.expires
-        && let Ok(time) = glib::DateTime::from_unix_local(i64::from(expires))
-        && let Ok(date) = time.format("%d.%m.%Y %H:%M")
-    {
-        details.push(format!("До {date}"));
+    if let Some(caption) = expiry_caption(link.expires) {
+        details.push(caption);
     }
     details.join(" · ")
+}
+
+fn expiry_caption(expires: Option<i32>) -> Option<String> {
+    let time = glib::DateTime::from_unix_local(i64::from(expires?)).ok()?;
+    Some(format!("До {}", time.format("%d.%m.%Y %H:%M").ok()?))
 }
 
 fn status_label() -> gtk::Label {

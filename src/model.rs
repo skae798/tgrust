@@ -381,6 +381,10 @@ pub struct InviteLink {
 }
 
 impl InviteLink {
+    pub fn editable(&self) -> bool {
+        !self.revoked && !self.permanent
+    }
+
     pub fn expired(&self, now: i64) -> bool {
         self.expires
             .is_some_and(|expires| i64::from(expires) <= now)
@@ -406,22 +410,10 @@ pub struct InviteDraft {
 impl InviteDraft {
     pub fn normalize(mut self) -> anyhow::Result<Self> {
         self.title = self.title.trim().to_owned();
-        anyhow::ensure!(
-            self.title.chars().count() <= 32,
-            "Название должно содержать до 32 символов"
-        );
+        validate_invite_fields(&self.title, self.limit, self.approval)?;
         anyhow::ensure!(
             self.hours.is_none_or(|hours| (1..=168).contains(&hours)),
             "Неверный срок действия"
-        );
-        anyhow::ensure!(
-            self.limit
-                .is_none_or(|limit| (1..=100_000).contains(&limit)),
-            "Укажите от 1 до 100 000 вступлений или оставьте поле пустым"
-        );
-        anyhow::ensure!(
-            !self.approval || self.limit.is_none(),
-            "Для ссылок с одобрением лимит вступлений недоступен"
         );
         Ok(self)
     }
@@ -437,8 +429,119 @@ impl InviteDraft {
     }
 }
 
+fn validate_invite_fields(title: &str, limit: Option<i32>, approval: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        title.chars().count() <= 32,
+        "Название должно содержать до 32 символов"
+    );
+    validate_invite_mode(limit, approval)
+}
+
+fn validate_invite_mode(limit: Option<i32>, approval: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        limit.is_none_or(|limit| (1..=99_999).contains(&limit)),
+        "Укажите от 1 до 99 999 вступлений или оставьте поле пустым"
+    );
+    anyhow::ensure!(
+        !approval || limit.is_none(),
+        "Для ссылок с одобрением лимит вступлений недоступен"
+    );
+    Ok(())
+}
+
+pub struct InviteEdit {
+    pub title: String,
+    pub expires: Option<i32>,
+    pub limit: Option<i32>,
+    pub approval: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct InviteChanges {
+    pub title: Option<String>,
+    pub expire_date: Option<i32>,
+    pub usage_limit: Option<i32>,
+    pub request_needed: Option<bool>,
+}
+
+impl InviteEdit {
+    pub fn changes(
+        &self,
+        original: &InviteLink,
+        current: &InviteLink,
+    ) -> anyhow::Result<InviteChanges> {
+        anyhow::ensure!(
+            current.editable()
+                && original.cursor.link == current.cursor.link
+                && original.paid == current.paid,
+            "Эту ссылку нельзя редактировать"
+        );
+        let title = if self.title == original.title {
+            self.title.as_str()
+        } else {
+            self.title.trim()
+        };
+        let title = invite_field_change(title, original.title.as_str(), current.title.as_str())?;
+        if let Some(title) = title {
+            anyhow::ensure!(
+                title.chars().count() <= 32,
+                "Название должно содержать до 32 символов"
+            );
+        }
+        let expiry = invite_field_change(self.expires, original.expires, current.expires)?;
+        let mode = invite_field_change(
+            (self.approval, self.limit),
+            (original.approval, original.limit),
+            (current.approval, current.limit),
+        )?;
+        anyhow::ensure!(
+            !current.paid || (expiry.is_none() && mode.is_none()),
+            "Для подписки можно менять только название"
+        );
+        if let Some((approval, limit)) = mode {
+            validate_invite_mode(limit, approval)?;
+        }
+        Ok(InviteChanges {
+            title: title.map(str::to_owned),
+            expire_date: expiry.map(Option::unwrap_or_default),
+            usage_limit: mode.map(|(_, limit)| limit.unwrap_or_default()),
+            request_needed: mode.map(|(approval, _)| approval),
+        })
+    }
+}
+
+fn invite_field_change<T: PartialEq>(
+    requested: T,
+    original: T,
+    current: T,
+) -> anyhow::Result<Option<T>> {
+    if requested == original || requested == current {
+        Ok(None)
+    } else if current == original {
+        Ok(Some(requested))
+    } else {
+        anyhow::bail!("Ссылка изменилась в другом клиенте. Откройте редактор заново")
+    }
+}
+
+impl InviteChanges {
+    pub fn confirmed_by(&self, link: &InviteLink) -> bool {
+        self.title.as_ref().is_none_or(|title| title == &link.title)
+            && self
+                .expire_date
+                .is_none_or(|date| date == link.expires.unwrap_or_default())
+            && self
+                .usage_limit
+                .is_none_or(|limit| limit == link.limit.unwrap_or_default())
+            && self
+                .request_needed
+                .is_none_or(|approval| approval == link.approval)
+    }
+}
+
 pub enum InviteAction {
     Create(InviteDraft),
+    Edit(InviteLink, InviteEdit),
     Revoke(String),
 }
 
@@ -1467,6 +1570,102 @@ mod tests {
         };
         assert!(draft(None).normalize().unwrap().approval);
         assert!(draft(Some(3)).normalize().is_err());
+    }
+
+    fn example_invite() -> InviteLink {
+        InviteLink {
+            cursor: InviteCursor {
+                date: 100,
+                link: "https://example.invalid/+invite".into(),
+            },
+            title: "Команда".into(),
+            permanent: false,
+            revoked: false,
+            expires: Some(200),
+            limit: Some(5),
+            uses: 2,
+            approval: false,
+            pending: 0,
+            paid: false,
+        }
+    }
+
+    #[test]
+    fn invite_edit_changes_only_the_selected_fields_and_preserves_a_concurrent_change() {
+        let old = example_invite();
+        let mut current = old.clone();
+        current.expires = Some(300);
+        current.approval = true;
+        current.limit = None;
+        let edit = InviteEdit {
+            title: "  Новое название ".into(),
+            expires: old.expires,
+            limit: old.limit,
+            approval: old.approval,
+        };
+        let changes = edit.changes(&old, &current).unwrap();
+        assert_eq!(
+            changes,
+            InviteChanges {
+                title: Some("Новое название".into()),
+                ..InviteChanges::default()
+            }
+        );
+        current.title = "Одновременная правка".into();
+        assert!(edit.changes(&old, &current).is_err());
+    }
+
+    #[test]
+    fn invite_edit_clears_limits_and_expiration_and_accepts_a_safe_retry() {
+        let old = example_invite();
+        let edit = InviteEdit {
+            title: String::new(),
+            expires: None,
+            limit: None,
+            approval: true,
+        };
+        let changes = edit.changes(&old, &old).unwrap();
+        assert_eq!(
+            changes,
+            InviteChanges {
+                title: Some(String::new()),
+                expire_date: Some(0),
+                usage_limit: Some(0),
+                request_needed: Some(true),
+            }
+        );
+        let mut updated = old.clone();
+        assert!(!changes.confirmed_by(&updated));
+        updated.title.clear();
+        updated.expires = None;
+        updated.limit = None;
+        updated.approval = true;
+        assert!(changes.confirmed_by(&updated));
+        assert_eq!(
+            edit.changes(&old, &updated).unwrap(),
+            InviteChanges::default()
+        );
+    }
+
+    #[test]
+    fn invite_edit_refuses_revoked_primary_and_subscription_parameter_changes() {
+        let mut link = example_invite();
+        let mut edit = InviteEdit {
+            title: "Другое название".into(),
+            expires: link.expires,
+            limit: link.limit,
+            approval: link.approval,
+        };
+        link.paid = true;
+        assert!(edit.changes(&link, &link).is_ok());
+        edit.expires = None;
+        assert!(edit.changes(&link, &link).is_err());
+        link.paid = false;
+        link.revoked = true;
+        assert!(edit.changes(&link, &link).is_err());
+        link.revoked = false;
+        link.permanent = true;
+        assert!(edit.changes(&link, &link).is_err());
     }
 
     #[test]
