@@ -1,5 +1,7 @@
 mod admin_log;
 mod create_chat;
+mod invite_members;
+use invite_members::invite_restricted;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -3495,6 +3497,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         moderation: None,
         admin_policy: None,
         can_manage_invites: false,
+        can_add_members: false,
         can_read_admin_log: false,
         bot_commands: Vec::new(),
     };
@@ -3509,6 +3512,8 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
                     profile.can_edit_chat = can_edit_chat(chat.creator, chat.admin_rights.as_ref());
                     profile.can_manage_invites =
                         can_manage_invites(chat.creator, chat.admin_rights.as_ref());
+                    profile.can_add_members = profile.can_manage_invites
+                        || !invite_restricted(chat.default_banned_rights.as_ref());
                     profile.moderation =
                         can_moderate_chat(chat.creator, chat.admin_rights.as_ref())
                             .then_some(MemberModeration::Remove);
@@ -3554,6 +3559,13 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
             && !channel.min
             && !channel.monoforum
             && can_manage_invites(channel.creator, channel.admin_rights.as_ref());
+        profile.can_add_members = !channel.left
+            && !channel.min
+            && !channel.monoforum
+            && (profile.can_manage_invites
+                || (channel.megagroup
+                    && !invite_restricted(channel.default_banned_rights.as_ref())
+                    && !invite_restricted(channel.banned_rights.as_ref())));
         profile.moderation = (!channel.left
             && !channel.min
             && can_moderate_chat(channel.creator, channel.admin_rights.as_ref()))

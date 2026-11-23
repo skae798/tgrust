@@ -171,6 +171,7 @@ pub struct MembersContext {
     pub load: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub avatar: AvatarLoader,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
+    pub invite: Option<crate::invite_members::OpenInvite>,
     pub refresh_profile: Box<dyn Fn()>,
 }
 
@@ -186,6 +187,12 @@ pub fn members(
         "Подписчики"
     } else {
         "Участники"
+    });
+    let add = context.invite.as_ref().map(|_| {
+        let button = gtk::Button::with_label("Добавить участников");
+        button.set_halign(gtk::Align::Start);
+        body.append(&button);
+        button
     });
     let mut choices = Vec::new();
     if can_view_members {
@@ -238,6 +245,32 @@ pub fn members(
         changed: Cell::new(false),
         closed: Cell::new(false),
     });
+    if let Some(add) = add {
+        add.connect_clicked(glib::clone!(
+            #[weak]
+            state,
+            move |button| {
+                if state.writing.get() {
+                    return;
+                }
+                if let Some(invite) = &state.context.invite {
+                    invite(
+                        button,
+                        Box::new(glib::clone!(
+                            #[weak]
+                            state,
+                            move || {
+                                if !state.closed.get() {
+                                    state.changed.set(true);
+                                    state.reset();
+                                }
+                            }
+                        )),
+                    );
+                }
+            }
+        ));
+    }
     state.filters.connect_selected_notify(glib::clone!(
         #[weak]
         state,

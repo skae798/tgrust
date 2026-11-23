@@ -358,6 +358,7 @@ pub struct PeerProfile {
     pub moderation: Option<MemberModeration>,
     pub admin_policy: Option<AdminPolicy>,
     pub can_manage_invites: bool,
+    pub can_add_members: bool,
     pub can_read_admin_log: bool,
     pub bot_commands: Vec<BotCommand>,
 }
@@ -414,6 +415,16 @@ impl AdminLogPage {
 }
 
 pub const INVITE_PAGE_SIZE: i32 = 25;
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum MemberInvitation {
+    InChat,
+    Rejected(String),
+    Unconfirmed,
+    NotSent,
+}
+
+pub type MemberInvitations = Vec<(String, MemberInvitation)>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct InviteCursor {

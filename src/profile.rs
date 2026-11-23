@@ -27,6 +27,7 @@ pub struct ProfileContext {
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
+    pub invite_members: crate::invite_members::OpenChatInvite,
     pub invites: Box<dyn Fn(&gtk::Button)>,
     pub join_requests: Box<dyn Fn(&gtk::Button)>,
     pub admin_log: Box<dyn Fn(&gtk::Button)>,
@@ -322,6 +323,7 @@ impl ProfileDialog {
             let can_view_members = profile.can_view_members;
             let moderation = profile.moderation;
             let admins = profile.admin_policy;
+            let can_add_members = profile.can_add_members;
             let subscribers = profile.kind == ChatKind::Broadcast;
             let button = gtk::Button::with_label(match (can_view_members, subscribers) {
                 (false, _) if admins.is_some() => "Администраторы",
@@ -365,6 +367,19 @@ impl ProfileDialog {
                                 }),
                                 move |member, change| (state.context.moderate)(member, change)
                             )),
+                            invite: can_add_members.then(|| {
+                                let open: crate::invite_members::OpenInvite =
+                                    Box::new(glib::clone!(
+                                        #[weak]
+                                        state,
+                                        move |anchor, changed| (state.context.invite_members)(
+                                            anchor,
+                                            !subscribers,
+                                            changed
+                                        )
+                                    ));
+                                open
+                            }),
                             refresh_profile: Box::new(glib::clone!(
                                 #[weak]
                                 state,
@@ -373,6 +388,24 @@ impl ProfileDialog {
                         },
                     );
                 }
+            ));
+            self.body.append(&button);
+        } else if profile.can_add_members {
+            let allow_bots = profile.kind != ChatKind::Broadcast;
+            let button = gtk::Button::with_label("Добавить участников");
+            button.set_halign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| (state.context.invite_members)(
+                    button,
+                    allow_bots,
+                    Box::new(glib::clone!(
+                        #[weak]
+                        state,
+                        move || state.load()
+                    ))
+                )
             ));
             self.body.append(&button);
         }
