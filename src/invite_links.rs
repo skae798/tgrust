@@ -47,6 +47,14 @@ pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
         .title("Лимит вступлений (необязательно)")
         .input_purpose(gtk::InputPurpose::Digits)
         .build();
+    let approval = adw::SwitchRow::builder()
+        .title("Одобрение администратора")
+        .build();
+    approval.connect_active_notify(glib::clone!(
+        #[weak]
+        limit,
+        move |approval| limit.set_visible(!approval.is_active())
+    ));
     let submit_row = adw::ActionRow::new();
     let submit = gtk::Button::builder()
         .label("Создать ссылку")
@@ -59,6 +67,7 @@ pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
     for row in [
         name.upcast_ref::<gtk::Widget>(),
         duration.upcast_ref(),
+        approval.upcast_ref(),
         limit.upcast_ref(),
         submit_row.upcast_ref(),
     ] {
@@ -82,6 +91,7 @@ pub fn open(anchor: &impl IsA<gtk::Widget>, context: InviteContext) {
         form,
         name,
         hours,
+        approval,
         limit,
         form_group,
         feedback,
@@ -155,6 +165,7 @@ struct Invites {
     form: gtk::ToggleButton,
     name: adw::EntryRow,
     hours: gtk::DropDown,
+    approval: adw::SwitchRow,
     limit: adw::EntryRow,
     form_group: adw::PreferencesGroup,
     feedback: gtk::Label,
@@ -302,7 +313,12 @@ impl Invites {
     }
 
     fn create(self: &Rc<Self>) {
-        let limit = self.limit.text();
+        let approval = self.approval.is_active();
+        let limit = if approval {
+            glib::GString::from("")
+        } else {
+            self.limit.text()
+        };
         let limit = match limit.trim() {
             "" => None,
             raw => match raw.parse::<i32>() {
@@ -317,6 +333,7 @@ impl Invites {
             title: self.name.text().into(),
             hours: [None, Some(1), Some(24), Some(168)][self.hours.selected().min(3) as usize],
             limit,
+            approval,
         };
         match draft.normalize() {
             Ok(draft) => self.write(InviteAction::Create(draft)),
@@ -389,6 +406,7 @@ impl Invites {
                         state.name.set_text("");
                         state.hours.set_selected(0);
                         state.limit.set_text("");
+                        state.approval.set_active(false);
                     }
                     set_status(
                         &state.feedback,

@@ -34,8 +34,9 @@ use crate::model::{
 };
 use crate::model::{
     AudioInfo, BotCommand, ChatInfo, ChatMember, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
-    InviteLink, InvitePage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration,
-    MemberPage, MemberRole, TextLink,
+    InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecision, JoinDecisionOutcome, JoinRequest,
+    JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
+    MemberModeration, MemberPage, MemberRole, TextLink,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -110,6 +111,7 @@ pub struct Telegram {
     dialog_settings: Mutex<()>,
     privacy_settings: Mutex<()>,
     blocked_changes: watch::Sender<u64>,
+    join_request_changes: broadcast::Sender<i64>,
     poll_updates: broadcast::Sender<PollUpdate>,
     read_state: crate::read_state::ReadState,
 }
@@ -200,6 +202,7 @@ impl Telegram {
                 dialog_settings: Mutex::new(()),
                 privacy_settings: Mutex::new(()),
                 blocked_changes: watch::channel(0).0,
+                join_request_changes: broadcast::channel(32).0,
                 poll_updates: broadcast::channel(64).0,
                 read_state: crate::read_state::ReadState::default(),
             }),
@@ -422,6 +425,10 @@ impl Telegram {
         self.blocked_changes.subscribe()
     }
 
+    pub fn join_request_changes(&self) -> broadcast::Receiver<i64> {
+        self.join_request_changes.subscribe()
+    }
+
     pub fn poll_updates(&self) -> broadcast::Receiver<PollUpdate> {
         self.poll_updates.subscribe()
     }
@@ -460,6 +467,12 @@ impl Telegram {
                     }
                     if matches!(update.raw(), enums::Update::PeerBlocked(_)) {
                         self.invalidate_blocked();
+                    }
+                    if let enums::Update::PendingJoinRequests(update) = update.raw()
+                        && let Some(chat) =
+                            raw_peer_id(&update.peer).and_then(PeerId::bot_api_dialog_id)
+                    {
+                        let _ = self.join_request_changes.send(chat);
                     }
                     if let Update::NewMessage(message) = &update
                         && let Some(notification) = notification_for(message, started)
@@ -981,7 +994,7 @@ impl Telegram {
                     .client
                     .invoke(&ExportChatInvite {
                         legacy_revoke_permanent: false,
-                        request_needed: false,
+                        request_needed: draft.approval,
                         peer: peer.into(),
                         expire_date: draft.expiration(now)?,
                         usage_limit: draft.limit,
@@ -990,7 +1003,8 @@ impl Telegram {
                     })
                     .await?;
                 ensure!(
-                    invite_link(invite).is_some_and(|link| !link.revoked),
+                    invite_link(invite)
+                        .is_some_and(|link| !link.revoked && link.approval == draft.approval),
                     "Telegram не подтвердил создание ссылки"
                 );
             }
@@ -1037,6 +1051,119 @@ impl Telegram {
             }
         }
         Ok(())
+    }
+
+    pub async fn join_requests(
+        &self,
+        chat: i64,
+        after: Option<JoinRequestCursor>,
+    ) -> Result<JoinRequestPage> {
+        use grammers_client::tl::functions::messages::GetChatInviteImporters;
+        let peer = self.invite_peer(chat).await?;
+        let offset_user = match after {
+            Some(after) => self.peer(after.user).await?.into(),
+            None => enums::InputUser::Empty,
+        };
+        let enums::messages::ChatInviteImporters::Importers(result) = self
+            .client
+            .invoke(&GetChatInviteImporters {
+                requested: true,
+                subscription_expired: false,
+                peer: peer.into(),
+                link: None,
+                q: None,
+                offset_date: after.map_or(0, |after| after.date),
+                offset_user,
+                limit: JOIN_REQUEST_PAGE_SIZE,
+            })
+            .await?;
+        let mut users: HashMap<_, _> = result
+            .users
+            .into_iter()
+            .map(|user| (user.id(), user))
+            .collect();
+        let mut requests = Vec::new();
+        let mut references = Vec::new();
+        let mut next = None;
+        for enums::ChatInviteImporter::Importer(importer) in result.importers {
+            if !importer.requested || PeerId::user(importer.user_id).is_none() {
+                continue;
+            }
+            let user = users
+                .remove(&importer.user_id)
+                .map(|user| grammers_client::peer::User::from_raw(&self.client, user));
+            let cursor = JoinRequestCursor {
+                date: importer.date,
+                user: importer.user_id,
+            };
+            let mut actionable = false;
+            if let Some(user) = user.as_ref()
+                && let Ok(Some(reference)) = user.to_ref().await
+            {
+                next = Some(cursor);
+                references.push((cursor.user, reference));
+                actionable = !user.is_self() && !user.deleted();
+            }
+            let name = user
+                .as_ref()
+                .map(|user| user.full_name())
+                .unwrap_or_default();
+            requests.push(JoinRequest {
+                cursor,
+                name: if name.trim().is_empty() {
+                    "Недоступный аккаунт".into()
+                } else {
+                    name
+                },
+                about: importer.about.unwrap_or_default(),
+                avatar: user.map(Peer::User).as_ref().and_then(peer_avatar),
+                actionable,
+            });
+        }
+        self.peers.write().await.extend(references);
+        Ok(JoinRequestPage {
+            requests,
+            next: next.filter(|next| Some(*next) != after),
+            total: result.count.max(0) as usize,
+        })
+    }
+
+    pub async fn decide_join_request(
+        &self,
+        chat: i64,
+        user: i64,
+        decision: JoinDecision,
+    ) -> Result<JoinDecisionOutcome> {
+        use grammers_client::tl::functions::messages::HideChatJoinRequest;
+        let _settings = self.dialog_settings.lock().await;
+        let peer = self.invite_peer(chat).await?;
+        let user = self.peer(user).await?;
+        ensure!(
+            user.id.kind() == PeerKind::User && Some(user.id) != self.self_id().await?,
+            "Пользователь заявки недоступен"
+        );
+        let result = self
+            .client
+            .invoke(&HideChatJoinRequest {
+                approved: matches!(decision, JoinDecision::Approve),
+                user_id: user.into(),
+                peer: peer.into(),
+            })
+            .await;
+        match result {
+            Ok(_) => {
+                if matches!(decision, JoinDecision::Approve) {
+                    self.invalidate_views();
+                }
+                Ok(JoinDecisionOutcome::Applied)
+            }
+            Err(error)
+                if error.is("HIDE_REQUESTER_MISSING") || error.is("USER_ALREADY_PARTICIPANT") =>
+            {
+                Ok(JoinDecisionOutcome::AlreadyHandled)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn chat_members(

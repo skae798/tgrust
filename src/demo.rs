@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
     AttachmentThumbnail, AudioInfo, Avatar, BotCommand, Chat, ChatFolder, ChatImage, ChatKind,
     ChatMember, Contact, INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink,
-    InvitePage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
+    InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor,
+    JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
     MemberRole, Message, PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft,
     TextLink,
 };
@@ -255,7 +256,7 @@ impl InviteLinks {
                         expires,
                         limit: draft.limit,
                         uses: 0,
-                        approval: false,
+                        approval: draft.approval,
                         pending: 0,
                         paid: false,
                     },
@@ -278,6 +279,7 @@ impl InviteLinks {
                             title: "Новая основная ссылка".into(),
                             hours: None,
                             limit: None,
+                            approval: false,
                         }),
                     )?;
                     self.links(chat)[0].permanent = true;
@@ -285,6 +287,62 @@ impl InviteLinks {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+pub struct JoinRequests {
+    handled: HashSet<(i64, i64)>,
+}
+
+impl JoinRequests {
+    pub fn page(&self, chat: i64, after: Option<JoinRequestCursor>) -> JoinRequestPage {
+        let remaining: Vec<_> = (101..=130)
+            .filter(|user| !self.handled.contains(&(chat, *user)))
+            .collect();
+        let mut requests: Vec<_> = remaining
+            .iter()
+            .copied()
+            .filter(|user| after.is_none_or(|after| *user > after.user))
+            .take(JOIN_REQUEST_PAGE_SIZE as usize + 1)
+            .map(|user| JoinRequest {
+                cursor: JoinRequestCursor {
+                    date: 1_700_000_000 - (user as i32 - 101) / 2,
+                    user,
+                },
+                name: match user {
+                    101 => "Алёна Миронова".into(),
+                    102 => "Максим Крылов".into(),
+                    _ => format!("Заявитель {user}"),
+                },
+                about: if user == 101 {
+                    "Хочу присоединиться к обсуждению.".into()
+                } else {
+                    String::new()
+                },
+                avatar: None,
+                actionable: true,
+            })
+            .collect();
+        let next = if requests.len() > JOIN_REQUEST_PAGE_SIZE as usize {
+            requests.pop();
+            requests.last().map(|request| request.cursor)
+        } else {
+            None
+        };
+        JoinRequestPage {
+            requests,
+            next,
+            total: remaining.len(),
+        }
+    }
+
+    pub fn decide(&mut self, chat: i64, user: i64) -> JoinDecisionOutcome {
+        if self.handled.insert((chat, user)) {
+            JoinDecisionOutcome::Applied
+        } else {
+            JoinDecisionOutcome::AlreadyHandled
+        }
     }
 }
 
@@ -783,4 +841,25 @@ pub fn privacy_settings()
         )
     })
     .collect()
+}
+
+#[cfg(test)]
+mod join_request_tests {
+    use super::*;
+
+    #[test]
+    fn join_request_pages_and_decision_retries_stay_in_their_chat() {
+        let mut queue = JoinRequests::default();
+        let first = queue.page(1, None);
+        assert_eq!(first.requests.len(), 25);
+        let second = queue.page(1, first.next);
+        assert_eq!(second.requests.len(), 5);
+        assert!(second.next.is_none());
+        let user = first.requests[0].cursor.user;
+        assert_eq!(queue.decide(1, user), JoinDecisionOutcome::Applied);
+        assert_eq!(queue.decide(1, user), JoinDecisionOutcome::AlreadyHandled);
+        assert_eq!(queue.page(1, None).total, 29);
+        assert_eq!(queue.page(3, None).total, 30);
+        assert_eq!(queue.page(3, None).requests[0].cursor.user, user);
+    }
 }

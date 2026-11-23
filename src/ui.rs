@@ -97,6 +97,7 @@ struct Ui {
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
     demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
     demo_invites: Rc<RefCell<demo::InviteLinks>>,
+    demo_join_requests: Rc<RefCell<demo::JoinRequests>>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     poll_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
@@ -580,6 +581,7 @@ pub fn open(
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
         demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::new())),
         demo_invites: Rc::new(RefCell::new(demo::InviteLinks::default())),
+        demo_join_requests: Rc::new(RefCell::new(demo::JoinRequests::default())),
         own_profile_dialog: glib::WeakRef::new(),
         poll_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
@@ -2972,6 +2974,11 @@ impl Ui {
                     self,
                     move |button| ui.open_invite_links(id, button)
                 )),
+                join_requests: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |button| ui.open_join_requests(id, button)
+                )),
                 command: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
@@ -3040,6 +3047,55 @@ impl Ui {
                             .await
                     })
                 }),
+            },
+        );
+    }
+
+    fn open_join_requests(self: &Rc<Self>, chat: i64, anchor: &gtk::Button) {
+        use crate::join_requests::{self, JoinRequestsContext};
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let write_client = client.clone();
+        let updates = client.as_ref().map(|client| client.join_request_changes());
+        let requests = self.demo_join_requests.clone();
+        let decisions = requests.clone();
+        join_requests::open(
+            anchor,
+            chat,
+            JoinRequestsContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |after| {
+                    let client = client.clone();
+                    let demo_page = demo.then(|| requests.borrow().page(chat, after));
+                    Box::pin(async move {
+                        if let Some(page) = demo_page {
+                            return Ok(page);
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .join_requests(chat, after)
+                            .await
+                    })
+                }),
+                decide: Box::new(move |user, decision| {
+                    let client = write_client.clone();
+                    let demo_result = demo.then(|| decisions.borrow_mut().decide(chat, user));
+                    Box::pin(async move {
+                        if let Some(result) = demo_result {
+                            return Ok(result);
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .decide_join_request(chat, user, decision)
+                            .await
+                    })
+                }),
+                avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
+                )),
+                updates,
             },
         );
     }

@@ -7,6 +7,7 @@ mod demo;
 mod devices;
 mod formatting;
 mod invite_links;
+mod join_requests;
 mod links;
 mod media_stream;
 mod media_viewer;

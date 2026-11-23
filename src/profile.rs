@@ -28,6 +28,7 @@ pub struct ProfileContext {
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
     pub invites: Box<dyn Fn(&gtk::Button)>,
+    pub join_requests: Box<dyn Fn(&gtk::Button)>,
     pub command: Box<dyn Fn(String)>,
 }
 
@@ -256,6 +257,14 @@ impl ProfileDialog {
                 move |button| (state.context.invites)(button)
             ));
             self.body.append(&button);
+            let requests = gtk::Button::with_label("Заявки на вступление");
+            requests.set_halign(gtk::Align::Center);
+            requests.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| (state.context.join_requests)(button)
+            ));
+            self.body.append(&requests);
         }
         if profile.can_edit_chat {
             let settings = gtk::Button::with_label("Настройки чата");
