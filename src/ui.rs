@@ -22,7 +22,9 @@ use crate::model::{
     UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, prepend_history_page,
     redact_spoilers,
 };
-use crate::model::{ChatInfo, GroupPermissions, PlayableMedia};
+use crate::model::{
+    ChatInfo, GroupPermissionEdit, GroupPermissions, PlayableMedia, slow_mode_change,
+};
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -96,7 +98,7 @@ struct Ui {
     profile_dialog: glib::WeakRef<adw::Dialog>,
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
     demo_chat_addresses: Rc<RefCell<HashMap<i64, crate::model::ChatAddresses>>>,
-    demo_group_permissions: Rc<RefCell<HashMap<i64, GroupPermissions>>>,
+    demo_group_permissions: Rc<RefCell<HashMap<i64, GroupPermissionEdit>>>,
     demo_created_chats: Rc<RefCell<HashMap<i64, crate::model::NewChatDraft>>>,
     create_chat_dialog: glib::WeakRef<adw::Dialog>,
     demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
@@ -129,6 +131,10 @@ struct Ui {
     input: gtk::TextView,
     input_placeholder: gtk::Label,
     send: gtk::Button,
+    slow_mode_label: gtk::Label,
+    slow_mode_waits: RefCell<HashMap<i64, Instant>>,
+    slow_mode_requests: RefCell<HashMap<i64, Rc<()>>>,
+    slow_mode_timer_running: Cell<bool>,
     attach: gtk::MenuButton,
     upload_bar: gtk::Box,
     upload_name: gtk::Label,
@@ -530,9 +536,19 @@ pub fn open(
     attach.set_valign(gtk::Align::End);
     send.set_valign(gtk::Align::End);
     composer.append(&send);
+    let slow_mode_label = gtk::Label::builder()
+        .xalign(0.0)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .wrap(true)
+        .css_classes(["dim-label", "caption"])
+        .visible(false)
+        .build();
     conversation.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     conversation.append(&reply_bar);
     conversation.append(&upload_bar);
+    conversation.append(&slow_mode_label);
     conversation.append(&composer);
     content.add_named(&conversation, Some("conversation"));
     pane.set_content(Some(&content));
@@ -622,6 +638,10 @@ pub fn open(
         input,
         input_placeholder,
         send,
+        slow_mode_label,
+        slow_mode_waits: RefCell::new(HashMap::new()),
+        slow_mode_requests: RefCell::new(HashMap::new()),
+        slow_mode_timer_running: Cell::new(false),
         attach,
         upload_bar,
         upload_name,
@@ -1677,6 +1697,13 @@ impl Ui {
             } else {
                 match result {
                     Ok(chats) => {
+                        let previous_slow_mode = ui.selection.get().and_then(|id| {
+                            ui.chats
+                                .borrow()
+                                .iter()
+                                .find(|chat| chat.id == id)
+                                .map(|chat| chat.slow_mode_enabled)
+                        });
                         for chat in chats.iter().filter(|chat| chat.unread == 0 || chat.muted) {
                             ui.withdraw_chat_notification(chat.id);
                         }
@@ -1685,6 +1712,12 @@ impl Ui {
                             && let Some(chat) = ui.chats.borrow().iter().find(|chat| chat.id == id)
                         {
                             ui.set_chat_writability(chat.can_write);
+                            if chat.slow_mode_enabled && previous_slow_mode != Some(true) {
+                                ui.refresh_slow_mode(chat.id);
+                            } else if !chat.slow_mode_enabled && previous_slow_mode == Some(true) {
+                                ui.slow_mode_requests.borrow_mut().remove(&id);
+                                ui.set_slow_mode_wait(id, Duration::ZERO);
+                            }
                         }
                         ui.render_chats();
                         if let Some(id) = ui.notification_chat.take() {
@@ -3020,13 +3053,18 @@ impl Ui {
                                 profile.usernames = addresses.active_usernames();
                                 profile.addresses = Some(addresses);
                             }
-                            if profile.group_permissions.is_some() {
+                            if let Some(original) = profile.group_permissions {
                                 let public =
                                     profile.addresses.as_ref().is_some_and(|a| a.is_public());
-                                profile.group_permissions = Some(demo::group_permissions(
-                                    group_permissions.unwrap_or_else(GroupPermissions::all),
-                                    public,
-                                ));
+                                let saved = group_permissions.unwrap_or(GroupPermissionEdit {
+                                    allowed: GroupPermissions::all(),
+                                    slow_mode: original.slow_mode,
+                                });
+                                profile.group_permissions =
+                                    Some(crate::model::GroupPermissionSettings {
+                                        slow_mode: saved.slow_mode,
+                                        ..demo::group_permissions(saved.allowed, public)
+                                    });
                             }
                             if let Some(info) = chat_info {
                                 profile.title = info.title;
@@ -3116,16 +3154,31 @@ impl Ui {
                         let client = permissions_client.clone();
                         if demo {
                             let mut permissions = demo_permissions.borrow_mut();
-                            let allowed =
-                                permissions.entry(id).or_insert_with(GroupPermissions::all);
+                            let saved = permissions.entry(id).or_insert(GroupPermissionEdit {
+                                allowed: GroupPermissions::all(),
+                                slow_mode: original.slow_mode,
+                            });
                             let mut current = crate::model::GroupPermissionSettings {
-                                allowed: *allowed,
+                                allowed: saved.allowed,
+                                slow_mode: saved.slow_mode,
                                 ..original
                             };
-                            let result = current.changes(original, requested).map(|changes| {
-                                current.apply(&changes);
-                                *allowed = current.allowed;
-                            });
+                            let result =
+                                current
+                                    .changes(original, requested.allowed)
+                                    .and_then(|changes| {
+                                        let interval = slow_mode_change(
+                                            current.slow_mode,
+                                            original.slow_mode,
+                                            requested.slow_mode,
+                                        )?;
+                                        current.apply(&changes);
+                                        saved.allowed = current.allowed;
+                                        if let Some(seconds) = interval {
+                                            saved.slow_mode = Some(seconds);
+                                        }
+                                        Ok(())
+                                    });
                             return Box::pin(async { result });
                         }
                         Box::pin(async move {
@@ -3522,6 +3575,9 @@ impl Ui {
             return;
         };
         self.withdraw_chat_notification(id);
+        if chat.slow_mode_enabled {
+            self.refresh_slow_mode(id);
+        }
         if self.selection.get() != Some(id) || anchor.is_some() {
             self.inline_audio.take();
         }
@@ -4964,12 +5020,124 @@ impl Ui {
         }
         self.attach
             .set_sensitive(self.input.is_sensitive() && !self.sending.get());
+        let wait = self
+            .selection
+            .get()
+            .and_then(|chat| self.slow_mode_remaining(chat));
+        if let Some(wait) = wait {
+            self.slow_mode_label.set_text(&slow_mode_status(wait));
+        }
+        self.slow_mode_label.set_visible(wait.is_some());
         self.send.set_sensitive(
             self.input.is_sensitive()
                 && (!text.trim().is_empty() || pending.is_some())
                 && text.trim().chars().count() <= 4096
-                && !self.sending.get(),
+                && !self.sending.get()
+                && wait.is_none(),
         );
+    }
+
+    fn slow_mode_remaining(&self, chat: i64) -> Option<Duration> {
+        self.slow_mode_waits
+            .borrow()
+            .get(&chat)
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    fn refresh_slow_mode_if_enabled(self: &Rc<Self>, chat: i64) {
+        let tracked = self
+            .chats
+            .borrow()
+            .iter()
+            .any(|item| item.id == chat && item.slow_mode_enabled)
+            || self
+                .external_chat
+                .borrow()
+                .as_ref()
+                .is_some_and(|item| item.id == chat && item.slow_mode_enabled);
+        if tracked {
+            self.refresh_slow_mode(chat);
+        }
+    }
+
+    fn refresh_slow_mode(self: &Rc<Self>, chat: i64) {
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let request = Rc::new(());
+        self.slow_mode_requests
+            .borrow_mut()
+            .insert(chat, request.clone());
+        self.job(
+            async move { client.slow_mode_remaining(chat).await },
+            move |ui, result| {
+                {
+                    let mut requests = ui.slow_mode_requests.borrow_mut();
+                    if !requests
+                        .get(&chat)
+                        .is_some_and(|current| Rc::ptr_eq(current, &request))
+                    {
+                        return;
+                    }
+                    requests.remove(&chat);
+                }
+                if let Ok(wait) = result {
+                    ui.set_slow_mode_wait(chat, wait);
+                }
+            },
+        );
+    }
+
+    fn set_slow_mode_wait(self: &Rc<Self>, chat: i64, wait: Duration) {
+        if wait.is_zero() {
+            self.slow_mode_waits.borrow_mut().remove(&chat);
+        } else {
+            self.slow_mode_waits
+                .borrow_mut()
+                .insert(chat, Instant::now() + wait);
+            if !self.slow_mode_timer_running.replace(true) {
+                let weak = Rc::downgrade(self);
+                glib::timeout_add_local(Duration::from_millis(250), move || {
+                    let Some(ui) = weak.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let now = Instant::now();
+                    ui.slow_mode_waits
+                        .borrow_mut()
+                        .retain(|_, until| *until > now);
+                    let selected = ui
+                        .selection
+                        .get()
+                        .is_some_and(|id| ui.slow_mode_waits.borrow().contains_key(&id));
+                    if selected || ui.slow_mode_label.is_visible() {
+                        ui.update_send_button();
+                    }
+                    if ui.slow_mode_waits.borrow().is_empty() {
+                        ui.slow_mode_timer_running.set(false);
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+            }
+        }
+        if self.selection.get() == Some(chat) {
+            self.update_send_button();
+        }
+    }
+
+    fn note_slow_mode_error(self: &Rc<Self>, chat: i64, error: &anyhow::Error) -> Option<String> {
+        let wait = crate::telegram::slow_mode_wait(error)?;
+        self.slow_mode_requests.borrow_mut().remove(&chat);
+        self.set_slow_mode_wait(chat, wait);
+        Some(slow_mode_status(wait))
+    }
+
+    fn start_demo_slow_mode(self: &Rc<Self>, chat: i64) {
+        if chat == demo::SLOW_MODE_GROUP {
+            self.set_slow_mode_wait(chat, demo::SLOW_MODE_DELAY);
+        }
     }
 
     fn choose_upload(self: &Rc<Self>, kind: UploadKind) {
@@ -5041,11 +5209,15 @@ impl Ui {
             let weak = weak.clone();
             Box::pin(async move {
                 let ui = weak.upgrade().context("Аккаунт закрыт")?;
+                if let Some(wait) = ui.slow_mode_remaining(chat) {
+                    anyhow::bail!("{}", slow_mode_status(wait));
+                }
                 if ui.is_demo.get() {
                     ui.add_demo_messages(
                         chat,
                         vec![demo::poll_message(ui.next_demo_message(), draft)],
                     );
+                    ui.start_demo_slow_mode(chat);
                     return Ok(());
                 }
                 let client = ui
@@ -5062,8 +5234,17 @@ impl Ui {
                     .context("Telegram не подтвердил отправку вовремя")?
                 });
                 drop(ui);
-                let message = task.await??;
+                let result = task.await?;
+                let message = result.map_err(|error| {
+                    if let Some(ui) = weak.upgrade()
+                        && let Some(wait) = ui.note_slow_mode_error(chat, &error)
+                    {
+                        return anyhow::anyhow!(wait);
+                    }
+                    error
+                })?;
                 if let Some(ui) = weak.upgrade() {
+                    ui.refresh_slow_mode_if_enabled(chat);
                     ui.history_cache.borrow_mut().remove(chat);
                     if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none() {
                         if let Some(message) = message {
@@ -5341,6 +5522,7 @@ impl Ui {
                     .collect()
             };
             self.add_demo_messages(chat, messages);
+            self.start_demo_slow_mode(chat);
             return;
         }
         let Some(client) = self.client.borrow().clone() else {
@@ -5358,6 +5540,7 @@ impl Ui {
                 ui.sending.set(false);
                 match result {
                     Ok(mut messages) => {
+                        ui.refresh_slow_mode_if_enabled(chat);
                         for message in &mut messages {
                             if message.reply_to == reply_to && message.reply_preview.is_none() {
                                 message.reply_preview =
@@ -5397,7 +5580,15 @@ impl Ui {
                             ui.load_history(None, false);
                         }
                     }
-                    Err(error) => ui.toast(&format!("Не удалось отправить сообщение. {error}")),
+                    Err(error) => {
+                        if let Some(wait) = ui.note_slow_mode_error(chat, &error) {
+                            if ui.selection.get() != Some(chat) {
+                                ui.toast(&wait);
+                            }
+                        } else {
+                            ui.toast(&format!("Не удалось отправить сообщение. {error}"));
+                        }
+                    }
                 }
                 ui.update_send_button();
             },
@@ -5601,6 +5792,10 @@ impl Ui {
             let (Some(ui), Some(chat)) = (weak.upgrade(), destination.get()) else {
                 return;
             };
+            if let Some(wait) = ui.slow_mode_remaining(chat) {
+                ui.toast(&slow_mode_status(wait));
+                return;
+            }
             if ui.is_demo.get() {
                 ui.add_demo_messages(
                     chat,
@@ -5623,6 +5818,7 @@ impl Ui {
                         ..message
                     }],
                 );
+                ui.start_demo_slow_mode(chat);
                 ui.toast("Сообщение переслано");
                 return;
             }
@@ -5638,6 +5834,7 @@ impl Ui {
                     ui.update_send_button();
                     match result {
                         Ok(message) => {
+                            ui.refresh_slow_mode_if_enabled(chat);
                             if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none()
                             {
                                 ui.messages.borrow_mut().insert(message.id, message);
@@ -5646,7 +5843,12 @@ impl Ui {
                             ui.refresh_chats();
                             ui.toast("Сообщение переслано");
                         }
-                        Err(error) => ui.toast(&format!("Не удалось переслать сообщение. {error}")),
+                        Err(error) => {
+                            let error = ui
+                                .note_slow_mode_error(chat, &error)
+                                .unwrap_or_else(|| error.to_string());
+                            ui.toast(&format!("Не удалось переслать сообщение. {error}"));
+                        }
                     }
                 },
             );
@@ -6338,6 +6540,18 @@ fn add_menu_button(menu: &gtk::Box, title: &str, activate: impl Fn() + 'static) 
         activate();
     });
     menu.append(&button);
+}
+
+fn slow_mode_status(wait: Duration) -> String {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    let minutes = seconds / 60;
+    let remainder = seconds % 60;
+    let duration = if minutes < 60 {
+        format!("{minutes:02}:{remainder:02}")
+    } else {
+        format!("{}:{:02}:{remainder:02}", minutes / 60, minutes % 60)
+    };
+    format!("Следующее сообщение через {duration}")
 }
 
 fn label(text: &str, class: &str) -> gtk::Label {

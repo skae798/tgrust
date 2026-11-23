@@ -9,16 +9,19 @@ use gtk::glib;
 use tokio::runtime::Handle;
 
 use crate::contact_picker::caption;
-use crate::model::{GroupPermission, GroupPermissionSettings, GroupPermissions};
+use crate::model::{
+    GroupPermission, GroupPermissionEdit, GroupPermissionSettings, SLOW_MODE_OPTIONS,
+    slow_mode_change,
+};
 
 type SaveFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-pub type Save = Box<dyn Fn(GroupPermissionSettings, GroupPermissions) -> SaveFuture>;
+pub type Save = Box<dyn Fn(GroupPermissionSettings, GroupPermissionEdit) -> SaveFuture>;
 
 pub fn open(
     anchor: &gtk::Button,
     runtime: Handle,
     original: GroupPermissionSettings,
-    save: impl Fn(GroupPermissionSettings, GroupPermissions) -> SaveFuture + 'static,
+    save: impl Fn(GroupPermissionSettings, GroupPermissionEdit) -> SaveFuture + 'static,
     refresh: impl Fn() + 'static,
 ) {
     let (dialog, toolbar, body) = crate::chat_management::dialog_with_toolbar("Разрешения группы");
@@ -52,6 +55,33 @@ pub fn open(
         .collect();
     form.append(&sending);
     form.append(&actions);
+    let slow_mode = original.slow_mode.map(|seconds| {
+        let mut choices = SLOW_MODE_OPTIONS
+            .map(|(value, label)| (value, label.to_owned()))
+            .to_vec();
+        if !choices.iter().any(|(value, _)| *value == seconds) {
+            choices.push((seconds, format!("{seconds} с")));
+        }
+        let labels: Vec<_> = choices.iter().map(|(_, label)| label.as_str()).collect();
+        let group = adw::PreferencesGroup::new();
+        let row = adw::ComboRow::builder()
+            .title("Медленный режим")
+            .subtitle("Интервал между сообщениями участников")
+            .model(&gtk::StringList::new(&labels))
+            .selected(
+                choices
+                    .iter()
+                    .position(|(value, _)| *value == seconds)
+                    .unwrap() as u32,
+            )
+            .build();
+        group.add(&row);
+        form.append(&group);
+        (
+            row,
+            choices.into_iter().map(|(seconds, _)| seconds).collect(),
+        )
+    });
     body.append(&form);
 
     let footer = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -107,6 +137,7 @@ pub fn open(
         dialog: dialog.downgrade(),
         form,
         rows,
+        slow_mode,
         status,
         submit,
         writing: Cell::new(false),
@@ -132,6 +163,7 @@ struct Editor {
     dialog: glib::WeakRef<adw::Dialog>,
     form: gtk::Box,
     rows: Vec<(GroupPermission, adw::SwitchRow)>,
+    slow_mode: Option<(adw::ComboRow, Vec<i32>)>,
     status: gtk::Label,
     submit: gtk::Button,
     writing: Cell<bool>,
@@ -148,14 +180,31 @@ impl Editor {
         if self.writing.get() {
             return;
         }
-        let requested = self
-            .rows
-            .iter()
-            .fold(self.original.allowed, |value, (permission, row)| {
-                value.with(*permission, row.is_active())
+        let requested = GroupPermissionEdit {
+            allowed: self
+                .rows
+                .iter()
+                .fold(self.original.allowed, |value, (permission, row)| {
+                    value.with(*permission, row.is_active())
+                }),
+            slow_mode: self
+                .slow_mode
+                .as_ref()
+                .and_then(|(row, choices)| choices.get(row.selected() as usize).copied()),
+        };
+        let changes = self
+            .original
+            .changes(self.original, requested.allowed)
+            .and_then(|changes| {
+                let interval = slow_mode_change(
+                    self.original.slow_mode,
+                    self.original.slow_mode,
+                    requested.slow_mode,
+                )?;
+                Ok(!changes.is_empty() || interval.is_some())
             });
-        match self.original.changes(self.original, requested) {
-            Ok(changes) if changes.is_empty() => {
+        match changes {
+            Ok(false) => {
                 self.feedback("Нет изменений.");
                 return;
             }
@@ -163,7 +212,7 @@ impl Editor {
                 self.feedback(&error.to_string());
                 return;
             }
-            Ok(_) => {}
+            Ok(true) => {}
         }
         let Some(dialog) = self.dialog.upgrade() else {
             return;

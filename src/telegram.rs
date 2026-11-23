@@ -3,6 +3,7 @@ mod chat_addresses;
 mod create_chat;
 mod group_permissions;
 mod invite_members;
+pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
 
 use std::collections::{HashMap, HashSet};
@@ -514,6 +515,7 @@ impl Telegram {
                             | enums::Update::PinnedDialogs(_)
                             | enums::Update::NotifySettings(_)
                             | enums::Update::DialogUnreadMark(_)
+                            | enums::Update::Channel(_)
                     ) {
                         self.invalidate_views();
                     }
@@ -712,6 +714,7 @@ impl Telegram {
                 last_message_id: raw.top_message.max(0),
                 broadcast: matches!(peer, Peer::Channel(_)),
                 can_write: can_write_chat(peer),
+                slow_mode_enabled: group_permissions::slow_mode_enabled(peer),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
                 avatar: peer_avatar(peer),
                 archived: raw.folder_id == Some(1),
@@ -836,6 +839,9 @@ impl Telegram {
                 }
             }
             enums::ChatFull::ChannelFull(full) => {
+                if let Some(permissions) = &mut profile.group_permissions {
+                    permissions.slow_mode = Some(full.slowmode_seconds.unwrap_or_default());
+                }
                 profile.about = full.about;
                 profile.can_view_members = full.can_view_participants;
                 profile.blocked = (profile.kind == ChatKind::Broadcast).then_some(full.blocked);
@@ -2070,6 +2076,7 @@ impl Telegram {
                     last_message_id: 0,
                     broadcast: matches!(peer, Peer::Channel(_)),
                     can_write: can_write_chat(peer),
+                    slow_mode_enabled: group_permissions::slow_mode_enabled(peer),
                     saved_messages: Some(peer_ref.id) == self_id
                         || matches!(peer, Peer::User(user) if user.is_self()),
                     avatar: peer_avatar(peer),
