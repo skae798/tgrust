@@ -361,10 +361,134 @@ pub struct PeerProfile {
     pub can_add_members: bool,
     pub can_read_admin_log: bool,
     pub addresses: Option<ChatAddresses>,
+    pub group_permissions: Option<GroupPermissionSettings>,
     pub bot_commands: Vec<BotCommand>,
 }
 
 pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupPermission {
+    Text,
+    Photos,
+    Videos,
+    VideoNotes,
+    Music,
+    Voice,
+    Documents,
+    StickersAndBots,
+    LinkPreviews,
+    Polls,
+    Reactions,
+    Invite,
+    Pin,
+    ChangeInfo,
+    Topics,
+    EditTag,
+}
+
+impl GroupPermission {
+    pub const OPTIONS: [(Self, &str); 16] = {
+        use GroupPermission::*;
+        [
+            (Text, "Отправлять текст"),
+            (Photos, "Отправлять фотографии"),
+            (Videos, "Отправлять видео"),
+            (VideoNotes, "Отправлять видеосообщения"),
+            (Music, "Отправлять музыку"),
+            (Voice, "Отправлять голосовые"),
+            (Documents, "Отправлять файлы"),
+            (
+                StickersAndBots,
+                "Отправлять стикеры, GIF, игры и ответы ботов",
+            ),
+            (LinkPreviews, "Показывать предпросмотр ссылок"),
+            (Polls, "Создавать опросы"),
+            (Reactions, "Ставить реакции"),
+            (Invite, "Добавлять участников"),
+            (Pin, "Закреплять сообщения"),
+            (ChangeInfo, "Изменять сведения о группе"),
+            (Topics, "Создавать темы"),
+            (EditTag, "Менять свой тег"),
+        ]
+    };
+
+    pub fn is_sending(self) -> bool {
+        !matches!(
+            self,
+            Self::Invite | Self::Pin | Self::ChangeInfo | Self::Topics | Self::EditTag
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GroupPermissions(u32);
+
+impl GroupPermissions {
+    pub fn all() -> Self {
+        Self((1 << GroupPermission::OPTIONS.len()) - 1)
+    }
+
+    pub fn has(self, permission: GroupPermission) -> bool {
+        self.0 & (1 << permission as u32) != 0
+    }
+
+    pub fn with(self, permission: GroupPermission, enabled: bool) -> Self {
+        let bit = 1 << permission as u32;
+        Self((self.0 & !bit) | if enabled { bit } else { 0 })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupPermissionSettings {
+    pub allowed: GroupPermissions,
+    pub editable: GroupPermissions,
+    pub forum: bool,
+}
+
+impl GroupPermissionSettings {
+    pub fn changes(
+        self,
+        original: Self,
+        requested: GroupPermissions,
+    ) -> anyhow::Result<Vec<(GroupPermission, bool)>> {
+        use GroupPermission::{LinkPreviews, Text};
+        let text_changed = requested.has(Text) != original.allowed.has(Text);
+        let enabling_text = text_changed && requested.has(Text) && !self.allowed.has(Text);
+        let requested = requested.with(
+            LinkPreviews,
+            requested.has(Text) && requested.has(LinkPreviews),
+        );
+        let mut changes = Vec::new();
+        for (permission, _) in GroupPermission::OPTIONS {
+            let desired = requested.has(permission);
+            let changed = desired != original.allowed.has(permission)
+                || (permission == LinkPreviews && text_changed);
+            let needs_write = desired != self.allowed.has(permission)
+                || (permission == LinkPreviews && enabling_text);
+            if changed && needs_write {
+                anyhow::ensure!(
+                    self.editable.has(permission) && original.editable.has(permission),
+                    "Право на изменение разрешений изменилось. Откройте редактор снова"
+                );
+                changes.push((permission, desired));
+            }
+        }
+        if changes.contains(&(LinkPreviews, true)) {
+            anyhow::ensure!(
+                requested.has(Text) && (self.allowed.has(Text) || changes.contains(&(Text, true))),
+                "Для предпросмотра ссылок разрешите отправку текста"
+            );
+        }
+        Ok(changes)
+    }
+
+    pub fn apply(&mut self, changes: &[(GroupPermission, bool)]) {
+        for &(permission, enable) in changes {
+            self.allowed = self.allowed.with(permission, enable);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChatAddresses {

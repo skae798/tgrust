@@ -10,9 +10,9 @@ use tokio::runtime::Handle;
 
 use crate::blocked::{self, BlockAction};
 use crate::chat_management::{self, EditFuture, MemberChangeFuture, MemberFuture, MembersContext};
-use crate::model::ChatAddresses;
 use crate::model::{
-    Avatar, ChatInfo, ChatKind, MemberChange, MemberFilter, MemberModeration, PeerProfile,
+    Avatar, ChatAddresses, ChatInfo, ChatKind, MemberChange, MemberFilter, MemberModeration,
+    PeerProfile,
 };
 
 type ProfileFuture = Pin<Box<dyn Future<Output = Result<PeerProfile>> + Send>>;
@@ -27,6 +27,7 @@ pub struct ProfileContext {
     pub edit_chat: Box<dyn Fn(ChatInfo, ChatInfo) -> EditFuture>,
     pub edit_addresses:
         Box<dyn Fn(ChatAddresses, ChatAddresses) -> crate::chat_addresses::EditAddressesFuture>,
+    pub edit_group_permissions: crate::group_permissions::Save,
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
@@ -253,6 +254,38 @@ impl ProfileDialog {
     }
 
     fn add_management(self: &Rc<Self>, profile: &PeerProfile) {
+        if let Some(permissions) = profile.group_permissions {
+            let button = gtk::Button::with_label("Разрешения группы");
+            button.set_halign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| {
+                    let edit = Rc::downgrade(&state);
+                    let refresh = edit.clone();
+                    crate::group_permissions::open(
+                        button,
+                        state.context.runtime.clone(),
+                        permissions,
+                        move |original, requested| {
+                            if let Some(state) = edit.upgrade() {
+                                (state.context.edit_group_permissions)(original, requested)
+                            } else {
+                                Box::pin(async {
+                                    anyhow::bail!("Профиль группы закрыт")
+                                })
+                            }
+                        },
+                        move || {
+                            if let Some(state) = refresh.upgrade() {
+                                state.load();
+                            }
+                        },
+                    );
+                }
+            ));
+            self.body.append(&button);
+        }
         if let Some(addresses) = profile.addresses.clone() {
             let button = gtk::Button::with_label("Публичные адреса");
             button.set_halign(gtk::Align::Center);

@@ -22,7 +22,7 @@ use crate::model::{
     UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, prepend_history_page,
     redact_spoilers,
 };
-use crate::model::{ChatInfo, PlayableMedia};
+use crate::model::{ChatInfo, GroupPermissions, PlayableMedia};
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -96,6 +96,7 @@ struct Ui {
     profile_dialog: glib::WeakRef<adw::Dialog>,
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
     demo_chat_addresses: Rc<RefCell<HashMap<i64, crate::model::ChatAddresses>>>,
+    demo_group_permissions: Rc<RefCell<HashMap<i64, GroupPermissions>>>,
     demo_created_chats: Rc<RefCell<HashMap<i64, crate::model::NewChatDraft>>>,
     create_chat_dialog: glib::WeakRef<adw::Dialog>,
     demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
@@ -586,6 +587,7 @@ pub fn open(
         profile_dialog: glib::WeakRef::new(),
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
         demo_chat_addresses: Rc::new(RefCell::new(HashMap::new())),
+        demo_group_permissions: Rc::new(RefCell::new(HashMap::new())),
         demo_created_chats: Rc::new(RefCell::new(HashMap::new())),
         create_chat_dialog: glib::WeakRef::new(),
         demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::default())),
@@ -2976,11 +2978,13 @@ impl Ui {
         let client = self.client.borrow().clone();
         let edit_client = client.clone();
         let address_client = client.clone();
+        let permissions_client = client.clone();
         let member_client = client.clone();
         let moderation_client = client.clone();
         let demo = self.is_demo.get();
         let demo_chat_info = self.demo_chat_info.clone();
         let demo_chat_addresses = self.demo_chat_addresses.clone();
+        let demo_group_permissions = self.demo_group_permissions.clone();
         let demo_created_chats = self.demo_created_chats.clone();
         let demo_members = self.demo_member_changes.clone();
         let demo_blocked = self.demo_blocked.clone();
@@ -2995,6 +2999,7 @@ impl Ui {
                     let client = client.clone();
                     let chat_info = demo_chat_info.borrow().get(&id).cloned();
                     let chat_addresses = demo_chat_addresses.borrow().get(&id).cloned();
+                    let group_permissions = demo_group_permissions.borrow().get(&id).copied();
                     let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
                     let created = demo_created_chats.borrow().get(&id).cloned();
                     let added = demo_members.borrow().invited_count(id);
@@ -3014,6 +3019,14 @@ impl Ui {
                             if let Some(addresses) = chat_addresses.or(profile.addresses.take()) {
                                 profile.usernames = addresses.active_usernames();
                                 profile.addresses = Some(addresses);
+                            }
+                            if profile.group_permissions.is_some() {
+                                let public =
+                                    profile.addresses.as_ref().is_some_and(|a| a.is_public());
+                                profile.group_permissions = Some(demo::group_permissions(
+                                    group_permissions.unwrap_or_else(GroupPermissions::all),
+                                    public,
+                                ));
                             }
                             if let Some(info) = chat_info {
                                 profile.title = info.title;
@@ -3093,6 +3106,32 @@ impl Ui {
                             client
                                 .context("Нет подключения к Telegram")?
                                 .edit_chat_addresses(id, original, proposed)
+                                .await
+                        })
+                    }
+                }),
+                edit_group_permissions: Box::new({
+                    let demo_permissions = self.demo_group_permissions.clone();
+                    move |original, requested| {
+                        let client = permissions_client.clone();
+                        if demo {
+                            let mut permissions = demo_permissions.borrow_mut();
+                            let allowed =
+                                permissions.entry(id).or_insert_with(GroupPermissions::all);
+                            let mut current = crate::model::GroupPermissionSettings {
+                                allowed: *allowed,
+                                ..original
+                            };
+                            let result = current.changes(original, requested).map(|changes| {
+                                current.apply(&changes);
+                                *allowed = current.allowed;
+                            });
+                            return Box::pin(async { result });
+                        }
+                        Box::pin(async move {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .edit_group_permissions(id, original, requested)
                                 .await
                         })
                     }
