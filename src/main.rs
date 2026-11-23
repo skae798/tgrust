@@ -1,4 +1,5 @@
 mod accounts;
+mod admin_log;
 mod audio;
 mod blocked;
 mod chat_management;
