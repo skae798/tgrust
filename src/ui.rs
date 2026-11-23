@@ -95,6 +95,8 @@ struct Ui {
     profile_button: gtk::Button,
     profile_dialog: glib::WeakRef<adw::Dialog>,
     demo_chat_info: Rc<RefCell<HashMap<i64, ChatInfo>>>,
+    demo_created_chats: Rc<RefCell<HashMap<i64, crate::model::NewChatDraft>>>,
+    create_chat_dialog: glib::WeakRef<adw::Dialog>,
     demo_member_changes: Rc<RefCell<demo::MemberChanges>>,
     demo_invites: Rc<RefCell<demo::InviteLinks>>,
     demo_join_requests: Rc<RefCell<demo::JoinRequests>>,
@@ -309,6 +311,9 @@ pub fn open(
     let my_profile = gtk::Button::with_label("Мой профиль");
     my_profile.add_css_class("flat");
     menu_body.append(&my_profile);
+    let create_chat = gtk::Button::with_label("Создать чат");
+    create_chat.add_css_class("flat");
+    menu_body.prepend(&create_chat);
     menu_body.append(&devices_button);
     let privacy_button = gtk::Button::with_label("Конфиденциальность");
     privacy_button.add_css_class("flat");
@@ -579,6 +584,8 @@ pub fn open(
         profile_button,
         profile_dialog: glib::WeakRef::new(),
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
+        demo_created_chats: Rc::new(RefCell::new(HashMap::new())),
+        create_chat_dialog: glib::WeakRef::new(),
         demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::new())),
         demo_invites: Rc::new(RefCell::new(demo::InviteLinks::default())),
         demo_join_requests: Rc::new(RefCell::new(demo::JoinRequests::default())),
@@ -876,6 +883,16 @@ pub fn open(
         #[weak]
         ui,
         move |_| ui.open_contacts()
+    ));
+    create_chat.connect_clicked(glib::clone!(
+        #[weak]
+        ui,
+        #[weak]
+        menu_popup,
+        move |_| {
+            menu_popup.popdown();
+            ui.open_create_chat();
+        }
     ));
     ui.latest.connect_clicked(glib::clone!(
         #[weak]
@@ -1660,6 +1677,11 @@ impl Ui {
                             ui.withdraw_chat_notification(chat.id);
                         }
                         ui.chats.replace(chats);
+                        if let Some(id) = ui.selection.get()
+                            && let Some(chat) = ui.chats.borrow().iter().find(|chat| chat.id == id)
+                        {
+                            ui.set_chat_writability(chat.can_write);
+                        }
                         ui.render_chats();
                         if let Some(id) = ui.notification_chat.take() {
                             if ui.chats.borrow().iter().any(|chat| chat.id == id) {
@@ -2238,6 +2260,7 @@ impl Ui {
             &self.own_profile_dialog,
             &self.poll_dialog,
             &self.contacts_dialog,
+            &self.create_chat_dialog,
             &self.devices_dialog,
             &self.privacy_dialog,
             &self.proxy_dialog,
@@ -2521,6 +2544,100 @@ impl Ui {
             move |_| ui.focus_composer()
         ));
         self.devices_dialog.set(Some(&dialog));
+    }
+
+    fn open_create_chat(self: &Rc<Self>) {
+        use crate::model::NewChatResult;
+        use crate::new_chat::{self, CreateContext};
+        let demo = self.is_demo.get();
+        if (!demo && self.login_step.get() != LoginStep::Authorized) || self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let client = self.client.borrow().clone();
+        let create_client = client.clone();
+        let publish_client = client.clone();
+        let demo_id = self
+            .demo_created_chats
+            .borrow()
+            .keys()
+            .min()
+            .map_or(-200, |id| id - 1);
+        let dialog = new_chat::open(
+            &window,
+            CreateContext {
+                runtime: self.runtime.clone(),
+                contacts: Box::new(move || {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            return Ok(Arc::new(demo::contacts()));
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .contacts(false)
+                            .await
+                    })
+                }),
+                create: Box::new(move |draft| {
+                    let client = create_client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            tokio::time::sleep(Duration::from_millis(350)).await;
+                            return demo::create_chat(demo_id, draft);
+                        }
+                        if let Some(client) = client {
+                            client.create_chat(draft).await
+                        } else {
+                            NewChatResult::Rejected("Нет подключения к Telegram".into())
+                        }
+                    })
+                }),
+                publish: Box::new(move |chat, username| {
+                    let client = publish_client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            anyhow::ensure!(username != "demo_taken", "Это публичное имя занято.");
+                            return Ok(());
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .set_created_chat_username(chat, &username)
+                            .await
+                    })
+                }),
+                opened: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |created: crate::model::CreatedChat| {
+                        let id = created.chat.id;
+                        if demo {
+                            ui.demo_created_chats.borrow_mut().insert(id, created.draft);
+                        }
+                        ui.chat_settings_revision
+                            .set(ui.chat_settings_revision.get().wrapping_add(1));
+                        if !ui.chats.borrow().iter().any(|chat| chat.id == id) {
+                            ui.chats.borrow_mut().push(created.chat.clone());
+                        }
+                        ui.external_chat.replace(Some(created.chat));
+                        ui.filter.set_text("");
+                        ui.folder_picker.set_selected(0);
+                        ui.archive.set_active(false);
+                        ui.render_chats();
+                        ui.show_chat(id, None);
+                        ui.refresh_chats();
+                    }
+                )),
+                reconcile: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.refresh_chats()
+                )),
+            },
+        );
+        self.create_chat_dialog.set(Some(&dialog));
     }
 
     fn open_contacts(self: &Rc<Self>) {
@@ -2860,6 +2977,7 @@ impl Ui {
         let moderation_client = client.clone();
         let demo = self.is_demo.get();
         let demo_chat_info = self.demo_chat_info.clone();
+        let demo_created_chats = self.demo_created_chats.clone();
         let demo_members = self.demo_member_changes.clone();
         let demo_blocked = self.demo_blocked.clone();
         let demo_profile = self.demo_profile.clone();
@@ -2873,11 +2991,18 @@ impl Ui {
                     let client = client.clone();
                     let chat_info = demo_chat_info.borrow().get(&id).cloned();
                     let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
+                    let created = demo_created_chats.borrow().get(&id).cloned();
                     Box::pin(async move {
                         if demo {
-                            let mut profile = demo::peer_profile(id).context("Чат не найден")?;
+                            let mut profile = if let Some(draft) = &created {
+                                demo::created_profile(id, draft)
+                            } else {
+                                let mut profile =
+                                    demo::peer_profile(id).context("Чат не найден")?;
+                                profile.members = profile.members.and(demo_count);
+                                profile
+                            };
                             profile.blocked = profile.blocked.map(|_| blocked);
-                            profile.members = profile.members.and(demo_count);
                             if let Some(info) = chat_info {
                                 profile.title = info.title;
                                 profile.about = info.about;
@@ -2935,10 +3060,16 @@ impl Ui {
                 )),
                 members: Box::new({
                     let demo_members = self.demo_member_changes.clone();
+                    let demo_created_chats = self.demo_created_chats.clone();
                     move |filter, offset| {
                         let client = member_client.clone();
-                        let local =
-                            demo.then(|| demo::members(id, &demo_members.borrow(), filter, offset));
+                        let local = demo.then(|| {
+                            if let Some(draft) = demo_created_chats.borrow().get(&id) {
+                                demo::created_members(draft, filter, offset)
+                            } else {
+                                demo::members(id, &demo_members.borrow(), filter, offset)
+                            }
+                        });
                         Box::pin(async move {
                             if let Some(page) = local {
                                 tokio::time::sleep(Duration::from_millis(150)).await;
@@ -3341,13 +3472,7 @@ impl Ui {
             buffer.set_text("");
         }
         buffer.place_cursor(&buffer.end_iter());
-        self.input.set_sensitive(!chat.broadcast);
-        self.input_placeholder.set_text(if chat.broadcast {
-            "Канал только для чтения"
-        } else {
-            "Сообщение"
-        });
-        self.update_send_button();
+        self.set_chat_writability(chat.can_write);
         let cached = if anchor.is_none() {
             self.history_cache.borrow_mut().restore(id, now)
         } else {
@@ -4657,6 +4782,16 @@ impl Ui {
         buffer.text(&buffer.start_iter(), &buffer.end_iter(), true)
     }
 
+    fn set_chat_writability(&self, writable: bool) {
+        self.input.set_sensitive(writable);
+        self.input_placeholder.set_text(if writable {
+            "Сообщение"
+        } else {
+            "Канал только для чтения"
+        });
+        self.update_send_button();
+    }
+
     fn update_send_button(&self) {
         let text = self.composer_text();
         self.input_placeholder.set_visible(text.is_empty());
@@ -5291,7 +5426,7 @@ impl Ui {
         dialog.add_response("cancel", "Отмена");
         let chats = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let destination = Rc::new(Cell::new(None));
-        for chat in self.chats.borrow().iter().filter(|chat| !chat.broadcast) {
+        for chat in self.chats.borrow().iter().filter(|chat| chat.can_write) {
             let button = gtk::Button::new();
             button.add_css_class("flat");
             let title = label(&chat.title, "");

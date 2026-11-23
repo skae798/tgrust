@@ -1,4 +1,5 @@
 mod admin_log;
+mod create_chat;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -706,6 +707,7 @@ impl Telegram {
                 unread_mark: raw.unread_mark,
                 last_message_id: raw.top_message.max(0),
                 broadcast: matches!(peer, Peer::Channel(_)),
+                can_write: can_write_chat(peer),
                 saved_messages: matches!(peer, Peer::User(user) if user.is_self()),
                 avatar: peer_avatar(peer),
                 archived: raw.folder_id == Some(1),
@@ -2063,6 +2065,7 @@ impl Telegram {
                     unread_mark: false,
                     last_message_id: 0,
                     broadcast: matches!(peer, Peer::Channel(_)),
+                    can_write: can_write_chat(peer),
                     saved_messages: Some(peer_ref.id) == self_id
                         || matches!(peer, Peer::User(user) if user.is_self()),
                     avatar: peer_avatar(peer),
@@ -3644,6 +3647,22 @@ fn peer_avatar(peer: &Peer) -> Option<Avatar> {
         photo,
         dc,
     })
+}
+
+fn can_write_chat(peer: &Peer) -> bool {
+    match peer {
+        Peer::Channel(channel) => {
+            let raw = &channel.raw;
+            !raw.left
+                && !raw.min
+                && (raw.creator
+                    || raw
+                        .admin_rights
+                        .as_ref()
+                        .is_some_and(|enums::ChatAdminRights::Rights(rights)| rights.post_messages))
+        }
+        _ => true,
+    }
 }
 
 fn chat_kind(peer: &Peer) -> ChatKind {

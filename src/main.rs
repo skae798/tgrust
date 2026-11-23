@@ -13,6 +13,7 @@ mod links;
 mod media_stream;
 mod media_viewer;
 mod model;
+mod new_chat;
 mod own_profile;
 mod playback_controls;
 mod poll_dialog;
