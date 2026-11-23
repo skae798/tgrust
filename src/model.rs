@@ -25,6 +25,7 @@ pub struct Chat {
     pub unread_mark: bool,
     pub last_message_id: i32,
     pub broadcast: bool,
+    pub can_write: bool,
     pub saved_messages: bool,
     pub archived: bool,
     pub kind: ChatKind,
@@ -98,6 +99,7 @@ impl Contact {
             unread_mark: false,
             last_message_id: 0,
             broadcast: false,
+            can_write: true,
             saved_messages: self.is_self,
             archived: false,
             kind: self.kind,
@@ -663,6 +665,115 @@ impl ChatInfo {
             field(&self.about, &original.about, &current.about)?,
         ))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewChatKind {
+    Group,
+    Supergroup,
+    Channel,
+}
+
+#[derive(Clone)]
+pub struct NewChatDraft {
+    pub kind: NewChatKind,
+    pub info: ChatInfo,
+    pub username: String,
+    pub members: Vec<Contact>,
+}
+
+impl NewChatDraft {
+    pub fn validate(mut self) -> anyhow::Result<Self> {
+        self.info.title = self.info.title.trim().to_owned();
+        self.info.about = self.info.about.trim().to_owned();
+        anyhow::ensure!(
+            !self.info.title.is_empty() && !self.info.title.contains(['\r', '\n']),
+            "Введите название чата"
+        );
+        anyhow::ensure!(
+            self.info.title.chars().count() <= 128 && self.info.about.chars().count() <= 255,
+            "Название должно содержать до 128 символов, описание до 255"
+        );
+        self.username = new_chat_username(&self.username)?;
+        let mut seen = HashSet::new();
+        self.members.retain(|member| {
+            member.id > 0 && !member.is_self && member.available && seen.insert(member.id)
+        });
+        anyhow::ensure!(
+            self.kind != NewChatKind::Group || self.username.is_empty(),
+            "Публичное имя доступно для супергрупп и каналов"
+        );
+        anyhow::ensure!(
+            self.kind != NewChatKind::Group || !self.members.is_empty(),
+            "Выберите хотя бы одного участника"
+        );
+        anyhow::ensure!(
+            self.kind != NewChatKind::Channel
+                || self
+                    .members
+                    .iter()
+                    .all(|member| member.kind != ChatKind::Bot),
+            "Ботов можно добавлять в канал через назначение администратора"
+        );
+        Ok(self)
+    }
+
+    pub fn chat(&self, id: i64, date: i64) -> Chat {
+        Chat {
+            id,
+            pinned: false,
+            last_activity: date,
+            title: self.info.title.clone(),
+            preview: String::new(),
+            preview_sender: None,
+            preview_image: None,
+            group: self.kind != NewChatKind::Channel,
+            unread: 0,
+            unread_mark: false,
+            last_message_id: 0,
+            broadcast: self.kind == NewChatKind::Channel,
+            can_write: true,
+            saved_messages: false,
+            avatar: None,
+            archived: false,
+            kind: if self.kind == NewChatKind::Channel {
+                ChatKind::Broadcast
+            } else {
+                ChatKind::Group
+            },
+            muted: false,
+        }
+    }
+}
+
+pub fn new_chat_username(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    let username = value.strip_prefix('@').unwrap_or(value);
+    anyhow::ensure!(
+        value.is_empty()
+            || ((5..=32).contains(&username.len())
+                && username.starts_with(|c: char| c.is_ascii_alphabetic())
+                && username.ends_with(|c: char| c.is_ascii_alphanumeric())
+                && !username.contains("__")
+                && username
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_')),
+        "Публичное имя должно содержать от 5 до 32 латинских букв, цифр или знаков подчёркивания"
+    );
+    Ok(username.to_owned())
+}
+
+pub struct CreatedChat {
+    pub chat: Chat,
+    pub draft: NewChatDraft,
+    pub warnings: Vec<String>,
+    pub public_error: Option<String>,
+}
+
+pub enum NewChatResult {
+    Created(Box<CreatedChat>),
+    Rejected(String),
+    Unconfirmed(String),
 }
 
 impl PeerProfile {
@@ -1750,6 +1861,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn chat_creation_validates_type_address_and_unique_contacts() {
+        let mut draft = NewChatDraft {
+            kind: NewChatKind::Group,
+            info: ChatInfo {
+                title: "  План  ".into(),
+                about: " Справка ".into(),
+            },
+            username: String::new(),
+            members: Vec::new(),
+        };
+        assert!(draft.clone().validate().is_err());
+        let member = Contact {
+            id: 42,
+            name: "Пример".into(),
+            usernames: Vec::new(),
+            phone: None,
+            avatar: None,
+            kind: ChatKind::Contact,
+            is_self: false,
+            available: true,
+        };
+        draft.members = vec![member.clone(), member];
+        let group = draft.clone().validate().unwrap();
+        assert_eq!(group.info.title, "План");
+        assert_eq!(group.info.about, "Справка");
+        assert_eq!(group.members.len(), 1);
+        draft.username = " @project_1 ".into();
+        assert!(draft.clone().validate().is_err());
+        draft.kind = NewChatKind::Channel;
+        let channel = draft.clone().validate().unwrap();
+        assert_eq!(channel.username, "project_1");
+        assert!(channel.chat(-1000000000234, 0).can_write);
+        draft.members[0].kind = ChatKind::Bot;
+        assert!(draft.validate().is_err());
+        for invalid in [
+            "@",
+            "@@project",
+            "проект",
+            "12345",
+            "valid_",
+            "test__project",
+        ] {
+            assert!(new_chat_username(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn admin_log_pages_skip_overlap_and_stop_at_zero_or_no_progress() {
         let entry = |id| AdminLogEntry {
             id,
@@ -2192,6 +2350,7 @@ mod tests {
             unread_mark: false,
             last_message_id: 0,
             broadcast: false,
+            can_write: true,
             saved_messages: false,
             archived: true,
             kind: ChatKind::Group,

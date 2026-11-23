@@ -4,11 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::model::{
     ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
-    BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, INVITE_PAGE_SIZE,
-    InviteAction, InviteCursor, InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE,
-    JoinDecisionOutcome, JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE,
-    MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole, Message, PeerProfile,
-    PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
+    BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, CreatedChat,
+    INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink, InvitePage,
+    JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor, JoinRequestPage,
+    MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole,
+    Message, NewChatDraft, NewChatKind, NewChatResult, PeerProfile, PlayableMedia,
+    PlaybackProgress, PlaybackSource, PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -51,6 +52,7 @@ pub fn chats() -> Vec<Chat> {
         unread_mark: false,
         last_message_id: history(id).last().map_or(0, |message| message.id),
         broadcast,
+        can_write: !broadcast,
         saved_messages: id == 2,
         avatar: (id != 2).then_some(Avatar {
             peer: id,
@@ -183,6 +185,97 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             Vec::new()
         },
     })
+}
+
+pub fn create_chat(id: i64, mut draft: NewChatDraft) -> NewChatResult {
+    if draft.username == "demo_taken" {
+        return NewChatResult::Rejected("Это публичное имя занято.".into());
+    }
+    if draft.username == "demo_unconfirmed" {
+        return NewChatResult::Unconfirmed("Telegram не прислал ответ вовремя.".into());
+    }
+    let public_error = (draft.username == "demo_race").then(|| "Это публичное имя занято.".into());
+    let mut warnings = Vec::new();
+    if let Some(contact) = draft.members.iter().find(|contact| contact.id == 12) {
+        warnings.push(format!(
+            "Telegram не добавил следующих участников.\n{}",
+            contact.name
+        ));
+        draft.members.retain(|contact| contact.id != 12);
+    }
+    NewChatResult::Created(Box::new(CreatedChat {
+        chat: draft.chat(id, now()),
+        draft,
+        warnings,
+        public_error,
+    }))
+}
+
+pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
+    let broadcast = draft.kind == NewChatKind::Channel;
+    PeerProfile {
+        id,
+        kind: if broadcast {
+            ChatKind::Broadcast
+        } else {
+            ChatKind::Group
+        },
+        title: draft.info.title.clone(),
+        about: draft.info.about.clone(),
+        usernames: (!draft.username.is_empty())
+            .then(|| format!("@{}", draft.username))
+            .into_iter()
+            .collect(),
+        members: u32::try_from(draft.members.len() + 1).ok(),
+        is_self: false,
+        blocked: None,
+        avatar: None,
+        phone: None,
+        online_members: None,
+        verified: false,
+        scam: false,
+        fake: false,
+        can_edit_chat: true,
+        can_view_members: true,
+        moderation: None,
+        admin_policy: None,
+        can_manage_invites: true,
+        can_read_admin_log: draft.kind != NewChatKind::Group,
+        bot_commands: Vec::new(),
+    }
+}
+
+pub fn created_members(draft: &NewChatDraft, filter: MemberFilter, offset: i32) -> MemberPage {
+    let owner = ChatMember {
+        id: OWN_AVATAR.peer,
+        name: OWN_NAME.into(),
+        avatar: Some(OWN_AVATAR),
+        role: MemberRole::Owner,
+        bot: false,
+        can_update: false,
+        admin: None,
+    };
+    let members = std::iter::once(owner)
+        .chain(draft.members.iter().map(|member| ChatMember {
+            id: member.id,
+            name: member.name.clone(),
+            avatar: member.avatar,
+            role: MemberRole::Member,
+            bot: member.kind == ChatKind::Bot,
+            can_update: false,
+            admin: None,
+        }))
+        .filter(|member| filter.includes(member))
+        .collect::<Vec<_>>();
+    MemberPage {
+        next: (offset + MEMBER_PAGE_SIZE < members.len() as i32)
+            .then_some(offset + MEMBER_PAGE_SIZE),
+        members: members
+            .into_iter()
+            .skip(offset as usize)
+            .take(MEMBER_PAGE_SIZE as usize)
+            .collect(),
+    }
 }
 
 #[derive(Default)]
