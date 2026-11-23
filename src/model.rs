@@ -400,6 +400,7 @@ pub struct InviteDraft {
     pub title: String,
     pub hours: Option<i32>,
     pub limit: Option<i32>,
+    pub approval: bool,
 }
 
 impl InviteDraft {
@@ -418,6 +419,10 @@ impl InviteDraft {
                 .is_none_or(|limit| (1..=100_000).contains(&limit)),
             "Укажите от 1 до 100 000 вступлений или оставьте поле пустым"
         );
+        anyhow::ensure!(
+            !self.approval || self.limit.is_none(),
+            "Для ссылок с одобрением лимит вступлений недоступен"
+        );
         Ok(self)
     }
 
@@ -435,6 +440,40 @@ impl InviteDraft {
 pub enum InviteAction {
     Create(InviteDraft),
     Revoke(String),
+}
+
+pub const JOIN_REQUEST_PAGE_SIZE: i32 = 25;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct JoinRequestCursor {
+    pub date: i32,
+    pub user: i64,
+}
+
+pub struct JoinRequest {
+    pub cursor: JoinRequestCursor,
+    pub name: String,
+    pub about: String,
+    pub avatar: Option<Avatar>,
+    pub actionable: bool,
+}
+
+pub struct JoinRequestPage {
+    pub requests: Vec<JoinRequest>,
+    pub next: Option<JoinRequestCursor>,
+    pub total: usize,
+}
+
+#[derive(Clone, Copy)]
+pub enum JoinDecision {
+    Approve,
+    Decline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinDecisionOutcome {
+    Applied,
+    AlreadyHandled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1396,6 +1435,7 @@ mod tests {
             title: "  Экскурсия  ".into(),
             hours: Some(24),
             limit: Some(3),
+            approval: false,
         }
         .normalize()
         .unwrap();
@@ -1410,10 +1450,23 @@ mod tests {
                 title: String::new(),
                 hours: None,
                 limit: Some(0),
+                approval: false,
             }
             .normalize()
             .is_err()
         );
+    }
+
+    #[test]
+    fn approval_invites_require_no_usage_limit() {
+        let draft = |limit| InviteDraft {
+            title: String::new(),
+            hours: Some(24),
+            limit,
+            approval: true,
+        };
+        assert!(draft(None).normalize().unwrap().approval);
+        assert!(draft(Some(3)).normalize().is_err());
     }
 
     #[test]
