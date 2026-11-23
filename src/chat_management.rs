@@ -11,7 +11,8 @@ use gtk::glib;
 use tokio::runtime::Handle;
 
 use crate::model::{
-    ChatInfo, MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole,
+    AdminPolicy, AdminRight, AdminRights, AdminState, ChatInfo, MemberChange, MemberFilter,
+    MemberModeration, MemberPage, MemberRole,
 };
 use crate::profile::AvatarLoader;
 
@@ -173,6 +174,7 @@ pub fn members(
     subscribers: bool,
     can_view_members: bool,
     moderation: Option<MemberModeration>,
+    admin_policy: Option<AdminPolicy>,
     context: MembersContext,
 ) {
     let (dialog, body) = dialog(if subscribers {
@@ -187,6 +189,8 @@ pub fn members(
             (MemberFilter::Admins, "Администраторы"),
             (MemberFilter::Bots, "Боты"),
         ]);
+    } else if admin_policy.is_some() {
+        choices.push((MemberFilter::Admins, "Администраторы"));
     }
     if moderation == Some(MemberModeration::Ban) {
         choices.push((MemberFilter::Banned, "Заблокированные"));
@@ -213,6 +217,7 @@ pub fn members(
     let state = Rc::new(Members {
         context,
         moderation,
+        admin_policy,
         choices: choices.into_iter().map(|(filter, _)| filter).collect(),
         filters,
         refresh,
@@ -260,6 +265,7 @@ pub fn members(
 struct Members {
     context: MembersContext,
     moderation: Option<MemberModeration>,
+    admin_policy: Option<AdminPolicy>,
     choices: Vec<MemberFilter>,
     filters: gtk::DropDown,
     refresh: gtk::Button,
@@ -381,7 +387,7 @@ impl Members {
                     .label(change_label(action))
                     .valign(gtk::Align::Center)
                     .build();
-                let name = member.name;
+                let name = member.name.clone();
                 button.update_property(&[gtk::accessible::Property::Label(&format!(
                     "{} — {name}",
                     change_label(action)
@@ -391,6 +397,51 @@ impl Members {
                     #[weak(rename_to = state)]
                     self,
                     move |button| state.confirm(button, id, &name, action)
+                ));
+                row.add_suffix(&button);
+            }
+            if let Some((policy, original)) = self.admin_policy.zip(member.admin) {
+                let (icon, label) = match (policy, original) {
+                    (_, AdminState::Member) => ("list-add-symbolic", "Назначить администратором"),
+                    (AdminPolicy::Basic, _) => {
+                        ("list-remove-symbolic", "Снять права администратора")
+                    }
+                    (AdminPolicy::Channel(_), _) => {
+                        ("document-edit-symbolic", "Права администратора")
+                    }
+                };
+                let button = gtk::Button::from_icon_name(icon);
+                button.set_valign(gtk::Align::Center);
+                button.set_tooltip_text(Some(label));
+                button.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{label} — {}",
+                    member.name
+                ))]);
+                let id = member.id;
+                let name = member.name;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = state)]
+                    self,
+                    move |button| match policy {
+                        AdminPolicy::Basic => {
+                            let requested = if original == AdminState::Member {
+                                AdminState::Administrator(AdminRights::default())
+                            } else {
+                                AdminState::Member
+                            };
+                            state.confirm(
+                                button,
+                                id,
+                                &name,
+                                MemberChange::SetAdmin {
+                                    original,
+                                    requested,
+                                },
+                            );
+                        }
+                        AdminPolicy::Channel(allowed) =>
+                            state.edit_admin(button, id, &name, original, allowed),
+                    }
                 ));
                 row.add_suffix(&button);
             }
@@ -420,18 +471,140 @@ impl Members {
             glib::clone!(
                 #[weak(rename_to = state)]
                 self,
-                move |_, _| state.change(member, change)
+                move |_, _| state.change(member, change, None)
             ),
         );
         prompt.present(Some(anchor));
     }
 
-    fn change(self: &Rc<Self>, member: i64, change: MemberChange) {
+    fn edit_admin(
+        self: &Rc<Self>,
+        anchor: &gtk::Button,
+        member: i64,
+        name: &str,
+        original: AdminState,
+        allowed: AdminRights,
+    ) {
+        let (dialog, body) = dialog("Права администратора");
+        let heading = gtk::Label::new(Some(name));
+        heading.add_css_class("title-3");
+        heading.set_wrap(true);
+        heading.set_xalign(0.0);
+        body.append(&heading);
+        if original == AdminState::Member {
+            let note = status_label();
+            note.set_text(
+                "Роль администратора открывает доступ к журналу действий и списку участников.",
+            );
+            body.append(&note);
+        }
+        let group = adw::PreferencesGroup::new();
+        let mut options = Vec::new();
+        for (right, title) in ADMIN_OPTIONS {
+            let selected = original.rights().has(right);
+            let editable = allowed.has(right);
+            if selected || editable {
+                let row = adw::SwitchRow::builder()
+                    .title(title)
+                    .active(selected)
+                    .build();
+                row.set_sensitive(editable);
+                group.add(&row);
+                options.push((right, row));
+            }
+        }
+        body.append(&group);
+        let status = status_label();
+        body.append(&status);
+        let submit = gtk::Button::with_label(if original == AdminState::Member {
+            "Назначить администратора"
+        } else {
+            "Сохранить права"
+        });
+        submit.add_css_class("suggested-action");
+        body.append(&submit);
+        submit.connect_clicked(glib::clone!(
+            #[weak(rename_to = state)]
+            self,
+            #[weak]
+            dialog,
+            #[weak]
+            status,
+            move |_| {
+                let rights = options
+                    .iter()
+                    .fold(original.rights(), |rights, (right, row)| {
+                        rights.with(*right, row.is_active())
+                    });
+                let requested = AdminState::Administrator(rights);
+                let policy = AdminPolicy::Channel(allowed);
+                match policy.needs_change(original, original, requested) {
+                    Ok(true) => state.change(
+                        member,
+                        MemberChange::SetAdmin {
+                            original,
+                            requested,
+                        },
+                        Some(AdminEditor { dialog, status }),
+                    ),
+                    Ok(false) => status.set_text("Нет изменений."),
+                    Err(error) => status.set_text(&error.to_string()),
+                }
+            }
+        ));
+        if original != AdminState::Member {
+            let demote = gtk::Button::with_label("Снять права администратора");
+            demote.add_css_class("destructive-action");
+            body.append(&demote);
+            let name = name.to_owned();
+            demote.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                #[weak]
+                dialog,
+                #[weak]
+                status,
+                move |demote| {
+                    let change = MemberChange::SetAdmin {
+                        original,
+                        requested: AdminState::Member,
+                    };
+                    let prompt = moderation_prompt(&name, change);
+                    prompt.connect_response(
+                        Some("confirm"),
+                        glib::clone!(
+                            #[weak]
+                            state,
+                            #[weak]
+                            dialog,
+                            #[weak]
+                            status,
+                            move |_, _| state.change(
+                                member,
+                                change,
+                                Some(AdminEditor { dialog, status })
+                            )
+                        ),
+                    );
+                    prompt.present(Some(demote));
+                }
+            ));
+        }
+        dialog.present(Some(anchor));
+    }
+
+    fn change(self: &Rc<Self>, member: i64, change: MemberChange, editor: Option<AdminEditor>) {
         if self.closed.get() || self.task.borrow().is_some() || self.writing.replace(true) {
             return;
         }
         self.set_controls_sensitive(false);
-        self.set_status("Сохранение…");
+        if let Some(editor) = &editor {
+            editor.dialog.set_can_close(false);
+            editor.dialog.set_sensitive(false);
+            editor.status.set_text("Сохранение…");
+        } else {
+            self.set_status("Сохранение…");
+        }
         let request = (self.context.moderate)(member, change);
         let task = self.context.runtime.spawn(async move {
             tokio::time::timeout(Duration::from_secs(25), request)
@@ -451,6 +624,17 @@ impl Members {
             }
             state.changed.set(true);
             state.set_controls_sensitive(true);
+            if let Some(editor) = editor {
+                editor.dialog.set_sensitive(true);
+                editor.dialog.set_can_close(true);
+                if let Err(error) = result {
+                    editor
+                        .status
+                        .set_text(&format!("Не удалось изменить права. {error}"));
+                    return;
+                }
+                editor.dialog.close();
+            }
             state.filters.grab_focus();
             match result {
                 Ok(()) => state.reset(),
@@ -467,6 +651,35 @@ impl Members {
     }
 }
 
+struct AdminEditor {
+    dialog: adw::Dialog,
+    status: gtk::Label,
+}
+
+const ADMIN_OPTIONS: [(AdminRight, &str); 18] = {
+    use AdminRight::*;
+    [
+        (ChangeInfo, "Изменять информацию"),
+        (PostMessages, "Публиковать сообщения"),
+        (EditMessages, "Редактировать сообщения"),
+        (DeleteMessages, "Удалять сообщения"),
+        (BanUsers, "Блокировать участников"),
+        (InviteUsers, "Приглашать участников"),
+        (PinMessages, "Закреплять сообщения"),
+        (ManageTopics, "Управлять темами"),
+        (ManageCall, "Управлять видеочатами"),
+        (Anonymous, "Сохранять анонимность"),
+        (PostStories, "Публиковать истории"),
+        (EditStories, "Редактировать истории"),
+        (DeleteStories, "Удалять истории"),
+        (ManageDirectMessages, "Управлять личными сообщениями канала"),
+        (ManageRanks, "Менять теги участников"),
+        (ManageLinkedPeers, "Управлять связанными чатами"),
+        (ManageWelcomeMessages, "Менять приветственные сообщения"),
+        (AddAdmins, "Назначать администраторов"),
+    ]
+};
+
 fn moderation_prompt(name: &str, change: MemberChange) -> adw::AlertDialog {
     let (heading, body) = match change {
         MemberChange::Remove => (
@@ -481,11 +694,30 @@ fn moderation_prompt(name: &str, change: MemberChange) -> adw::AlertDialog {
             "Снять блокировку?",
             format!("{name} сможет снова вступить в чат, если у него есть доступ."),
         ),
+        MemberChange::SetAdmin {
+            requested: AdminState::Member,
+            ..
+        } => (
+            "Снять права администратора?",
+            format!("{name} останется в чате без прав администратора."),
+        ),
+        MemberChange::SetAdmin { .. } => (
+            "Назначить администратором?",
+            format!("{name} получит права администратора в этой группе."),
+        ),
     };
     let prompt = adw::AlertDialog::new(Some(heading), Some(&body));
     prompt.set_body_use_markup(false);
     prompt.add_responses(&[("cancel", "Отмена"), ("confirm", change_label(change))]);
-    if change != MemberChange::Unban {
+    if matches!(
+        change,
+        MemberChange::Remove
+            | MemberChange::Ban
+            | MemberChange::SetAdmin {
+                requested: AdminState::Member,
+                ..
+            }
+    ) {
         prompt.set_response_appearance("confirm", adw::ResponseAppearance::Destructive);
     }
     prompt.set_default_response(Some("cancel"));
@@ -502,6 +734,11 @@ fn change_label(change: MemberChange) -> &'static str {
         MemberChange::Remove => "Удалить",
         MemberChange::Ban => "Заблокировать",
         MemberChange::Unban => "Разблокировать",
+        MemberChange::SetAdmin {
+            requested: AdminState::Member,
+            ..
+        } => "Снять права",
+        MemberChange::SetAdmin { .. } => "Назначить",
     }
 }
 

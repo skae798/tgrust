@@ -23,6 +23,13 @@ use grammers_session::{
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, watch};
 
 use crate::model::{
+    AdminPolicy, AdminRight, AdminRights, AdminState, AudioInfo, BotCommand, ChatInfo, ChatMember,
+    INVITE_PAGE_SIZE, InviteAction, InviteChanges, InviteCursor, InviteLink, InvitePage,
+    JOIN_REQUEST_PAGE_SIZE, JoinDecision, JoinDecisionOutcome, JoinRequest, JoinRequestCursor,
+    JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
+    MemberRole, TextLink,
+};
+use crate::model::{
     AttachmentThumbnail, Avatar, BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer, Chat, ChatFolder,
     ChatImage, ChatKind, Contact, DeviceChange, DeviceSession, DeviceSessions, FormattedText,
     HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, OwnProfile,
@@ -31,12 +38,6 @@ use crate::model::{
     ProfileDetails, ProfileEdit, ProfileEditResult, Reaction, ReadRequest, ReplyPreview,
     SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
     UploadKind, redact_spoilers,
-};
-use crate::model::{
-    AudioInfo, BotCommand, ChatInfo, ChatMember, INVITE_PAGE_SIZE, InviteAction, InviteChanges,
-    InviteCursor, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecision,
-    JoinDecisionOutcome, JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE,
-    MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole, TextLink,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -1230,6 +1231,7 @@ impl Telegram {
                         Some((
                             PeerId::user(participant.user_id())?,
                             basic_member_role(&participant),
+                            basic_admin_state(&participant),
                         ))
                     });
                 let peers = self.peers_from_entities(result.users, Vec::new());
@@ -1283,7 +1285,9 @@ impl Telegram {
                 let next = member_next(offset, result.participants.len(), result.count);
                 let roles = result.participants.into_iter().filter_map(|participant| {
                     let (id, role) = channel_member(&participant)?;
-                    Some((id, role?))
+                    let admin = channel_admin_state(&participant)
+                        .and_then(|(state, editable)| editable.then_some(state));
+                    Some((id, role?, admin))
                 });
                 let peers = self.peers_from_entities(result.users, result.chats);
                 Ok(MemberPage {
@@ -1298,12 +1302,12 @@ impl Telegram {
     async fn member_views(
         &self,
         mut peers: HashMap<PeerId, Peer>,
-        roles: impl IntoIterator<Item = (PeerId, MemberRole)>,
+        roles: impl IntoIterator<Item = (PeerId, MemberRole, Option<AdminState>)>,
         filter: MemberFilter,
     ) -> Vec<ChatMember> {
         let mut members = Vec::new();
         let mut refs = Vec::new();
-        for (peer_id, role) in roles {
+        for (peer_id, role, admin) in roles {
             let Some(id) = peer_id.bot_api_dialog_id() else {
                 continue;
             };
@@ -1332,6 +1336,7 @@ impl Telegram {
                 avatar: None,
                 role,
                 can_update: false,
+                admin: None,
             };
             if filter.includes(&member) {
                 if let Some(peer) = peer
@@ -1340,6 +1345,7 @@ impl Telegram {
                     refs.push((id, reference));
                     member.avatar = peer_avatar(&peer);
                     member.can_update = eligible;
+                    member.admin = admin.filter(|_| eligible);
                 }
                 members.push(member);
             }
@@ -1354,6 +1360,15 @@ impl Telegram {
         member: i64,
         change: MemberChange,
     ) -> Result<()> {
+        if let MemberChange::SetAdmin {
+            original,
+            requested,
+        } = change
+        {
+            return self
+                .change_chat_admin(chat, member, original, requested)
+                .await;
+        }
         let _serial = self.dialog_settings.lock().await;
         let chat = self.peer(chat).await?;
         let member = self.peer(member).await?;
@@ -1436,6 +1451,105 @@ impl Telegram {
         }
         self.invalidate_views();
         Ok(())
+    }
+
+    async fn change_chat_admin(
+        &self,
+        chat: i64,
+        member: i64,
+        original: AdminState,
+        requested: AdminState,
+    ) -> Result<()> {
+        use grammers_client::tl::functions::{channels::EditAdmin, messages::EditChatAdmin};
+        let _serial = self.dialog_settings.lock().await;
+        let chat = self.peer(chat).await?;
+        let member = self.peer(member).await?;
+        let own = match self.self_id().await? {
+            Some(id) => id,
+            None => self.profile().await.context("Аккаунт недоступен")?.id(),
+        };
+        ensure!(
+            member.id.kind() == PeerKind::User
+                && member.id != own
+                && enums::InputPeer::from(member) != enums::InputPeer::PeerSelf,
+            "Эту роль нельзя изменить"
+        );
+        let member_id = member.id.bare_id().context("Участник недоступен")?;
+        let full = self.full_chat(chat).await?;
+        let policy = self
+            .chat_profile_view(chat, full.chats)?
+            .admin_policy
+            .context("Telegram не разрешает управлять администраторами этого чата")?;
+        match policy {
+            AdminPolicy::Basic => {
+                let enums::ChatFull::Full(full) = full.full_chat else {
+                    bail!("Профиль группы изменился");
+                };
+                let enums::ChatParticipants::Participants(members) = full.participants else {
+                    bail!("Telegram ограничил доступ к списку участников");
+                };
+                let current = members
+                    .participants
+                    .iter()
+                    .find(|entry| entry.user_id() == member_id)
+                    .and_then(basic_admin_state)
+                    .context("Участник недоступен или его роль нельзя изменить")?;
+                if policy.needs_change(original, current, requested)? {
+                    ensure!(
+                        self.client
+                            .invoke(&EditChatAdmin {
+                                chat_id: full.id,
+                                user_id: member.into(),
+                                is_admin: requested != AdminState::Member,
+                            })
+                            .await?,
+                        "Telegram не подтвердил изменение роли"
+                    );
+                }
+            }
+            AdminPolicy::Channel(_) => {
+                let (current, editable) = self.channel_admin(chat, member).await?;
+                ensure!(editable, "Telegram не разрешает менять эту роль");
+                if policy.needs_change(original, current, requested)? {
+                    self.client
+                        .invoke(&EditAdmin {
+                            channel: chat.into(),
+                            user_id: member.into(),
+                            admin_rights: telegram_admin_rights(requested.channel_rights()).into(),
+                            rank: None,
+                        })
+                        .await?;
+                    self.invalidate_views();
+                    let (confirmed, _) = self.channel_admin(chat, member).await?;
+                    ensure!(
+                        matches!(
+                            policy.needs_change(requested, confirmed, requested),
+                            Ok(false)
+                        ),
+                        "Telegram не подтвердил изменение прав"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        self.invalidate_views();
+        Ok(())
+    }
+
+    async fn channel_admin(&self, chat: PeerRef, member: PeerRef) -> Result<(AdminState, bool)> {
+        use grammers_client::tl::functions::channels::GetParticipant;
+        let enums::channels::ChannelParticipant::Participant(result) = self
+            .client
+            .invoke(&GetParticipant {
+                channel: chat.into(),
+                participant: member.into(),
+            })
+            .await?;
+        ensure!(
+            channel_member(&result.participant).is_some_and(|(id, _)| id == member.id),
+            "Telegram вернул другого участника"
+        );
+        channel_admin_state(&result.participant).context("Telegram не разрешает менять эту роль")
     }
 
     fn peers_from_entities(
@@ -3114,6 +3228,84 @@ fn basic_member_role(participant: &enums::ChatParticipant) -> MemberRole {
     }
 }
 
+fn basic_admin_state(participant: &enums::ChatParticipant) -> Option<AdminState> {
+    match participant {
+        enums::ChatParticipant::Participant(_) => Some(AdminState::Member),
+        enums::ChatParticipant::Admin(_) => Some(AdminState::Administrator(AdminRights::default())),
+        enums::ChatParticipant::Creator(_) => None,
+    }
+}
+
+fn channel_admin_state(participant: &enums::ChannelParticipant) -> Option<(AdminState, bool)> {
+    use enums::ChannelParticipant as P;
+    match participant {
+        P::Participant(_) => Some((AdminState::Member, true)),
+        P::Admin(admin) if !admin.is_self => Some((
+            AdminState::Administrator(model_admin_rights(&admin.admin_rights)),
+            admin.can_edit,
+        )),
+        _ => None,
+    }
+}
+
+macro_rules! admin_rights_mapping {
+    ($($right:ident => $field:ident),+ $(,)?) => {
+        fn model_admin_rights(rights: &enums::ChatAdminRights) -> AdminRights {
+            let enums::ChatAdminRights::Rights(rights) = rights;
+            AdminRights::from_rights([
+                $((AdminRight::$right, rights.$field)),+
+            ].into_iter().filter_map(|(right, enabled)| enabled.then_some(right)))
+        }
+
+        fn telegram_admin_rights(rights: AdminRights) -> types::ChatAdminRights {
+            types::ChatAdminRights {
+                $($field: rights.has(AdminRight::$right)),+
+            }
+        }
+    };
+}
+
+admin_rights_mapping! {
+    ChangeInfo => change_info,
+    PostMessages => post_messages,
+    EditMessages => edit_messages,
+    DeleteMessages => delete_messages,
+    BanUsers => ban_users,
+    InviteUsers => invite_users,
+    PinMessages => pin_messages,
+    AddAdmins => add_admins,
+    Anonymous => anonymous,
+    ManageCall => manage_call,
+    Other => other,
+    ManageTopics => manage_topics,
+    PostStories => post_stories,
+    EditStories => edit_stories,
+    DeleteStories => delete_stories,
+    ManageDirectMessages => manage_direct_messages,
+    ManageRanks => manage_ranks,
+    ManageLinkedPeers => manage_linked_peers,
+    ManageWelcomeMessages => manage_welcome_messages,
+}
+
+fn channel_admin_policy(channel: &types::Channel) -> Option<AdminPolicy> {
+    if channel.left || channel.min || channel.monoforum {
+        return None;
+    }
+    let available = AdminRights::channel(
+        channel.broadcast,
+        channel.forum,
+        channel.linked_monoforum_id.is_some(),
+    );
+    if channel.creator {
+        return Some(AdminPolicy::Channel(available));
+    }
+    let own = model_admin_rights(channel.admin_rights.as_ref()?);
+    own.has(AdminRight::AddAdmins)
+        .then_some(AdminPolicy::Channel(
+            available.intersect(own.with(AdminRight::Other, true)),
+        ))
+}
+
 fn channel_member(participant: &enums::ChannelParticipant) -> Option<(PeerId, Option<MemberRole>)> {
     use enums::ChannelParticipant as P;
     let (id, role) = match participant {
@@ -3296,6 +3488,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         can_edit_chat: false,
         can_view_members: false,
         moderation: None,
+        admin_policy: None,
         can_manage_invites: false,
         bot_commands: Vec::new(),
     };
@@ -3306,6 +3499,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
             enums::Chat::Chat(chat) => {
                 profile.members = u32::try_from(chat.participants_count).ok();
                 if !chat.left && !chat.deactivated && chat.migrated_to.is_none() {
+                    profile.admin_policy = chat.creator.then_some(AdminPolicy::Basic);
                     profile.can_edit_chat = can_edit_chat(chat.creator, chat.admin_rights.as_ref());
                     profile.can_manage_invites =
                         can_manage_invites(chat.creator, chat.admin_rights.as_ref());
@@ -3343,6 +3537,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         Peer::Community(_) => None,
     };
     if let Some(channel) = channel {
+        profile.admin_policy = channel_admin_policy(channel);
         profile.can_edit_chat =
             !channel.left && can_edit_chat(channel.creator, channel.admin_rights.as_ref());
         profile.can_manage_invites = !channel.left
@@ -4270,6 +4465,38 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_admin_mapping_preserves_protocol_flags_and_server_editability() {
+        use AdminRight::*;
+        let rights = AdminRights::from_rights([PostMessages, AddAdmins, ManageLinkedPeers, Other]);
+        let encoded = telegram_admin_rights(rights);
+        assert!(encoded.post_messages && encoded.add_admins && encoded.manage_linked_peers);
+        assert!(encoded.other && !encoded.delete_messages && !encoded.anonymous);
+        assert!(!telegram_admin_rights(AdminRights::default()).other);
+        assert_eq!(model_admin_rights(&encoded.clone().into()), rights);
+        let mut admin = types::ChannelParticipantAdmin {
+            can_edit: true,
+            is_self: false,
+            user_id: 42,
+            inviter_id: None,
+            promoted_by: 17,
+            date: 100,
+            admin_rights: encoded.into(),
+            rank: Some("Модератор".into()),
+        };
+        assert_eq!(
+            channel_admin_state(&admin.clone().into()),
+            Some((AdminState::Administrator(rights), true))
+        );
+        admin.can_edit = false;
+        assert_eq!(
+            channel_admin_state(&admin.clone().into()),
+            Some((AdminState::Administrator(rights), false))
+        );
+        admin.is_self = true;
+        assert_eq!(channel_admin_state(&admin.into()), None);
+    }
 
     #[test]
     fn member_offset_follows_server_rows_and_stops_when_no_progress_is_possible() {

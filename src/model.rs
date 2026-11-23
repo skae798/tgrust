@@ -354,6 +354,7 @@ pub struct PeerProfile {
     pub can_edit_chat: bool,
     pub can_view_members: bool,
     pub moderation: Option<MemberModeration>,
+    pub admin_policy: Option<AdminPolicy>,
     pub can_manage_invites: bool,
     pub bot_commands: Vec<BotCommand>,
 }
@@ -650,6 +651,143 @@ pub enum MemberChange {
     Remove,
     Ban,
     Unban,
+    SetAdmin {
+        original: AdminState,
+        requested: AdminState,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum AdminRight {
+    ChangeInfo,
+    PostMessages,
+    EditMessages,
+    DeleteMessages,
+    BanUsers,
+    InviteUsers,
+    PinMessages,
+    AddAdmins,
+    Anonymous,
+    ManageCall,
+    Other,
+    ManageTopics,
+    PostStories,
+    EditStories,
+    DeleteStories,
+    ManageDirectMessages,
+    ManageRanks,
+    ManageLinkedPeers,
+    ManageWelcomeMessages,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdminRights(u32);
+
+impl AdminRights {
+    pub fn from_rights(rights: impl IntoIterator<Item = AdminRight>) -> Self {
+        rights
+            .into_iter()
+            .fold(Self::default(), |mask, right| mask.with(right, true))
+    }
+
+    pub fn has(self, right: AdminRight) -> bool {
+        self.0 & (1 << right as u32) != 0
+    }
+
+    pub fn with(self, right: AdminRight, enabled: bool) -> Self {
+        let bit = 1 << right as u32;
+        Self((self.0 & !bit) | if enabled { bit } else { 0 })
+    }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub fn channel(broadcast: bool, forum: bool, direct: bool) -> Self {
+        use AdminRight::*;
+        Self::from_rights([
+            ChangeInfo,
+            DeleteMessages,
+            BanUsers,
+            InviteUsers,
+            AddAdmins,
+            ManageCall,
+            Other,
+            PostStories,
+            EditStories,
+            DeleteStories,
+            ManageWelcomeMessages,
+        ])
+        .with(PostMessages, broadcast)
+        .with(EditMessages, broadcast)
+        .with(ManageDirectMessages, broadcast && direct)
+        .with(PinMessages, !broadcast)
+        .with(Anonymous, !broadcast)
+        .with(ManageTopics, !broadcast && forum)
+        .with(ManageRanks, !broadcast)
+        .with(ManageLinkedPeers, !broadcast)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum AdminPolicy {
+    Basic,
+    Channel(AdminRights),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminState {
+    Member,
+    Administrator(AdminRights),
+}
+
+impl AdminState {
+    pub fn rights(self) -> AdminRights {
+        match self {
+            Self::Member => AdminRights::default(),
+            Self::Administrator(rights) => rights,
+        }
+    }
+
+    pub fn channel_rights(self) -> AdminRights {
+        self.rights().with(AdminRight::Other, self != Self::Member)
+    }
+}
+
+impl AdminPolicy {
+    pub fn needs_change(
+        self,
+        original: AdminState,
+        current: AdminState,
+        requested: AdminState,
+    ) -> anyhow::Result<bool> {
+        let equal = |left: AdminState, right: AdminState| match self {
+            Self::Basic => left == right,
+            Self::Channel(_) => left.channel_rights() == right.channel_rights(),
+        };
+        if equal(requested, current) {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            equal(current, original),
+            "Роль или права уже изменились. Обновите список участников"
+        );
+        match (self, requested) {
+            (Self::Basic, AdminState::Administrator(rights)) => anyhow::ensure!(
+                rights == AdminRights::default(),
+                "В обычной группе используется общий набор прав администратора"
+            ),
+            (Self::Channel(allowed), AdminState::Administrator(_)) => {
+                let changed = requested.channel_rights().0 ^ current.channel_rights().0;
+                anyhow::ensure!(
+                    changed & !allowed.0 == 0,
+                    "Набор прав превышает доступные для изменения права"
+                );
+            }
+            (_, AdminState::Member) => {}
+        }
+        Ok(true)
+    }
 }
 
 impl MemberModeration {
@@ -671,6 +809,7 @@ pub struct ChatMember {
     pub role: MemberRole,
     pub bot: bool,
     pub can_update: bool,
+    pub admin: Option<AdminState>,
 }
 
 impl MemberFilter {
@@ -1531,6 +1670,55 @@ pub fn prepend_history_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_admin_changes_preserve_locked_rights_and_reject_stale_roles() {
+        use AdminRight::*;
+        let allowed = AdminRights::from_rights([DeleteMessages, Other]);
+        let policy = AdminPolicy::Channel(allowed);
+        let original = AdminState::Administrator(AdminRights::from_rights([InviteUsers]));
+        let updated = AdminState::Administrator(original.rights().with(DeleteMessages, true));
+        let invalid = AdminState::Administrator(AdminRights::from_rights([DeleteMessages]));
+        assert!(policy.needs_change(original, original, updated).unwrap());
+        assert!(policy.needs_change(original, original, invalid).is_err());
+        assert!(
+            policy
+                .needs_change(original, AdminState::Member, updated)
+                .is_err()
+        );
+        assert!(
+            policy
+                .needs_change(original, updated, AdminState::Member)
+                .is_err()
+        );
+        let confirmed = AdminState::Administrator(updated.rights().with(Other, true));
+        assert!(!policy.needs_change(original, confirmed, updated).unwrap());
+    }
+
+    #[test]
+    fn administrator_options_follow_the_chat_type_and_basic_group_role() {
+        use AdminRight::*;
+        let forum = AdminRights::channel(false, true, false);
+        let broadcast = AdminRights::channel(true, false, true);
+        assert!(forum.has(ManageTopics) && forum.has(PinMessages) && forum.has(Anonymous));
+        assert!(!forum.has(PostMessages) && !forum.has(ManageDirectMessages));
+        assert!(broadcast.has(PostMessages) && broadcast.has(ManageDirectMessages));
+        assert!(!broadcast.has(Anonymous) && !broadcast.has(ManageTopics));
+        assert!(!AdminRights::channel(false, false, false).has(ManageTopics));
+        let policy = AdminPolicy::Basic;
+        let original = AdminState::Member;
+        let admin = AdminState::Administrator(AdminRights::default());
+        assert!(admin.channel_rights().has(Other));
+        assert_eq!(original.channel_rights(), AdminRights::default());
+        assert!(policy.needs_change(original, original, admin).unwrap());
+        assert!(!policy.needs_change(original, admin, admin).unwrap());
+        assert!(policy.needs_change(admin, admin, original).unwrap());
+        assert!(
+            policy
+                .needs_change(original, original, AdminState::Administrator(forum))
+                .is_err()
+        );
+    }
 
     #[test]
     fn invite_draft_validates_limits_and_calculates_expiration_at_send_time() {
