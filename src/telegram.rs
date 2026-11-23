@@ -33,10 +33,10 @@ use crate::model::{
     UploadKind, redact_spoilers,
 };
 use crate::model::{
-    AudioInfo, BotCommand, ChatInfo, ChatMember, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
-    InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecision, JoinDecisionOutcome, JoinRequest,
-    JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
-    MemberModeration, MemberPage, MemberRole, TextLink,
+    AudioInfo, BotCommand, ChatInfo, ChatMember, INVITE_PAGE_SIZE, InviteAction, InviteChanges,
+    InviteCursor, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecision,
+    JoinDecisionOutcome, JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE,
+    MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole, TextLink,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -981,9 +981,7 @@ impl Telegram {
     }
 
     pub async fn change_invite(&self, chat: i64, action: InviteAction) -> Result<()> {
-        use grammers_client::tl::functions::messages::{
-            EditExportedChatInvite, ExportChatInvite, GetExportedChatInvite,
-        };
+        use grammers_client::tl::functions::messages::{EditExportedChatInvite, ExportChatInvite};
         let _settings = self.dialog_settings.lock().await;
         let peer = self.invite_peer(chat).await?;
         match action {
@@ -1008,27 +1006,41 @@ impl Telegram {
                     "Telegram не подтвердил создание ссылки"
                 );
             }
-            InviteAction::Revoke(link) => {
-                let current = self
+            InviteAction::Edit(original, edit) => {
+                let link = &original.cursor.link;
+                let current = self.own_invite(peer, link).await?;
+                let changes = edit.changes(&original, &current)?;
+                if changes == InviteChanges::default() {
+                    return Ok(());
+                }
+                let result = self
                     .client
-                    .invoke(&GetExportedChatInvite {
+                    .invoke(&EditExportedChatInvite {
+                        revoked: false,
                         peer: peer.into(),
                         link: link.clone(),
+                        expire_date: changes.expire_date,
+                        usage_limit: changes.usage_limit,
+                        request_needed: changes.request_needed,
+                        title: changes.title.clone(),
                     })
-                    .await?
-                    .invite();
-                let account = match self.self_id().await? {
-                    Some(account) => account,
-                    None => self
-                        .profile()
-                        .await
-                        .context("Не удалось проверить владельца ссылки")?
-                        .id(),
-                };
-                let account = account
-                    .bare_id()
-                    .context("Не удалось проверить владельца ссылки")?;
-                if !needs_invite_revocation(&current, account, &link)? {
+                    .await?;
+                ensure!(
+                    invite_link(result.invite()).is_some_and(|updated| {
+                        updated.editable()
+                            && updated.cursor.link == *link
+                            && changes.confirmed_by(&updated)
+                    }),
+                    "Telegram не подтвердил параметры ссылки"
+                );
+            }
+            InviteAction::Revoke(link) => {
+                let current = self.own_invite(peer, &link).await?;
+                ensure!(
+                    !current.paid,
+                    "Эта ссылка связана с подпиской Telegram Stars"
+                );
+                if current.revoked {
                     return Ok(());
                 }
                 let result = self
@@ -1051,6 +1063,30 @@ impl Telegram {
             }
         }
         Ok(())
+    }
+
+    async fn own_invite(&self, peer: PeerRef, link: &str) -> Result<InviteLink> {
+        use grammers_client::tl::functions::messages::GetExportedChatInvite;
+        let raw = self
+            .client
+            .invoke(&GetExportedChatInvite {
+                peer: peer.into(),
+                link: link.to_owned(),
+            })
+            .await?
+            .invite();
+        let account = match self.self_id().await? {
+            Some(account) => account,
+            None => self
+                .profile()
+                .await
+                .context("Не удалось проверить владельца ссылки")?
+                .id(),
+        };
+        let account = account
+            .bare_id()
+            .context("Не удалось проверить владельца ссылки")?;
+        owned_invite_link(raw, account, link)
     }
 
     pub async fn join_requests(
@@ -3222,23 +3258,19 @@ fn exported_invite_page(
     InvitePage { links, next }
 }
 
-fn needs_invite_revocation(
-    raw: &enums::ExportedChatInvite,
+fn owned_invite_link(
+    raw: enums::ExportedChatInvite,
     account: i64,
     link: &str,
-) -> Result<bool> {
-    let enums::ExportedChatInvite::ChatInviteExported(raw) = raw else {
+) -> Result<InviteLink> {
+    let enums::ExportedChatInvite::ChatInviteExported(invite) = &raw else {
         bail!("Telegram вернул неизвестную ссылку");
     };
     ensure!(
-        raw.link == link && raw.admin_id == account,
+        invite.link == link && invite.admin_id == account,
         "Ссылка принадлежит другому администратору"
     );
-    ensure!(
-        raw.subscription_pricing.is_none(),
-        "Эта ссылка связана с подпиской Telegram Stars"
-    );
-    Ok(!raw.revoked)
+    invite_link(raw).context("Ссылка недоступна")
 }
 
 fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
@@ -4297,13 +4329,21 @@ mod tests {
     }
 
     #[test]
-    fn revoke_checks_ownership_and_preserves_paid_links() {
+    fn invite_writes_verify_link_url_and_owner_before_using_server_state() {
         let mut raw = test_invite("link", false);
-        assert!(needs_invite_revocation(&raw.clone().into(), 123, "link").unwrap());
-        assert!(needs_invite_revocation(&raw.clone().into(), 123, "other").is_err());
-        assert!(needs_invite_revocation(&raw.clone().into(), 124, "link").is_err());
+        assert!(
+            !owned_invite_link(raw.clone().into(), 123, "link")
+                .unwrap()
+                .revoked
+        );
+        assert!(owned_invite_link(raw.clone().into(), 123, "other").is_err());
+        assert!(owned_invite_link(raw.clone().into(), 124, "link").is_err());
         raw.revoked = true;
-        assert!(!needs_invite_revocation(&raw.clone().into(), 123, "link").unwrap());
+        assert!(
+            owned_invite_link(raw.clone().into(), 123, "link")
+                .unwrap()
+                .revoked
+        );
         raw.subscription_pricing = Some(
             types::StarsSubscriptionPricing {
                 period: 2592000,
@@ -4311,7 +4351,7 @@ mod tests {
             }
             .into(),
         );
-        assert!(needs_invite_revocation(&raw.into(), 123, "link").is_err());
+        assert!(owned_invite_link(raw.into(), 123, "link").unwrap().paid);
     }
 
     #[test]
