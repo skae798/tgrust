@@ -586,7 +586,7 @@ pub fn open(
         demo_chat_info: Rc::new(RefCell::new(HashMap::new())),
         demo_created_chats: Rc::new(RefCell::new(HashMap::new())),
         create_chat_dialog: glib::WeakRef::new(),
-        demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::new())),
+        demo_member_changes: Rc::new(RefCell::new(demo::MemberChanges::default())),
         demo_invites: Rc::new(RefCell::new(demo::InviteLinks::default())),
         demo_join_requests: Rc::new(RefCell::new(demo::JoinRequests::default())),
         own_profile_dialog: glib::WeakRef::new(),
@@ -2992,10 +2992,13 @@ impl Ui {
                     let chat_info = demo_chat_info.borrow().get(&id).cloned();
                     let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
                     let created = demo_created_chats.borrow().get(&id).cloned();
+                    let added = demo_members.borrow().invited_count(id);
                     Box::pin(async move {
                         if demo {
                             let mut profile = if let Some(draft) = &created {
-                                demo::created_profile(id, draft)
+                                let mut profile = demo::created_profile(id, draft);
+                                profile.members = profile.members.map(|count| count + added);
+                                profile
                             } else {
                                 let mut profile =
                                     demo::peer_profile(id).context("Чат не найден")?;
@@ -3065,7 +3068,13 @@ impl Ui {
                         let client = member_client.clone();
                         let local = demo.then(|| {
                             if let Some(draft) = demo_created_chats.borrow().get(&id) {
-                                demo::created_members(draft, filter, offset)
+                                demo::created_members(
+                                    id,
+                                    draft,
+                                    &demo_members.borrow(),
+                                    filter,
+                                    offset,
+                                )
                             } else {
                                 demo::members(id, &demo_members.borrow(), filter, offset)
                             }
@@ -3100,6 +3109,12 @@ impl Ui {
                         })
                     }
                 }),
+                invite_members: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |anchor, allow_bots, changed| ui
+                        .open_invite_members(id, anchor, allow_bots, changed)
+                )),
                 invites: Box::new(glib::clone!(
                     #[weak(rename_to = ui)]
                     self,
@@ -3143,6 +3158,59 @@ impl Ui {
             },
         );
         self.profile_dialog.set(Some(&dialog));
+    }
+
+    fn open_invite_members(
+        &self,
+        chat: i64,
+        anchor: &gtk::Button,
+        allow_bots: bool,
+        changed: Box<dyn Fn()>,
+    ) {
+        use crate::invite_members::{self, InviteContext};
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let write = client.clone();
+        let demo_members = self.demo_member_changes.clone();
+        let demo_created = self.demo_created_chats.clone();
+        invite_members::open(
+            anchor,
+            allow_bots,
+            InviteContext {
+                runtime: self.runtime.clone(),
+                contacts: Box::new(move || {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            return Ok(Arc::new(demo::invitable_contacts()));
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .contacts(false)
+                            .await
+                    })
+                }),
+                invite: Box::new(move |contacts| {
+                    let client = write.clone();
+                    if demo {
+                        let result = demo::invite_members(
+                            chat,
+                            demo_created.borrow().get(&chat),
+                            contacts,
+                            &mut demo_members.borrow_mut(),
+                        );
+                        return Box::pin(async { result });
+                    }
+                    Box::pin(async move {
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .invite_members(chat, contacts)
+                            .await
+                    })
+                }),
+                changed,
+            },
+        );
     }
 
     fn open_invite_links(&self, chat: i64, anchor: &gtk::Button) {

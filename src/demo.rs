@@ -123,6 +123,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             moderation: None,
             admin_policy: None,
             can_manage_invites: false,
+            can_add_members: false,
             can_read_admin_log: false,
             bot_commands: Vec::new(),
         });
@@ -172,6 +173,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         moderation: demo_moderation(id),
         admin_policy: demo_admin_policy(id),
         can_manage_invites: matches!(id, 1 | 3),
+        can_add_members: matches!(id, 1 | 3),
         can_read_admin_log: id == 3,
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
@@ -240,12 +242,19 @@ pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
         moderation: None,
         admin_policy: None,
         can_manage_invites: true,
+        can_add_members: true,
         can_read_admin_log: draft.kind != NewChatKind::Group,
         bot_commands: Vec::new(),
     }
 }
 
-pub fn created_members(draft: &NewChatDraft, filter: MemberFilter, offset: i32) -> MemberPage {
+pub fn created_members(
+    chat: i64,
+    draft: &NewChatDraft,
+    changes: &MemberChanges,
+    filter: MemberFilter,
+    offset: i32,
+) -> MemberPage {
     let owner = ChatMember {
         id: OWN_AVATAR.peer,
         name: OWN_NAME.into(),
@@ -256,26 +265,29 @@ pub fn created_members(draft: &NewChatDraft, filter: MemberFilter, offset: i32) 
         admin: None,
     };
     let members = std::iter::once(owner)
-        .chain(draft.members.iter().map(|member| ChatMember {
-            id: member.id,
-            name: member.name.clone(),
-            avatar: member.avatar,
-            role: MemberRole::Member,
-            bot: member.kind == ChatKind::Bot,
-            can_update: false,
-            admin: None,
-        }))
+        .chain(
+            draft
+                .members
+                .iter()
+                .chain(
+                    changes
+                        .invited
+                        .iter()
+                        .filter_map(|(&(target, _), contact)| (target == chat).then_some(contact)),
+                )
+                .map(|member| ChatMember {
+                    id: member.id,
+                    name: member.name.clone(),
+                    avatar: member.avatar,
+                    role: MemberRole::Member,
+                    bot: member.kind == ChatKind::Bot,
+                    can_update: false,
+                    admin: None,
+                }),
+        )
         .filter(|member| filter.includes(member))
         .collect::<Vec<_>>();
-    MemberPage {
-        next: (offset + MEMBER_PAGE_SIZE < members.len() as i32)
-            .then_some(offset + MEMBER_PAGE_SIZE),
-        members: members
-            .into_iter()
-            .skip(offset as usize)
-            .take(MEMBER_PAGE_SIZE as usize)
-            .collect(),
-    }
+    member_page(members, offset)
 }
 
 #[derive(Default)]
@@ -465,7 +477,80 @@ impl JoinRequests {
     }
 }
 
-pub type MemberChanges = HashMap<(i64, i64), MemberChange>;
+#[derive(Default)]
+pub struct MemberChanges {
+    moderation: HashMap<(i64, i64), MemberChange>,
+    invited: HashMap<(i64, i64), Contact>,
+}
+
+impl MemberChanges {
+    pub fn invited_count(&self, chat: i64) -> u32 {
+        self.invited
+            .keys()
+            .filter(|(target, _)| chat == *target)
+            .count() as u32
+    }
+}
+
+pub fn invitable_contacts() -> Vec<Contact> {
+    let mut contacts = contacts();
+    contacts.extend(
+        [
+            (50, "Елена Белова", "demo_elena"),
+            (51, "Денис Левин", "demo_denis"),
+            (52, "София Коваль", "demo_sofia"),
+        ]
+        .map(|(id, name, username)| Contact {
+            id,
+            name: name.into(),
+            usernames: vec![format!("@{username}")],
+            phone: None,
+            avatar: None,
+            kind: ChatKind::Contact,
+            is_self: false,
+            available: true,
+        }),
+    );
+    contacts
+}
+
+pub fn invite_members(
+    chat: i64,
+    created: Option<&NewChatDraft>,
+    contacts: Vec<Contact>,
+    changes: &mut MemberChanges,
+) -> anyhow::Result<crate::model::MemberInvitations> {
+    use crate::model::MemberInvitation;
+    anyhow::ensure!(
+        created.is_some() || matches!(chat, 1 | 3),
+        "Приглашение недоступно"
+    );
+    Ok(contacts
+        .into_iter()
+        .map(|contact| {
+            let role = demo_member_role(chat, contact.id, changes);
+            let existing = created.map_or(
+                role.is_some_and(|role| role != MemberRole::Banned),
+                |draft| {
+                    draft.members.iter().any(|member| member.id == contact.id)
+                        || changes.invited.contains_key(&(chat, contact.id))
+                },
+            );
+            let status = if existing {
+                MemberInvitation::InChat
+            } else if created.is_none() && role == Some(MemberRole::Banned) {
+                MemberInvitation::Rejected("Участник заблокирован".into())
+            } else if contact.id == 52 {
+                MemberInvitation::Rejected("Ограничения приватности".into())
+            } else {
+                changes.moderation.remove(&(chat, contact.id));
+                changes.invited.insert((chat, contact.id), contact.clone());
+                MemberInvitation::InChat
+            };
+            (contact.name, status)
+        })
+        .collect())
+}
 
 pub fn admin_log(chat: i64, query: AdminLogQuery, before: Option<i64>) -> AdminLogPage {
     use AdminLogFilter as F;
@@ -561,7 +646,7 @@ fn demo_admin_policy(chat: i64) -> Option<AdminPolicy> {
 }
 
 fn demo_member_role(chat: i64, member: i64, changes: &MemberChanges) -> Option<MemberRole> {
-    match changes.get(&(chat, member)) {
+    match changes.moderation.get(&(chat, member)) {
         Some(MemberChange::Remove | MemberChange::Unban) => return None,
         Some(MemberChange::Ban) => return Some(MemberRole::Banned),
         Some(MemberChange::SetAdmin { requested, .. }) => {
@@ -578,6 +663,7 @@ fn demo_member_role(chat: i64, member: i64, changes: &MemberChanges) -> Option<M
         3..=8 => MemberRole::Member,
         9..=45 if chat != 6 => MemberRole::Member,
         46..=47 if chat == 3 => MemberRole::Banned,
+        _ if changes.invited.contains_key(&(chat, member)) => MemberRole::Member,
         _ => return None,
     };
     Some(role)
@@ -587,7 +673,9 @@ fn demo_admin_state(chat: i64, member: i64, changes: &MemberChanges) -> Option<A
     match demo_member_role(chat, member, changes)? {
         MemberRole::Member => Some(AdminState::Member),
         MemberRole::Administrator => {
-            if let Some(MemberChange::SetAdmin { requested, .. }) = changes.get(&(chat, member)) {
+            if let Some(MemberChange::SetAdmin { requested, .. }) =
+                changes.moderation.get(&(chat, member))
+            {
                 return Some(*requested);
             }
             let rights = if chat == 3 {
@@ -617,7 +705,7 @@ pub fn change_member(
         let current =
             demo_admin_state(chat, member, changes).context("Эту роль нельзя изменить")?;
         if policy.needs_change(original, current, requested)? {
-            changes.insert((chat, member), change);
+            changes.moderation.insert((chat, member), change);
         }
         return Ok(());
     }
@@ -628,12 +716,12 @@ pub fn change_member(
         allowed == Some(change),
         "Это действие с участником недоступно"
     );
-    changes.insert((chat, member), change);
+    changes.moderation.insert((chat, member), change);
     Ok(())
 }
 
 pub fn member_count(chat: i64, changes: &MemberChanges) -> u32 {
-    (1..=47)
+    member_ids(chat, changes)
         .filter_map(|id| demo_member_role(chat, id, changes))
         .filter(|role| *role != MemberRole::Banned)
         .count() as u32
@@ -645,7 +733,8 @@ pub fn members(
     filter: MemberFilter,
     offset: i32,
 ) -> MemberPage {
-    let members: Vec<_> = (1..=47)
+    let contact_names = contacts();
+    let members: Vec<_> = member_ids(chat, changes)
         .filter_map(|id| Some((id, demo_member_role(chat, id, changes)?)))
         .map(|(id, role)| ChatMember {
             id,
@@ -653,7 +742,11 @@ pub fn members(
                 1 => "Алексей".into(),
                 2 => "Анна".into(),
                 3 => "Бот проекта".into(),
-                _ => format!("Участник {id}"),
+                _ => changes
+                    .invited
+                    .get(&(chat, id))
+                    .or_else(|| contact_names.iter().find(|contact| contact.id == id))
+                    .map_or_else(|| format!("Участник {id}"), |contact| contact.name.clone()),
             },
             avatar: (id <= 3).then_some(OWN_AVATAR),
             role,
@@ -663,6 +756,20 @@ pub fn members(
         })
         .filter(|member| filter.includes(member))
         .collect();
+    member_page(members, offset)
+}
+
+fn member_ids(chat: i64, changes: &MemberChanges) -> impl Iterator<Item = i64> {
+    let invited: Vec<_> = changes
+        .invited
+        .keys()
+        .filter_map(|(target, id)| (*target == chat && *id > 47).then_some(*id))
+        .collect();
+    (1..=47).chain(invited)
+}
+
+fn member_page(mut members: Vec<ChatMember>, offset: i32) -> MemberPage {
+    members.sort_by_key(|member| member.id);
     let end = offset + MEMBER_PAGE_SIZE;
     MemberPage {
         next: (end < members.len() as i32).then_some(end),

@@ -1,35 +1,29 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 
 use adw::prelude::*;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use gtk::glib;
-use tokio::{runtime::Handle, task::AbortHandle};
+use tokio::runtime::Handle;
 
+use crate::contact_picker::{ContactPicker, LoadContacts, caption};
 use crate::model::{
-    ChatInfo, ChatKind, Contact, CreatedChat, NewChatDraft, NewChatKind, NewChatResult,
-    new_chat_username,
+    ChatInfo, CreatedChat, NewChatDraft, NewChatKind, NewChatResult, new_chat_username,
 };
 
-type LoadContacts = Pin<Box<dyn Future<Output = Result<Arc<Vec<Contact>>>> + Send>>;
 type Create = Pin<Box<dyn Future<Output = NewChatResult> + Send>>;
 type Publish = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 pub struct CreateContext {
     pub runtime: Handle,
-    pub contacts: Box<dyn Fn() -> LoadContacts>,
+    pub contacts: LoadContacts,
     pub create: Box<dyn Fn(NewChatDraft) -> Create>,
     pub publish: Box<dyn Fn(i64, String) -> Publish>,
     pub opened: Box<dyn Fn(CreatedChat)>,
     pub reconcile: Box<dyn Fn()>,
 }
-
-const MEMBERS_PAGE: usize = 30;
 
 pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dialog {
     let (dialog, toolbar, body) = crate::chat_management::dialog_with_toolbar("Создать чат");
@@ -60,25 +54,16 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
     about.update_property(&[gtk::accessible::Property::Label("Описание")]);
     form.append(&about);
 
-    let members_hint = caption();
-    form.append(&members_hint);
-    let search = gtk::SearchEntry::builder()
-        .placeholder_text("Найти участника")
-        .build();
-    search.update_property(&[gtk::accessible::Property::Label("Найти участника")]);
-    form.append(&search);
-    let people = adw::PreferencesGroup::new();
-    form.append(&people);
-    let list_status = caption();
-    form.append(&list_status);
-    let more = gtk::Button::with_label("Ещё контакты");
-    more.set_halign(gtk::Align::Start);
-    more.set_visible(false);
-    form.append(&more);
-    let reload = gtk::Button::with_label("Повторить загрузку контактов");
-    reload.set_halign(gtk::Align::Start);
-    reload.set_visible(false);
-    form.append(&reload);
+    let CreateContext {
+        runtime,
+        contacts,
+        create,
+        publish,
+        opened,
+        reconcile,
+    } = context;
+    let picker = ContactPicker::new(runtime.clone(), contacts);
+    form.append(&picker.widget);
     body.append(&form);
 
     let actions = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -111,7 +96,12 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
     toolbar.add_bottom_bar(&actions);
 
     let state = Rc::new(Form {
-        context,
+        runtime,
+        create,
+        publish,
+        opened,
+        reconcile,
+        picker,
         dialog: dialog.downgrade(),
         form,
         kind,
@@ -119,22 +109,11 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
         about,
         username,
         privacy_hint,
-        members_hint,
-        search,
-        people,
-        list_status,
-        more,
-        reload,
         submit,
         status,
         status_scroll,
         retry_group,
         retry_name,
-        contacts: RefCell::new(None),
-        selected: RefCell::new(HashSet::new()),
-        rendered: RefCell::new(Vec::new()),
-        visible_limit: Cell::new(MEMBERS_PAGE),
-        load_task: RefCell::new(None),
         busy: Cell::new(false),
         closed: Cell::new(false),
         unconfirmed: Cell::new(false),
@@ -144,33 +123,7 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
     state.kind.connect_selected_notify(glib::clone!(
         #[weak]
         state,
-        move |_| {
-            state.update_type();
-            state.render_contacts();
-        }
-    ));
-    state.search.connect_search_changed(glib::clone!(
-        #[weak]
-        state,
-        move |_| {
-            state.visible_limit.set(MEMBERS_PAGE);
-            state.render_contacts();
-        }
-    ));
-    state.more.connect_clicked(glib::clone!(
-        #[weak]
-        state,
-        move |_| {
-            state
-                .visible_limit
-                .set(state.visible_limit.get().saturating_add(MEMBERS_PAGE));
-            state.render_contacts();
-        }
-    ));
-    state.reload.connect_clicked(glib::clone!(
-        #[weak]
-        state,
-        move |_| state.load_contacts()
+        move |_| state.update_type()
     ));
     state.submit.connect_clicked(glib::clone!(
         #[weak]
@@ -186,27 +139,29 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
         let state = state.clone();
         move |_| {
             state.closed.set(true);
-            if let Some(task) = state.load_task.take() {
-                task.abort();
-            }
+            state.picker.cancel_load();
             if let Some(mut created) = state.created.take() {
                 if created.public_error.is_some() {
                     created.draft.username.clear();
                 }
-                (state.context.opened)(created);
+                (state.opened)(created);
             }
         }
     });
 
     state.update_type();
-    state.load_contacts();
     dialog.set_focus(Some(&state.name));
     dialog.present(Some(window));
     dialog
 }
 
 struct Form {
-    context: CreateContext,
+    runtime: Handle,
+    create: Box<dyn Fn(NewChatDraft) -> Create>,
+    publish: Box<dyn Fn(i64, String) -> Publish>,
+    opened: Box<dyn Fn(CreatedChat)>,
+    reconcile: Box<dyn Fn()>,
+    picker: Rc<ContactPicker>,
     dialog: glib::WeakRef<adw::Dialog>,
     form: gtk::Box,
     kind: gtk::DropDown,
@@ -214,22 +169,11 @@ struct Form {
     about: gtk::TextView,
     username: adw::EntryRow,
     privacy_hint: gtk::Label,
-    members_hint: gtk::Label,
-    search: gtk::SearchEntry,
-    people: adw::PreferencesGroup,
-    list_status: gtk::Label,
-    more: gtk::Button,
-    reload: gtk::Button,
     submit: gtk::Button,
     status: gtk::Label,
     status_scroll: gtk::ScrolledWindow,
     retry_group: adw::PreferencesGroup,
     retry_name: adw::EntryRow,
-    contacts: RefCell<Option<Arc<Vec<Contact>>>>,
-    selected: RefCell<HashSet<i64>>,
-    rendered: RefCell<Vec<gtk::CheckButton>>,
-    visible_limit: Cell<usize>,
-    load_task: RefCell<Option<AbortHandle>>,
     busy: Cell<bool>,
     closed: Cell<bool>,
     unconfirmed: Cell<bool>,
@@ -249,115 +193,13 @@ impl Form {
         let public = self.kind() != NewChatKind::Group;
         self.username.set_visible(public);
         self.privacy_hint.set_visible(public);
-        self.update_members_hint();
-    }
-
-    fn eligible(&self, contact: &Contact) -> bool {
-        !contact.is_self
-            && contact.available
-            && (self.kind() != NewChatKind::Channel || contact.kind != ChatKind::Bot)
-    }
-
-    fn chosen(&self) -> Vec<Contact> {
-        self.contacts
-            .borrow()
-            .iter()
-            .flat_map(|contacts| contacts.iter())
-            .filter(|contact| {
-                self.eligible(contact) && self.selected.borrow().contains(&contact.id)
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn update_members_hint(&self) {
-        let count = self.chosen().len();
-        let hint = if self.kind() == NewChatKind::Group {
-            "Выберите хотя бы одного участника"
-        } else {
+        let hint = if public {
             "Участники (необязательно)"
+        } else {
+            "Выберите хотя бы одного участника"
         };
-        self.members_hint.set_text(&format!("{hint} · {count}"));
-    }
-
-    fn load_contacts(self: &Rc<Self>) {
-        self.reload.set_visible(false);
-        self.list_status.set_text("Загрузка контактов…");
-        let request = (self.context.contacts)();
-        let task = self.context.runtime.spawn(async move {
-            tokio::time::timeout(Duration::from_secs(15), request)
-                .await
-                .context("Telegram не прислал контакты вовремя")?
-        });
-        self.load_task.replace(Some(task.abort_handle()));
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let result = task
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result);
-            let Some(state) = weak.upgrade().filter(|state| !state.closed.get()) else {
-                return;
-            };
-            state.load_task.take();
-            match result {
-                Ok(contacts) => {
-                    state.contacts.replace(Some(contacts));
-                    state.render_contacts();
-                }
-                Err(error) => {
-                    state
-                        .list_status
-                        .set_text(&format!("Не удалось загрузить контакты. {error}"));
-                    state.reload.set_visible(true);
-                }
-            }
-        });
-    }
-
-    fn render_contacts(self: &Rc<Self>) {
-        let contacts = self.contacts.borrow();
-        let Some(contacts) = contacts.as_ref() else {
-            return;
-        };
-        for row in self.rendered.take() {
-            self.people.remove(&row);
-        }
-        let query = self.search.text();
-        let limit = self.visible_limit.get();
-        let mut matching = contacts
-            .iter()
-            .filter(|contact| self.eligible(contact) && contact.matches(&query));
-        for contact in matching.by_ref().take(limit) {
-            let check = gtk::CheckButton::with_label(&contact.name);
-            if let Some(label) = check.child().and_downcast::<gtk::Label>() {
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            }
-            check.set_active(self.selected.borrow().contains(&contact.id));
-            let id = contact.id;
-            check.connect_toggled(glib::clone!(
-                #[weak(rename_to = state)]
-                self,
-                move |check| {
-                    if check.is_active() {
-                        state.selected.borrow_mut().insert(id);
-                    } else {
-                        state.selected.borrow_mut().remove(&id);
-                    }
-                    state.update_members_hint();
-                }
-            ));
-            self.people.add(&check);
-            self.rendered.borrow_mut().push(check);
-        }
-        self.more.set_visible(matching.next().is_some());
-        self.list_status
-            .set_text(if self.rendered.borrow().is_empty() {
-                "Контактов не найдено."
-            } else {
-                ""
-            });
-        self.update_members_hint();
+        self.picker
+            .configure(hint, self.kind() != NewChatKind::Channel);
     }
 
     fn set_status(&self, text: &str) {
@@ -400,7 +242,7 @@ impl Form {
             } else {
                 self.username.text().into()
             },
-            members: self.chosen(),
+            members: self.picker.chosen(),
         };
         let draft = match draft.validate() {
             Ok(draft) => draft,
@@ -411,7 +253,7 @@ impl Form {
         };
         self.set_status("Создание чата…");
         self.set_busy(true);
-        let task = self.context.runtime.spawn((self.context.create)(draft));
+        let task = self.runtime.spawn((self.create)(draft));
         let state = self.clone();
         glib::spawn_future_local(async move {
             let result = task
@@ -437,7 +279,7 @@ impl Form {
                 }
                 NewChatResult::Rejected(error) => state.set_status(&error),
                 NewChatResult::Unconfirmed(error) => {
-                    (state.context.reconcile)();
+                    (state.reconcile)();
                     state.unconfirmed.set(true);
                     state.form.set_sensitive(false);
                     state.submit.set_label("К списку чатов");
@@ -485,10 +327,7 @@ impl Form {
         };
         self.set_status("Сохранение публичного имени…");
         self.set_busy(true);
-        let task = self
-            .context
-            .runtime
-            .spawn((self.context.publish)(chat, username.clone()));
+        let task = self.runtime.spawn((self.publish)(chat, username.clone()));
         let state = self.clone();
         glib::spawn_future_local(async move {
             let result = task
@@ -511,13 +350,4 @@ impl Form {
             state.show_created();
         });
     }
-}
-
-fn caption() -> gtk::Label {
-    gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .css_classes(["dim-label"])
-        .build()
 }
