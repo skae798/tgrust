@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{
-    AttachmentThumbnail, AudioInfo, Avatar, BotCommand, Chat, ChatFolder, ChatImage, ChatKind,
-    ChatMember, Contact, INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink,
-    InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor,
-    JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
-    MemberRole, Message, PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft,
-    TextLink,
+    AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
+    BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, INVITE_PAGE_SIZE,
+    InviteAction, InviteCursor, InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE,
+    JoinDecisionOutcome, JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE,
+    MemberChange, MemberFilter, MemberModeration, MemberPage, MemberRole, Message, PeerProfile,
+    PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -118,6 +118,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             can_edit_chat: false,
             can_view_members: false,
             moderation: None,
+            admin_policy: None,
             can_manage_invites: false,
             bot_commands: Vec::new(),
         });
@@ -165,6 +166,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
         can_edit_chat: matches!(id, 1 | 3),
         can_view_members: matches!(id, 1 | 3 | 6),
         moderation: demo_moderation(id),
+        admin_policy: demo_admin_policy(id),
         can_manage_invites: matches!(id, 1 | 3),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
@@ -377,10 +379,26 @@ fn demo_moderation(chat: i64) -> Option<MemberModeration> {
     }
 }
 
+fn demo_admin_policy(chat: i64) -> Option<AdminPolicy> {
+    match chat {
+        1 => Some(AdminPolicy::Basic),
+        3 => Some(AdminPolicy::Channel(AdminRights::channel(
+            true, false, true,
+        ))),
+        _ => None,
+    }
+}
+
 fn demo_member_role(chat: i64, member: i64, changes: &MemberChanges) -> Option<MemberRole> {
     match changes.get(&(chat, member)) {
         Some(MemberChange::Remove | MemberChange::Unban) => return None,
         Some(MemberChange::Ban) => return Some(MemberRole::Banned),
+        Some(MemberChange::SetAdmin { requested, .. }) => {
+            return Some(match requested {
+                AdminState::Member => MemberRole::Member,
+                AdminState::Administrator(_) => MemberRole::Administrator,
+            });
+        }
         None => {}
     }
     let role = match member {
@@ -394,12 +412,44 @@ fn demo_member_role(chat: i64, member: i64, changes: &MemberChanges) -> Option<M
     Some(role)
 }
 
+fn demo_admin_state(chat: i64, member: i64, changes: &MemberChanges) -> Option<AdminState> {
+    match demo_member_role(chat, member, changes)? {
+        MemberRole::Member => Some(AdminState::Member),
+        MemberRole::Administrator => {
+            if let Some(MemberChange::SetAdmin { requested, .. }) = changes.get(&(chat, member)) {
+                return Some(*requested);
+            }
+            let rights = if chat == 3 {
+                AdminRights::from_rights([AdminRight::PostMessages, AdminRight::Other])
+            } else {
+                AdminRights::default()
+            };
+            Some(AdminState::Administrator(rights))
+        }
+        _ => None,
+    }
+}
+
 pub fn change_member(
     changes: &mut MemberChanges,
     chat: i64,
     member: i64,
     change: MemberChange,
 ) -> anyhow::Result<()> {
+    if let MemberChange::SetAdmin {
+        original,
+        requested,
+    } = change
+    {
+        use anyhow::Context;
+        let policy = demo_admin_policy(chat).context("Назначение администратора недоступно")?;
+        let current =
+            demo_admin_state(chat, member, changes).context("Эту роль нельзя изменить")?;
+        if policy.needs_change(original, current, requested)? {
+            changes.insert((chat, member), change);
+        }
+        return Ok(());
+    }
     let allowed = demo_moderation(chat)
         .zip(demo_member_role(chat, member, changes))
         .and_then(|(mode, role)| mode.action(role));
@@ -438,6 +488,7 @@ pub fn members(
             role,
             bot: id == 3,
             can_update: true,
+            admin: demo_admin_state(chat, id, changes),
         })
         .filter(|member| filter.includes(member))
         .collect();

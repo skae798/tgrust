@@ -304,11 +304,16 @@ impl ProfileDialog {
             ));
             self.body.append(&settings);
         }
-        if profile.can_view_members || profile.moderation == Some(MemberModeration::Ban) {
+        if profile.can_view_members
+            || profile.admin_policy.is_some()
+            || profile.moderation == Some(MemberModeration::Ban)
+        {
             let can_view_members = profile.can_view_members;
             let moderation = profile.moderation;
+            let admins = profile.admin_policy;
             let subscribers = profile.kind == ChatKind::Broadcast;
             let button = gtk::Button::with_label(match (can_view_members, subscribers) {
+                (false, _) if admins.is_some() => "Администраторы",
                 (false, _) => "Заблокированные",
                 (true, true) => "Список подписчиков",
                 (true, false) => "Список участников",
@@ -323,6 +328,7 @@ impl ProfileDialog {
                         subscribers,
                         can_view_members,
                         moderation,
+                        admins,
                         MembersContext {
                             runtime: state.context.runtime.clone(),
                             load: Box::new(glib::clone!(
