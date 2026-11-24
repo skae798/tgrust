@@ -2519,51 +2519,7 @@ impl Telegram {
         random_id: i64,
         topic: Option<i32>,
     ) -> Result<Option<Message>> {
-        let poll = draft.validate()?;
-        let text = |text| {
-            types::TextWithEntities {
-                text,
-                entities: Vec::new(),
-            }
-            .into()
-        };
-        let media = types::InputMediaPoll {
-            poll: types::Poll {
-                id: random_id,
-                closed: false,
-                public_voters: poll.public,
-                multiple_choice: poll.multiple,
-                quiz: false,
-                open_answers: false,
-                revoting_disabled: false,
-                shuffle_answers: false,
-                hide_results_until_close: false,
-                creator: false,
-                subscribers_only: false,
-                question: text(poll.question),
-                answers: poll
-                    .choices
-                    .into_iter()
-                    .map(|choice| {
-                        types::InputPollAnswer {
-                            text: text(choice),
-                            media: None,
-                        }
-                        .into()
-                    })
-                    .collect(),
-                close_period: None,
-                close_date: None,
-                countries_iso2: None,
-                hash: 0,
-            }
-            .into(),
-            correct_answers: None,
-            attached_media: None,
-            solution: None,
-            solution_entities: None,
-            solution_media: None,
-        };
+        let media = poll_media(draft.validate()?, random_id);
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
@@ -4001,6 +3957,60 @@ fn poll_question(text: &enums::TextWithEntities) -> String {
     quote_preview(&text.text, &text.entities)
 }
 
+fn poll_media(poll: PollDraft, random_id: i64) -> types::InputMediaPoll {
+    let (correct_answers, solution) = match poll.quiz {
+        Some(quiz) => (
+            Some(quiz.correct.into_iter().map(|index| index as i32).collect()),
+            (!quiz.solution.is_empty()).then_some(quiz.solution),
+        ),
+        None => (None, None),
+    };
+    let text = |text| {
+        types::TextWithEntities {
+            text,
+            entities: Vec::new(),
+        }
+        .into()
+    };
+    types::InputMediaPoll {
+        poll: types::Poll {
+            id: random_id,
+            closed: false,
+            public_voters: poll.public,
+            multiple_choice: poll.multiple,
+            quiz: correct_answers.is_some(),
+            open_answers: false,
+            revoting_disabled: correct_answers.is_some(),
+            shuffle_answers: false,
+            hide_results_until_close: false,
+            creator: false,
+            subscribers_only: false,
+            question: text(poll.question),
+            answers: poll
+                .choices
+                .into_iter()
+                .map(|choice| {
+                    types::InputPollAnswer {
+                        text: text(choice),
+                        media: None,
+                    }
+                    .into()
+                })
+                .collect(),
+            close_period: None,
+            close_date: None,
+            countries_iso2: None,
+            hash: 0,
+        }
+        .into(),
+        correct_answers,
+        attached_media: None,
+        solution_entities: solution.as_ref().map(|_| Vec::new()),
+        solution,
+        solution_media: None,
+    }
+}
+
 fn poll_definition(raw: &types::Poll) -> Poll {
     Poll {
         id: raw.id,
@@ -4524,6 +4534,47 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_media_sends_quiz_indices_and_pairs_optional_solution_fields() {
+        use crate::model::PollQuizDraft;
+
+        let mut draft = PollDraft {
+            question: "Какой день идёт после вторника?".into(),
+            choices: vec!["Понедельник".into(), " ".into(), "Среда".into()],
+            public: true,
+            ..PollDraft::default()
+        };
+        let media = poll_media(draft.clone().validate().unwrap(), 123);
+        let enums::Poll::Poll(poll) = media.poll;
+        assert!(poll.public_voters && !poll.quiz && !poll.revoting_disabled);
+        assert!(media.correct_answers.is_none());
+        assert!(media.solution.is_none() && media.solution_entities.is_none());
+
+        draft.quiz = Some(PollQuizDraft {
+            correct: vec![2],
+            solution: "Среда идёт после вторника.".into(),
+        });
+        let media = poll_media(draft.clone().validate().unwrap(), 123);
+        let enums::Poll::Poll(poll) = media.poll;
+        assert_eq!(poll.id, 123);
+        assert!(poll.public_voters && poll.quiz && poll.revoting_disabled);
+        let enums::PollAnswer::InputPollAnswer(answer) = &poll.answers[1] else {
+            panic!("expected an outgoing answer");
+        };
+        assert_eq!(poll_question(&answer.text), "Среда");
+        assert_eq!(media.correct_answers, Some(vec![1]));
+        assert_eq!(
+            media.solution.as_deref(),
+            Some("Среда идёт после вторника.")
+        );
+        assert_eq!(media.solution_entities, Some(vec![]));
+
+        draft.quiz.as_mut().unwrap().solution.clear();
+        let media = poll_media(draft.validate().unwrap(), 123);
+        assert_eq!(media.correct_answers, Some(vec![1]));
+        assert!(media.solution.is_none() && media.solution_entities.is_none());
+    }
 
     #[test]
     fn channel_admin_mapping_preserves_protocol_flags_and_server_editability() {

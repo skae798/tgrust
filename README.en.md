@@ -20,7 +20,7 @@ The prebuilt client checks for updates automatically and opens the new build on 
 
 ## Features
 
-- **Messages** — scroll to load history, search, reply, edit, react, and vote in polls.
+- **Messages** — scroll to load history, search, reply, edit, react, and create or vote in polls and quizzes.
 - **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers.
 - **Chats** — create groups and channels, manage supergroup topics, folders, archive, GNOME notifications, member and admin management, group and individual restrictions, slow mode, invitations, public addresses, and recent actions.
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.
