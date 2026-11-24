@@ -3014,6 +3014,8 @@ impl Ui {
         let permissions_client = client.clone();
         let member_client = client.clone();
         let moderation_client = client.clone();
+        let restriction_loader = client.clone();
+        let restriction_saver = client.clone();
         let demo = self.is_demo.get();
         let demo_chat_info = self.demo_chat_info.clone();
         let demo_chat_addresses = self.demo_chat_addresses.clone();
@@ -3233,6 +3235,59 @@ impl Ui {
                             client
                                 .context("Нет подключения к Telegram")?
                                 .change_chat_member(id, member, change)
+                                .await
+                        })
+                    }
+                }),
+                member_restriction: Box::new({
+                    let members = self.demo_member_changes.clone();
+                    let permissions = self.demo_group_permissions.clone();
+                    move |member| {
+                        let client = restriction_loader.clone();
+                        let local = demo.then(|| {
+                            let allowed = permissions
+                                .borrow()
+                                .get(&id)
+                                .map_or_else(GroupPermissions::all, |settings| settings.allowed);
+                            demo::member_restriction(&members.borrow(), id, member, allowed)
+                        });
+                        Box::pin(async move {
+                            if let Some(result) = local {
+                                return result;
+                            }
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .member_restriction(id, member)
+                                .await
+                        })
+                    }
+                }),
+                edit_member_restriction: Box::new({
+                    let members = self.demo_member_changes.clone();
+                    let permissions = self.demo_group_permissions.clone();
+                    move |member, original, edit| {
+                        let client = restriction_saver.clone();
+                        let local = demo.then(|| {
+                            let allowed = permissions
+                                .borrow()
+                                .get(&id)
+                                .map_or_else(GroupPermissions::all, |settings| settings.allowed);
+                            demo::edit_member_restriction(
+                                &mut members.borrow_mut(),
+                                id,
+                                member,
+                                allowed,
+                                original,
+                                edit,
+                            )
+                        });
+                        Box::pin(async move {
+                            if let Some(result) = local {
+                                return result;
+                            }
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .edit_member_restriction(id, member, original, edit)
                                 .await
                         })
                     }

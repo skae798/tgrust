@@ -36,6 +36,7 @@ impl Telegram {
 
         if !changes.is_empty() {
             apply_changes(&mut raw, &changes);
+            raw.until_date = 0;
             let result = timeout(
                 RPC_TIMEOUT,
                 self.client.invoke(&EditChatDefaultBannedRights {
@@ -70,7 +71,7 @@ impl Telegram {
         Ok(())
     }
 
-    async fn current_group_permissions(
+    pub(super) async fn current_group_permissions(
         &self,
         reference: PeerRef,
     ) -> Result<(GroupPermissionSettings, types::ChatBannedRights)> {
@@ -107,7 +108,7 @@ impl Telegram {
     }
 }
 
-fn permission_result(
+pub(super) fn permission_result(
     result: Result<Result<enums::Updates, InvocationError>, tokio::time::error::Elapsed>,
 ) -> Result<()> {
     if let Err(error) = result.context("Telegram не подтвердил сохранение вовремя")?
@@ -211,9 +212,23 @@ fn settings(
                 forum && rights.is_some_and(|rights| rights.manage_topics),
             );
     }
+    let allowed = allowed_permissions(raw);
+    GroupPermissionSettings {
+        allowed: allowed
+            .with(LinkPreviews, allowed.has(Text) && allowed.has(LinkPreviews))
+            .with(Pin, !public_or_linked && allowed.has(Pin))
+            .with(ChangeInfo, !public_or_linked && allowed.has(ChangeInfo)),
+        editable,
+        forum,
+        slow_mode: None,
+    }
+}
+
+pub(super) fn allowed_permissions(raw: &types::ChatBannedRights) -> GroupPermissions {
+    use GroupPermission::*;
     let mut granular = raw.clone();
     expand_legacy(&mut granular);
-    let allowed = GroupPermission::OPTIONS.into_iter().fold(
+    GroupPermission::OPTIONS.into_iter().fold(
         GroupPermissions::default(),
         |allowed, (permission, _)| {
             let banned = match permission {
@@ -230,24 +245,18 @@ fn settings(
                         || granular.send_games
                         || granular.send_inline
                 }
-                LinkPreviews => granular.embed_links || granular.send_plain,
+                LinkPreviews => granular.embed_links,
                 Polls => granular.send_polls,
                 Reactions => granular.send_reactions,
                 Invite => granular.invite_users,
-                Pin => granular.pin_messages || public_or_linked,
-                ChangeInfo => granular.change_info || public_or_linked,
+                Pin => granular.pin_messages,
+                ChangeInfo => granular.change_info,
                 Topics => granular.manage_topics,
                 EditTag => granular.edit_rank,
             };
             allowed.with(permission, !banned)
         },
-    );
-    GroupPermissionSettings {
-        allowed,
-        editable,
-        forum,
-        slow_mode: None,
-    }
+    )
 }
 
 fn expand_legacy(raw: &mut types::ChatBannedRights) {
@@ -268,7 +277,10 @@ fn expand_legacy(raw: &mut types::ChatBannedRights) {
     raw.send_media = false;
 }
 
-fn apply_changes(raw: &mut types::ChatBannedRights, changes: &[(GroupPermission, bool)]) {
+pub(super) fn apply_changes(
+    raw: &mut types::ChatBannedRights,
+    changes: &[(GroupPermission, bool)],
+) {
     use GroupPermission::*;
     if changes
         .iter()
@@ -305,7 +317,6 @@ fn apply_changes(raw: &mut types::ChatBannedRights, changes: &[(GroupPermission,
             EditTag => raw.edit_rank = banned,
         }
     }
-    raw.until_date = 0;
 }
 
 #[cfg(test)]

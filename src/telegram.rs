@@ -3,6 +3,7 @@ mod chat_addresses;
 mod create_chat;
 mod group_permissions;
 mod invite_members;
+mod member_restrictions;
 pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
 
@@ -1228,8 +1229,8 @@ impl Telegram {
         match reference.id.kind() {
             PeerKind::Chat => {
                 ensure!(
-                    filter != MemberFilter::Banned,
-                    "В этой группе нет списка блокировок"
+                    !matches!(filter, MemberFilter::Banned | MemberFilter::Restricted),
+                    "В этой группе нет списка ограничений"
                 );
                 let result = self.full_chat(reference).await?;
                 let enums::ChatFull::Full(full) = result.full_chat else {
@@ -1274,6 +1275,12 @@ impl Telegram {
                         "Telegram не разрешает просматривать блокировки этого чата"
                     );
                 }
+                if filter == MemberFilter::Restricted {
+                    ensure!(
+                        self.peer_profile(id).await?.group_permissions.is_some(),
+                        "Telegram не разрешает просматривать ограничения этого чата"
+                    );
+                }
                 let result = self
                     .client
                     .invoke(&grammers_client::tl::functions::channels::GetParticipants {
@@ -1282,6 +1289,11 @@ impl Telegram {
                             MemberFilter::All => F::ChannelParticipantsRecent,
                             MemberFilter::Admins => F::ChannelParticipantsAdmins,
                             MemberFilter::Bots => F::ChannelParticipantsBots,
+                            MemberFilter::Restricted => {
+                                F::ChannelParticipantsBanned(types::ChannelParticipantsBanned {
+                                    q: String::new(),
+                                })
+                            }
                             MemberFilter::Banned => {
                                 F::ChannelParticipantsKicked(types::ChannelParticipantsKicked {
                                     q: String::new(),
@@ -3333,6 +3345,17 @@ fn channel_member(participant: &enums::ChannelParticipant) -> Option<(PeerId, Op
             let enums::ChatBannedRights::Rights(rights) = &value.banned_rights;
             let role = if rights.view_messages {
                 Some(MemberRole::Banned)
+            } else if member_restrictions::personal_restriction(
+                rights,
+                crate::model::restriction_now(),
+            )
+            .active()
+            {
+                Some(if value.left {
+                    MemberRole::RestrictedFormer
+                } else {
+                    MemberRole::Restricted
+                })
             } else {
                 (!value.left).then_some(MemberRole::Member)
             };
@@ -3345,10 +3368,13 @@ fn channel_member(participant: &enums::ChannelParticipant) -> Option<(PeerId, Op
 
 fn channel_moderation_needed(role: Option<MemberRole>, change: MemberChange) -> Result<bool> {
     match (role, change) {
-        (Some(MemberRole::Member), MemberChange::Ban)
+        (Some(MemberRole::Member | MemberRole::Restricted), MemberChange::Ban)
         | (Some(MemberRole::Banned), MemberChange::Unban) => Ok(true),
         (Some(MemberRole::Banned), MemberChange::Ban)
-        | (Some(MemberRole::Member) | None, MemberChange::Unban) => Ok(false),
+        | (
+            Some(MemberRole::Member | MemberRole::Restricted | MemberRole::RestrictedFormer) | None,
+            MemberChange::Unban,
+        ) => Ok(false),
         (None, MemberChange::Ban) => bail!("Пользователь больше не состоит в чате"),
         _ => bail!("Роль участника изменилась. Обновите список"),
     }
@@ -4653,9 +4679,12 @@ mod tests {
         let id = PeerId::user(5).unwrap();
         assert_eq!(
             channel_member(&build(false, false)),
-            Some((id, Some(MemberRole::Member)))
+            Some((id, Some(MemberRole::Restricted)))
         );
-        assert_eq!(channel_member(&build(true, false)), Some((id, None)));
+        assert_eq!(
+            channel_member(&build(true, false)),
+            Some((id, Some(MemberRole::RestrictedFormer)))
+        );
         assert_eq!(
             channel_member(&build(true, true)),
             Some((id, Some(MemberRole::Banned)))

@@ -26,35 +26,7 @@ pub fn open(
 ) {
     let (dialog, toolbar, body) = crate::chat_management::dialog_with_toolbar("Разрешения группы");
     let form = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    let sending = adw::PreferencesGroup::builder()
-        .title("Сообщения и вложения")
-        .build();
-    let actions = adw::PreferencesGroup::builder()
-        .title("Действия участников")
-        .build();
-    use GroupPermission::{LinkPreviews, Text, Topics};
-    let rows: Vec<_> = GroupPermission::OPTIONS
-        .into_iter()
-        .filter(|(permission, _)| *permission != Topics || original.forum)
-        .map(|(permission, title)| {
-            let row = adw::SwitchRow::builder()
-                .title(title)
-                .active(original.allowed.has(permission))
-                .build();
-            if !original.editable.has(permission) {
-                row.set_subtitle("Недоступно для изменения");
-                row.set_sensitive(false);
-            }
-            if permission.is_sending() {
-                sending.add(&row);
-            } else {
-                actions.add(&row);
-            }
-            (permission, row)
-        })
-        .collect();
-    form.append(&sending);
-    form.append(&actions);
+    let rows = permission_rows(&form, original, "Недоступно для изменения");
     let slow_mode = original.slow_mode.map(|seconds| {
         let mut choices = SLOW_MODE_OPTIONS
             .map(|(value, label)| (value, label.to_owned()))
@@ -100,35 +72,7 @@ pub fn open(
     footer.append(&submit);
     toolbar.add_bottom_bar(&footer);
 
-    if let Some((_, text)) = rows.iter().find(|(permission, _)| *permission == Text)
-        && let Some((_, previews)) = rows
-            .iter()
-            .find(|(permission, _)| *permission == LinkPreviews)
-    {
-        let editable = original.editable.has(LinkPreviews);
-        let remember = Cell::new(previews.is_active());
-        let sync = {
-            let previews = previews.clone();
-            move |text: &adw::SwitchRow| {
-                if text.is_active() {
-                    previews.set_active(remember.get());
-                    previews.set_subtitle(if editable {
-                        ""
-                    } else {
-                        "Недоступно для изменения"
-                    });
-                } else {
-                    remember.set(previews.is_active());
-                    previews.set_active(false);
-                    previews.set_subtitle("Разрешите отправку текста");
-                }
-                previews.set_sensitive(editable && text.is_active());
-            }
-        };
-        sync(text);
-        text.connect_active_notify(sync);
-        dialog.set_focus(Some(text));
-    }
+    wire_link_previews(&dialog, &rows, original, "Недоступно для изменения");
 
     let editor = Rc::new(Editor {
         runtime,
@@ -154,6 +98,81 @@ pub fn open(
         }
     });
     dialog.present(Some(anchor));
+}
+
+pub(crate) fn permission_rows(
+    form: &gtk::Box,
+    original: GroupPermissionSettings,
+    locked_reason: &str,
+) -> Vec<(GroupPermission, adw::SwitchRow)> {
+    let sending = adw::PreferencesGroup::builder()
+        .title("Сообщения и вложения")
+        .build();
+    let actions = adw::PreferencesGroup::builder()
+        .title("Действия участников")
+        .build();
+    use GroupPermission::Topics;
+    let rows: Vec<_> = GroupPermission::OPTIONS
+        .into_iter()
+        .filter(|(permission, _)| *permission != Topics || original.forum)
+        .map(|(permission, title)| {
+            let row = adw::SwitchRow::builder()
+                .title(title)
+                .active(original.allowed.has(permission))
+                .build();
+            if !original.editable.has(permission) {
+                row.set_subtitle(locked_reason);
+                row.set_sensitive(false);
+            }
+            if permission.is_sending() {
+                sending.add(&row);
+            } else {
+                actions.add(&row);
+            }
+            (permission, row)
+        })
+        .collect();
+    form.append(&sending);
+    form.append(&actions);
+    rows
+}
+
+pub(crate) fn wire_link_previews(
+    dialog: &adw::Dialog,
+    rows: &[(GroupPermission, adw::SwitchRow)],
+    original: GroupPermissionSettings,
+    locked_reason: &'static str,
+) {
+    use GroupPermission::{LinkPreviews, Text};
+    if let Some((_, text)) = rows.iter().find(|(permission, _)| *permission == Text)
+        && let Some((_, previews)) = rows
+            .iter()
+            .find(|(permission, _)| *permission == LinkPreviews)
+    {
+        let editable = original.editable.has(LinkPreviews);
+        let remember = Cell::new(previews.is_active());
+        let sync = {
+            let previews = previews.clone();
+            move |text: &adw::SwitchRow| {
+                if text.is_active() {
+                    previews.set_active(remember.get());
+                    previews.set_subtitle(if editable { "" } else { locked_reason });
+                } else {
+                    remember.set(previews.is_active());
+                    previews.set_active(false);
+                    previews.set_subtitle(if editable {
+                        "Разрешите отправку текста"
+                    } else {
+                        locked_reason
+                    });
+                }
+                previews.set_sensitive(editable && text.is_active());
+            }
+        };
+        sync(text);
+        text.connect_active_notify(sync);
+        dialog.set_focus(Some(text));
+    }
 }
 
 struct Editor {

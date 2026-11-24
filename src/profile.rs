@@ -9,7 +9,9 @@ use gtk::glib;
 use tokio::runtime::Handle;
 
 use crate::blocked::{self, BlockAction};
-use crate::chat_management::{self, EditFuture, MemberChangeFuture, MemberFuture, MembersContext};
+use crate::chat_management::{
+    self, EditFuture, MemberChangeFuture, MemberFuture, MemberRestrictionsContext, MembersContext,
+};
 use crate::model::{
     Avatar, ChatAddresses, ChatInfo, ChatKind, MemberChange, MemberFilter, MemberModeration,
     PeerProfile,
@@ -31,6 +33,8 @@ pub struct ProfileContext {
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
+    pub member_restriction: crate::member_restrictions::Load,
+    pub edit_member_restriction: crate::member_restrictions::Save,
     pub invite_members: crate::invite_members::OpenChatInvite,
     pub invites: Box<dyn Fn(&gtk::Button)>,
     pub join_requests: Box<dyn Fn(&gtk::Button)>,
@@ -390,6 +394,8 @@ impl ProfileDialog {
         {
             let can_view_members = profile.can_view_members;
             let moderation = profile.moderation;
+            let can_restrict =
+                moderation == Some(MemberModeration::Ban) && profile.group_permissions.is_some();
             let admins = profile.admin_policy;
             let can_add_members = profile.can_add_members;
             let subscribers = profile.kind == ChatKind::Broadcast;
@@ -435,6 +441,30 @@ impl ProfileDialog {
                                 }),
                                 move |member, change| (state.context.moderate)(member, change)
                             )),
+                            restrictions: can_restrict.then(|| MemberRestrictionsContext {
+                                load: Box::new(glib::clone!(
+                                    #[weak]
+                                    state,
+                                    #[upgrade_or]
+                                    Box::pin(async {
+                                        anyhow::bail!("Профиль чата закрыт")
+                                    }),
+                                    move |member| (state.context.member_restriction)(member)
+                                )),
+                                save: Box::new(glib::clone!(
+                                    #[weak]
+                                    state,
+                                    #[upgrade_or]
+                                    Box::pin(async {
+                                        anyhow::bail!("Профиль чата закрыт")
+                                    }),
+                                    move |member, original, edit| (state
+                                        .context
+                                        .edit_member_restriction)(
+                                        member, original, edit
+                                    )
+                                )),
+                            }),
                             invite: can_add_members.then(|| {
                                 let open: crate::invite_members::OpenInvite =
                                     Box::new(glib::clone!(
