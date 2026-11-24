@@ -12,7 +12,7 @@ use crate::model::{
     JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
     MemberRestriction, MemberRestrictionEdit, MemberRestrictionSettings, MemberRole, Message,
     NewChatDraft, NewChatKind, NewChatResult, PeerProfile, PlayableMedia, PlaybackProgress,
-    PlaybackSource, PollDraft, PollQuizDraft, TextLink, forum_topic_title, restriction_now,
+    PlaybackSource, PollDraft, TextLink, forum_topic_title, restriction_now,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -1363,7 +1363,7 @@ pub fn sample_quiz() -> PollDraft {
     PollDraft {
         question: "Какой день идёт после вторника?".into(),
         choices: vec!["Среда".into(), "Воскресенье".into()],
-        quiz: Some(PollQuizDraft {
+        quiz: Some(crate::model::PollQuizDraft {
             correct: vec![0],
             solution: "Первый вариант правильный.".into(),
         }),
