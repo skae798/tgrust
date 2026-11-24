@@ -17,6 +17,7 @@ use super::{Attribute, Media, Uploaded};
 pub struct InputMedia {
     pub(crate) entities: Vec<tl::enums::MessageEntity>,
     pub(crate) reply_to: Option<i32>,
+    pub(crate) forum_topic: Option<i32>,
     pub(crate) caption: String,
     pub(crate) media: Option<tl::enums::InputMedia>,
     media_ttl: Option<i32>,
@@ -131,6 +132,12 @@ impl From<TimeToLive> for Option<i32> {
 }
 
 impl InputMedia {
+    /// Target a forum topic when this media starts an album.
+    pub fn forum_topic(mut self, topic: Option<i32>) -> Self {
+        self.forum_topic = topic;
+        self
+    }
+
     /// Creates a new empty media message for input.
     pub fn new() -> Self {
         Self::default()

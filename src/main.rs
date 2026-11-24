@@ -9,6 +9,7 @@ mod contacts;
 mod demo;
 mod devices;
 mod formatting;
+mod forum_topics;
 mod group_permissions;
 mod invite_links;
 mod invite_members;

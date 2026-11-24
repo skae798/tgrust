@@ -23,7 +23,8 @@ use crate::model::{
     redact_spoilers,
 };
 use crate::model::{
-    ChatInfo, GroupPermissionEdit, GroupPermissions, PlayableMedia, slow_mode_change,
+    ChatInfo, Conversation, ForumTopic, GENERAL_TOPIC, GroupPermissionEdit, GroupPermissions,
+    PlayableMedia, slow_mode_change,
 };
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -151,6 +152,11 @@ struct Ui {
     external_chat: RefCell<Option<Chat>>,
     message_search: glib::WeakRef<adw::Dialog>,
     selection: Cell<Option<i64>>,
+    selected_topic: RefCell<Option<ForumTopic>>,
+    forum_jump: Cell<u64>,
+    topic_picker: glib::WeakRef<adw::Dialog>,
+    topics_button: gtk::Button,
+    open_topics_button: gtk::Button,
     notification_chat: Cell<Option<i64>>,
     notified_messages: RefCell<HashMap<i64, i32>>,
     generation: Cell<u64>,
@@ -172,10 +178,11 @@ struct Ui {
     history_revision: Cell<HistoryRevision>,
     history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
+    demo_read_topics: Rc<RefCell<HashSet<Conversation>>>,
     demo_next_message: Cell<i32>,
-    drafts: RefCell<HashMap<i64, FormattedText>>,
-    uploads: RefCell<HashMap<i64, Vec<Upload>>>,
-    replies: RefCell<HashMap<i64, Reply>>,
+    drafts: RefCell<HashMap<Conversation, FormattedText>>,
+    uploads: RefCell<HashMap<Conversation, Vec<Upload>>>,
+    replies: RefCell<HashMap<Conversation, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
     voting: RefCell<HashSet<(i64, i32)>>,
     poll_revision: Cell<u64>,
@@ -441,6 +448,9 @@ pub fn open(
     let search_in_chat = icon_button("system-search-symbolic", "Поиск в чате");
     search_in_chat.set_visible(false);
     pane_header.pack_end(&search_in_chat);
+    let topics_button = icon_button("view-list-symbolic", "Темы");
+    topics_button.set_visible(false);
+    pane_header.pack_start(&topics_button);
     pane.add_top_bar(&pane_header);
     let content = gtk::Stack::new();
     let empty = adw::StatusPage::builder()
@@ -448,6 +458,15 @@ pub fn open(
         .title("Выберите чат")
         .build();
     content.add_named(&empty, Some("empty"));
+    let open_topics_button = gtk::Button::with_label("Открыть темы");
+    open_topics_button.set_halign(gtk::Align::Center);
+    open_topics_button.add_css_class("suggested-action");
+    let forum = adw::StatusPage::builder()
+        .icon_name("view-list-symbolic")
+        .title("Выберите тему")
+        .child(&open_topics_button)
+        .build();
+    content.add_named(&forum, Some("forum"));
     let conversation = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let latest = gtk::Button::with_label("К последним сообщениям");
     latest.add_css_class("flat");
@@ -658,6 +677,11 @@ pub fn open(
         external_chat: RefCell::new(None),
         message_search: glib::WeakRef::new(),
         selection: Cell::new(None),
+        selected_topic: RefCell::new(None),
+        forum_jump: Cell::new(0),
+        topic_picker: glib::WeakRef::new(),
+        topics_button,
+        open_topics_button,
         notification_chat: Cell::new(None),
         notified_messages: RefCell::new(HashMap::new()),
         generation: Cell::new(0),
@@ -679,6 +703,7 @@ pub fn open(
         history_revision: Cell::new(HistoryRevision::default()),
         history_refreshed: Cell::new(None),
         demo_messages: RefCell::new(HashMap::new()),
+        demo_read_topics: Rc::new(RefCell::new(HashSet::new())),
         demo_next_message: Cell::new(200),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
@@ -922,11 +947,16 @@ pub fn open(
         #[weak]
         ui,
         move |_| {
-            if let Some(chat) = ui.selection.get() {
-                ui.show_chat(chat, None);
-            }
+            ui.reopen_conversation(None);
         }
     ));
+    for button in [&ui.topics_button, &ui.open_topics_button] {
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            ui,
+            move |_| ui.open_current_topics()
+        ));
+    }
     ui.filter.connect_search_changed(glib::clone!(
         #[weak]
         ui,
@@ -1056,8 +1086,8 @@ pub fn open(
         #[weak]
         ui,
         move |_| {
-            if let Some(chat) = ui.selection.get() {
-                ui.uploads.borrow_mut().remove(&chat);
+            if let Some(target) = ui.conversation() {
+                ui.uploads.borrow_mut().remove(&target);
                 ui.update_send_button();
             }
         }
@@ -1066,8 +1096,8 @@ pub fn open(
         #[weak]
         ui,
         move |_| {
-            if let Some(chat) = ui.selection.get() {
-                ui.replies.borrow_mut().remove(&chat);
+            if let Some(target) = ui.conversation() {
+                ui.replies.borrow_mut().remove(&target);
                 ui.update_send_button();
             }
         }
@@ -2293,6 +2323,7 @@ impl Ui {
     fn chat_dialog_open(&self) -> bool {
         [
             &self.message_search,
+            &self.topic_picker,
             &self.profile_dialog,
             &self.own_profile_dialog,
             &self.poll_dialog,
@@ -3602,8 +3633,17 @@ impl Ui {
                     self,
                     move |hit: SearchHit| {
                         let id = hit.chat.id;
+                        let forum = hit.chat.forum;
                         ui.external_chat.replace(Some(hit.chat));
-                        ui.show_chat(id, Some(hit.message.id));
+                        if forum {
+                            ui.open_forum_message(
+                                id,
+                                Some(hit.message.topic.unwrap_or(GENERAL_TOPIC)),
+                                hit.message.id,
+                            );
+                        } else {
+                            ui.show_chat(id, Some(hit.message.id));
+                        }
                     }
                 )),
             },
@@ -3613,8 +3653,18 @@ impl Ui {
     }
 
     fn show_chat(self: &Rc<Self>, id: i64, anchor: Option<i32>) {
-        let Some(chat) = self
-            .chats
+        let Some(chat) = self.chat_view(id) else {
+            return;
+        };
+        let forum = chat.forum;
+        self.show_conversation(chat, None, if forum { None } else { anchor });
+        if forum {
+            self.open_current_topics();
+        }
+    }
+
+    fn chat_view(&self, id: i64) -> Option<Chat> {
+        self.chats
             .borrow()
             .iter()
             .find(|chat| chat.id == id)
@@ -3626,14 +3676,174 @@ impl Ui {
                     .filter(|chat| chat.id == id)
                     .cloned()
             })
+    }
+
+    fn conversation(&self) -> Option<Conversation> {
+        if self.content.visible_child_name().as_deref() != Some("conversation") {
+            return None;
+        }
+        Some(Conversation {
+            chat: self.selection.get()?,
+            topic: self.selected_topic.borrow().as_ref().map(|topic| topic.id),
+        })
+    }
+
+    fn reopen_conversation(self: &Rc<Self>, anchor: Option<i32>) {
+        if let Some(chat) = self.selection.get().and_then(|id| self.chat_view(id)) {
+            let topic = self.selected_topic.borrow().clone();
+            self.show_conversation(chat, topic, anchor);
+        }
+    }
+
+    fn open_current_topics(self: &Rc<Self>) {
+        let Some(chat) = self
+            .selection
+            .get()
+            .filter(|id| self.chat_view(*id).is_some_and(|chat| chat.forum))
         else {
             return;
         };
+        let generation = self.generation.get();
+        self.choose_forum_topic(chat, move |ui, topic| {
+            if ui.selection.get() == Some(chat)
+                && ui.generation.get() == generation
+                && let Some(chat) = ui.chat_view(chat)
+            {
+                ui.show_conversation(chat, Some(topic), None);
+            }
+        });
+    }
+
+    fn choose_forum_topic(
+        self: &Rc<Self>,
+        chat: i64,
+        choose: impl Fn(&Rc<Self>, ForumTopic) + 'static,
+    ) {
+        if self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let demo = self.is_demo.get();
+        let client = self.client.borrow().clone();
+        let read_topics = self.demo_read_topics.clone();
+        let picker = crate::forum_topics::open(
+            &window,
+            self.runtime.clone(),
+            move |cursor| {
+                let client = client.clone();
+                let sample = demo.then(|| {
+                    let mut page = demo::forum_topics(cursor);
+                    let read = read_topics.borrow();
+                    for topic in &mut page.topics {
+                        if read.contains(&Conversation {
+                            chat,
+                            topic: Some(topic.id),
+                        }) {
+                            topic.unread = 0;
+                        }
+                    }
+                    page
+                });
+                Box::pin(async move {
+                    if let Some(page) = sample {
+                        return Ok(page);
+                    }
+                    client
+                        .context("Нет подключения к Telegram")?
+                        .forum_topics(chat, cursor)
+                        .await
+                })
+            },
+            glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move |topic| choose(&ui, topic)
+            ),
+        );
+        self.topic_picker.set(Some(&picker));
+    }
+
+    fn open_forum_message(self: &Rc<Self>, chat: i64, topic: Option<i32>, anchor: i32) {
+        let Some(view) = self.chat_view(chat) else {
+            return;
+        };
+        if self.is_demo.get() {
+            let topic = topic.or_else(|| {
+                let mut history = self.demo_messages.borrow_mut();
+                history
+                    .entry(chat)
+                    .or_insert_with(|| demo::history(chat))
+                    .iter()
+                    .find(|message| message.id == anchor)
+                    .map(|message| message.topic.unwrap_or(GENERAL_TOPIC))
+            });
+            if let Some(topic) = topic.and_then(demo::forum_topic) {
+                self.show_conversation(view, Some(topic), Some(anchor));
+            }
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let generation = self.generation.get();
+        let jump = self.forum_jump.get().wrapping_add(1);
+        self.forum_jump.set(jump);
+        self.job(
+            async move {
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    let topic = match topic {
+                        Some(topic) => topic,
+                        None => client.forum_topic_for_message(chat, anchor).await?,
+                    };
+                    client.forum_topic(chat, topic).await
+                })
+                .await
+                .context("Telegram не прислал тему вовремя")?
+            },
+            move |ui, result| {
+                if ui.generation.get() != generation || ui.forum_jump.get() != jump {
+                    return;
+                }
+                match result {
+                    Ok(topic) => ui.show_conversation(view, Some(topic), Some(anchor)),
+                    Err(error) => ui.toast(&format!("Не удалось открыть тему. {error}")),
+                }
+            },
+        );
+    }
+
+    fn show_conversation(
+        self: &Rc<Self>,
+        chat: Chat,
+        topic: Option<ForumTopic>,
+        anchor: Option<i32>,
+    ) {
+        let id = chat.id;
+        let target = Conversation {
+            chat: id,
+            topic: topic.as_ref().map(|topic| topic.id),
+        };
+        let overview = chat.forum && topic.is_none();
+        let previous = self.conversation();
+        if self.is_demo.get()
+            && anchor.is_none()
+            && let Some(topic) = &topic
+            && self.demo_read_topics.borrow_mut().insert(target)
+            && let Some(chat) = self
+                .chats
+                .borrow_mut()
+                .iter_mut()
+                .find(|chat| chat.id == id)
+        {
+            chat.unread = (chat.unread - topic.unread).max(0);
+        }
         self.withdraw_chat_notification(id);
         if chat.slow_mode_enabled {
             self.refresh_slow_mode(id);
         }
-        if self.selection.get() != Some(id) || anchor.is_some() {
+        if previous != Some(target) || anchor.is_some() {
             self.inline_audio.take();
         }
         if self.chats.borrow().iter().any(|item| item.id == id) {
@@ -3647,11 +3857,18 @@ impl Ui {
             }
         }
         self.title.set_title(&chat.title);
-        self.title
-            .set_subtitle(if chat.broadcast { "Канал" } else { "" });
+        self.title.set_subtitle(
+            topic
+                .as_ref()
+                .map_or(if chat.broadcast { "Канал" } else { "" }, |topic| {
+                    topic.title.as_str()
+                }),
+        );
+        self.topics_button.set_visible(chat.forum);
         self.split.set_show_content(true);
         let client = self.client.borrow().clone();
-        if self.unread_overrides.borrow_mut().remove(&id)
+        if !chat.forum
+            && self.unread_overrides.borrow_mut().remove(&id)
             && let Some(client) = &client
         {
             client.begin_read_change(id);
@@ -3663,11 +3880,14 @@ impl Ui {
                 client.history_revision(id)
             });
         let now = Instant::now();
-        if self.selection.get() == Some(id)
+        if !overview
+            && previous == Some(target)
             && self.loaded.get()
             && anchor.is_none()
             && self.search_anchor.get().is_none()
         {
+            self.selected_topic.replace(topic);
+            self.set_chat_writability(chat.can_write);
             self.focus_composer();
             if self.is_demo.get()
                 || self.history_refreshed.get().is_some_and(|refreshed| {
@@ -3676,13 +3896,13 @@ impl Ui {
                         .is_fresh(refreshed, revision, now)
                 })
             {
-                self.mark_cached_read(&chat);
+                self.mark_cached_conversation_read(&chat, target);
             } else {
                 self.load_history(None, true);
             }
             return;
         }
-        if let Some(previous) = self.selection.replace(Some(id)) {
+        if let Some(previous) = previous {
             self.drafts
                 .borrow_mut()
                 .insert(previous, editor_text(&self.input.buffer()));
@@ -3699,6 +3919,8 @@ impl Ui {
                 );
             }
         }
+        self.selection.set(Some(id));
+        self.selected_topic.replace(topic);
         self.update_archive_button();
         self.update_mute_button();
         self.search_in_chat.set_visible(true);
@@ -3718,9 +3940,16 @@ impl Ui {
         self.messages.borrow_mut().clear();
         self.revealed_spoilers.borrow_mut().clear();
         self.history_refreshed.set(None);
-        self.content.set_visible_child_name("conversation");
+        self.content
+            .set_visible_child_name(if overview { "forum" } else { "conversation" });
         let buffer = self.input.buffer();
-        if let Some(draft) = self.drafts.borrow().get(&id) {
+        if overview {
+            buffer.set_text("");
+            self.set_chat_writability(false);
+            self.open_topics_button.grab_focus();
+            return;
+        }
+        if let Some(draft) = self.drafts.borrow().get(&target) {
             set_editor_text(&buffer, draft);
         } else {
             buffer.set_text("");
@@ -3728,7 +3957,7 @@ impl Ui {
         buffer.place_cursor(&buffer.end_iter());
         self.set_chat_writability(chat.can_write);
         let cached = if anchor.is_none() {
-            self.history_cache.borrow_mut().restore(id, now)
+            self.history_cache.borrow_mut().restore(target, now)
         } else {
             None
         };
@@ -3740,21 +3969,25 @@ impl Ui {
             self.messages.replace(cached.messages);
             self.loaded.set(true);
             self.render_history(true);
+            if self.is_demo.get() && chat.forum {
+                self.render_chats();
+            }
             if fresh {
-                self.mark_cached_read(&chat);
+                self.mark_cached_conversation_read(&chat, target);
             } else {
                 self.load_history(None, true);
             }
         } else if self.is_demo.get() {
-            let (messages, has_older, _) = self.demo_history(id, None, anchor);
+            let (messages, has_older, _) = self.demo_history(target, None, anchor);
             self.messages
                 .borrow_mut()
                 .extend(messages.into_iter().map(|message| (message.id, message)));
-            if let Some(chat) = self
-                .chats
-                .borrow_mut()
-                .iter_mut()
-                .find(|chat| chat.id == id)
+            if !chat.forum
+                && let Some(chat) = self
+                    .chats
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|chat| chat.id == id)
             {
                 chat.unread = 0;
                 chat.unread_mark = false;
@@ -3787,6 +4020,30 @@ impl Ui {
                     .iter()
                     .any(|chat| chat.id == id && chat.unread_mark),
         })
+    }
+
+    fn mark_cached_conversation_read(self: &Rc<Self>, chat: &Chat, target: Conversation) {
+        let Some(topic) = target.topic else {
+            self.mark_cached_read(chat);
+            return;
+        };
+        if self.unread_overrides.borrow().contains(&chat.id) {
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let Some((&max_id, _)) = self.messages.borrow().last_key_value() else {
+            return;
+        };
+        self.job(
+            async move { client.read_forum_topic(target.chat, topic, max_id).await },
+            move |ui, result| {
+                if result.is_ok_and(|read| read) {
+                    ui.refresh_chats();
+                }
+            },
+        );
     }
 
     fn mark_cached_read(self: &Rc<Self>, chat: &Chat) {
@@ -3900,12 +4157,22 @@ impl Ui {
 
     fn demo_history(
         &self,
-        chat: i64,
+        target: Conversation,
         before: Option<i32>,
         anchor: Option<i32>,
     ) -> (Vec<Message>, bool, bool) {
         let mut history = self.demo_messages.borrow_mut();
-        let messages = history.entry(chat).or_insert_with(|| demo::history(chat));
+        let messages = history
+            .entry(target.chat)
+            .or_insert_with(|| demo::history(target.chat));
+        let messages: Vec<_> = messages
+            .iter()
+            .filter(|message| {
+                target
+                    .topic
+                    .is_none_or(|topic| message.topic.unwrap_or(GENERAL_TOPIC) == topic)
+            })
+            .collect();
         let end = if let Some(before) = before {
             messages.partition_point(|message| message.id < before)
         } else if let Some(anchor) = anchor {
@@ -3915,7 +4182,14 @@ impl Ui {
             messages.len()
         };
         let start = end.saturating_sub(HISTORY_PAGE_SIZE);
-        (messages[start..end].to_vec(), start > 0, false)
+        (
+            messages[start..end]
+                .iter()
+                .map(|message| (*message).clone())
+                .collect(),
+            start > 0,
+            false,
+        )
     }
 
     fn load_older_near_top(self: &Rc<Self>) {
@@ -4027,9 +4301,10 @@ impl Ui {
     }
 
     fn load_history(self: &Rc<Self>, before: Option<i32>, mark_read: bool) {
-        let Some(id) = self.selection.get() else {
+        let Some(target) = self.conversation() else {
             return;
         };
+        let id = target.chat;
         let client = self.client.borrow().clone();
         let demo = self.is_demo.get();
         if client.is_none() && !demo {
@@ -4051,7 +4326,7 @@ impl Ui {
             .map_or_else(HistoryRevision::default, |client| {
                 client.history_revision(id)
             });
-        let demo_page = demo.then(|| self.demo_history(id, before, anchor));
+        let demo_page = demo.then(|| self.demo_history(target, before, anchor));
         let visible = if before.is_none()
             && anchor.is_none()
             && self.loaded.get()
@@ -4087,13 +4362,26 @@ impl Ui {
                 }
                 let client = client.expect("Telegram history requires a client");
                 tokio::time::timeout(Duration::from_secs(25), async {
-                    if before.is_none()
+                    if target.topic.is_none()
+                        && before.is_none()
                         && let Some(anchor) = anchor
                     {
                         let (messages, older) = client.history_around(id, anchor).await?;
                         return Ok((messages, older, false));
                     }
-                    let (messages, mut older, marked) = client.history(id, before, read).await?;
+                    let (messages, mut older, marked) = if let Some(topic) = target.topic {
+                        client
+                            .forum_history(
+                                id,
+                                topic,
+                                before,
+                                anchor.filter(|_| before.is_none()),
+                                read.is_some(),
+                            )
+                            .await?
+                    } else {
+                        client.history(id, before, read).await?
+                    };
                     let needs_more = visible.filter(|visible| {
                         messages.first().is_some_and(|first| {
                             *visible < first.id
@@ -4110,8 +4398,13 @@ impl Ui {
                         && older
                         && oldest.id > visible
                     {
-                        let (page, has_older, _) =
-                            client.history(id, Some(oldest.id), None).await?;
+                        let (page, has_older, _) = if let Some(topic) = target.topic {
+                            client
+                                .forum_history(id, topic, Some(oldest.id), None, false)
+                                .await?
+                        } else {
+                            client.history(id, Some(oldest.id), None).await?
+                        };
                         older = has_older && !page.is_empty();
                         pages.push(page);
                     }
@@ -4482,7 +4775,11 @@ impl Ui {
             return;
         }
         if !self.messages.borrow().contains_key(&id) {
-            self.show_chat(chat, Some(id));
+            if self.selected_topic.borrow().is_some() {
+                self.open_forum_message(chat, None, id);
+            } else {
+                self.reopen_conversation(Some(id));
+            }
             return;
         }
         let Some(bubble) = self.message_bubble(id) else {
@@ -4862,6 +5159,7 @@ impl Ui {
     ) -> Option<gtk::Box> {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let id = message.id;
+        let target = self.conversation();
         if let Some((text, selected)) = copy {
             add_menu_button(
                 &menu,
@@ -4894,8 +5192,10 @@ impl Ui {
                         #[weak(rename_to = ui)]
                         self,
                         move || {
-                            if ui.selection.get() == Some(chat) {
-                                ui.replies.borrow_mut().insert(chat, reply.clone());
+                            if let Some(target) =
+                                target.filter(|target| ui.conversation() == Some(*target))
+                            {
+                                ui.replies.borrow_mut().insert(target, reply.clone());
                                 ui.update_send_button();
                                 ui.input.grab_focus();
                             }
@@ -5037,8 +5337,16 @@ impl Ui {
     }
 
     fn set_chat_writability(&self, writable: bool) {
-        self.input.set_sensitive(writable);
-        self.input_placeholder.set_text(if writable {
+        let closed = self
+            .selected_topic
+            .borrow()
+            .as_ref()
+            .is_some_and(|topic| topic.closed);
+        self.input
+            .set_sensitive(writable && !closed && self.conversation().is_some());
+        self.input_placeholder.set_text(if closed {
+            "Тема закрыта"
+        } else if writable {
             "Сообщение"
         } else {
             "Канал только для чтения"
@@ -5050,7 +5358,7 @@ impl Ui {
         let text = self.composer_text();
         self.input_placeholder.set_visible(text.is_empty());
         let uploads = self.uploads.borrow();
-        let pending = self.selection.get().and_then(|chat| uploads.get(&chat));
+        let pending = self.conversation().and_then(|target| uploads.get(&target));
         self.upload_bar.set_visible(pending.is_some());
         if let Some(pending) = pending {
             self.upload_name.set_text(
@@ -5062,7 +5370,7 @@ impl Ui {
             );
         }
         let replies = self.replies.borrow();
-        let reply = self.selection.get().and_then(|chat| replies.get(&chat));
+        let reply = self.conversation().and_then(|target| replies.get(&target));
         self.reply_bar.set_visible(reply.is_some());
         if let Some(reply) = reply {
             self.reply_sender.set_text(
@@ -5199,7 +5507,7 @@ impl Ui {
         if !self.attach.is_sensitive() {
             return;
         }
-        let (Some(window), Some(chat)) = (self.window.upgrade(), self.selection.get()) else {
+        let (Some(window), Some(target)) = (self.window.upgrade(), self.conversation()) else {
             return;
         };
         let dialog = gtk::FileDialog::builder()
@@ -5246,7 +5554,7 @@ impl Ui {
                 selected.push(Upload { path, name, kind });
             }
             if !selected.is_empty() {
-                ui.uploads.borrow_mut().insert(chat, selected);
+                ui.uploads.borrow_mut().insert(target, selected);
             }
             ui.update_send_button();
         });
@@ -5256,9 +5564,10 @@ impl Ui {
         if !self.attach.is_sensitive() || self.chat_dialog_open() {
             return;
         }
-        let (Some(window), Some(chat)) = (self.window.upgrade(), self.selection.get()) else {
+        let (Some(window), Some(target)) = (self.window.upgrade(), self.conversation()) else {
             return;
         };
+        let chat = target.chat;
         let weak = Rc::downgrade(self);
         let dialog = crate::poll_dialog::create(&window, move |draft, random_id| {
             let weak = weak.clone();
@@ -5269,8 +5578,11 @@ impl Ui {
                 }
                 if ui.is_demo.get() {
                     ui.add_demo_messages(
-                        chat,
-                        vec![demo::poll_message(ui.next_demo_message(), draft)],
+                        target,
+                        vec![Message {
+                            topic: target.topic,
+                            ..demo::poll_message(ui.next_demo_message(), draft)
+                        }],
                     );
                     ui.start_demo_slow_mode(chat);
                     return Ok(());
@@ -5283,7 +5595,7 @@ impl Ui {
                 let task = ui.runtime.spawn(async move {
                     tokio::time::timeout(
                         Duration::from_secs(35),
-                        client.send_poll(chat, draft, random_id),
+                        client.send_poll(chat, draft, random_id, target.topic),
                     )
                     .await
                     .context("Telegram не подтвердил отправку вовремя")?
@@ -5300,8 +5612,8 @@ impl Ui {
                 })?;
                 if let Some(ui) = weak.upgrade() {
                     ui.refresh_slow_mode_if_enabled(chat);
-                    ui.history_cache.borrow_mut().remove(chat);
-                    if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none() {
+                    ui.history_cache.borrow_mut().remove_conversation(target);
+                    if ui.conversation() == Some(target) && ui.search_anchor.get().is_none() {
                         if let Some(message) = message {
                             ui.messages.borrow_mut().insert(message.id, message);
                             ui.render_history(true);
@@ -5491,23 +5803,25 @@ impl Ui {
         if !self.send.is_sensitive() {
             return;
         }
-        let Some(chat) = self.selection.get() else {
+        let Some(target) = self.conversation() else {
             return;
         };
+        let chat = target.chat;
         let original = editor_text(&self.input.buffer());
         let text = original.trimmed();
         let uploads = self
             .uploads
             .borrow()
-            .get(&chat)
+            .get(&target)
             .cloned()
             .unwrap_or_default();
-        let reply = self.replies.borrow().get(&chat).cloned();
+        let reply = self.replies.borrow().get(&target).cloned();
         let reply_to = reply.as_ref().map(|reply| reply.id);
         if self.is_demo.get() {
             let id = self.next_demo_message();
             let message = Message {
                 id,
+                topic: target.topic,
                 text: text.text,
                 styles: text.spans,
                 links: Vec::new(),
@@ -5536,8 +5850,8 @@ impl Ui {
                 album: (uploads.len() > 1).then_some(i64::from(id)),
             };
             self.input.buffer().set_text("");
-            self.uploads.borrow_mut().remove(&chat);
-            self.replies.borrow_mut().remove(&chat);
+            self.uploads.borrow_mut().remove(&target);
+            self.replies.borrow_mut().remove(&target);
             self.update_send_button();
             let messages = if uploads.is_empty() {
                 vec![message]
@@ -5576,7 +5890,7 @@ impl Ui {
                     })
                     .collect()
             };
-            self.add_demo_messages(chat, messages);
+            self.add_demo_messages(target, messages);
             self.start_demo_slow_mode(chat);
             return;
         }
@@ -5590,7 +5904,11 @@ impl Ui {
         }
         let request_uploads = uploads.clone();
         self.job(
-            async move { client.send(chat, text, request_uploads, reply_to).await },
+            async move {
+                client
+                    .send(chat, text, request_uploads, reply_to, target.topic)
+                    .await
+            },
             move |ui, result| {
                 ui.sending.set(false);
                 match result {
@@ -5602,19 +5920,19 @@ impl Ui {
                                     reply.as_ref().map(|reply| reply.preview.clone());
                             }
                         }
-                        if ui.uploads.borrow().get(&chat) == Some(&uploads) {
-                            ui.uploads.borrow_mut().remove(&chat);
+                        if ui.uploads.borrow().get(&target) == Some(&uploads) {
+                            ui.uploads.borrow_mut().remove(&target);
                         }
-                        if ui.replies.borrow().get(&chat) == reply.as_ref() {
-                            ui.replies.borrow_mut().remove(&chat);
+                        if ui.replies.borrow().get(&target) == reply.as_ref() {
+                            ui.replies.borrow_mut().remove(&target);
                         }
-                        if ui.selection.get() == Some(chat) {
+                        if ui.conversation() == Some(target) {
                             if editor_text(&ui.input.buffer()) == original {
                                 ui.input.buffer().set_text("");
                             }
                             if ui.search_anchor.get().is_some() || !ui.loaded.get() {
-                                ui.history_cache.borrow_mut().remove(chat);
-                                ui.show_chat(chat, None);
+                                ui.history_cache.borrow_mut().remove_conversation(target);
+                                ui.reopen_conversation(None);
                             } else {
                                 ui.messages.borrow_mut().extend(
                                     messages.into_iter().map(|message| (message.id, message)),
@@ -5622,13 +5940,13 @@ impl Ui {
                                 ui.render_history(true);
                             }
                         } else {
-                            ui.history_cache.borrow_mut().remove(chat);
-                            if ui.drafts.borrow().get(&chat) == Some(&original) {
-                                ui.drafts.borrow_mut().remove(&chat);
+                            ui.history_cache.borrow_mut().remove_conversation(target);
+                            if ui.drafts.borrow().get(&target) == Some(&original) {
+                                ui.drafts.borrow_mut().remove(&target);
                             }
                         }
                         ui.refresh_chats();
-                        if ui.selection.get() == Some(chat)
+                        if ui.conversation() == Some(target)
                             && ui.search_anchor.get().is_none()
                             && uploads.len() > 1
                         {
@@ -5753,7 +6071,8 @@ impl Ui {
         id
     }
 
-    fn add_demo_messages(self: &Rc<Self>, chat: i64, messages: Vec<Message>) {
+    fn add_demo_messages(self: &Rc<Self>, target: Conversation, messages: Vec<Message>) {
+        let chat = target.chat;
         let Some(last) = messages.last() else { return };
         if !self.chats.borrow().iter().any(|item| item.id == chat)
             && let Some(contact) = self
@@ -5764,7 +6083,7 @@ impl Ui {
         {
             self.chats.borrow_mut().insert(0, contact.clone());
         }
-        self.history_cache.borrow_mut().remove(chat);
+        self.history_cache.borrow_mut().remove_conversation(target);
         if let Some(chat) = self
             .chats
             .borrow_mut()
@@ -5791,7 +6110,7 @@ impl Ui {
             .entry(chat)
             .or_insert_with(|| demo::history(chat))
             .extend(messages.iter().cloned());
-        if self.selection.get() == Some(chat) {
+        if self.conversation() == Some(target) {
             self.messages
                 .borrow_mut()
                 .extend(messages.into_iter().map(|message| (message.id, message)));
@@ -5847,67 +6166,94 @@ impl Ui {
             let (Some(ui), Some(chat)) = (weak.upgrade(), destination.get()) else {
                 return;
             };
-            if let Some(wait) = ui.slow_mode_remaining(chat) {
-                ui.toast(&slow_mode_status(wait));
-                return;
-            }
-            if ui.is_demo.get() {
-                ui.add_demo_messages(
-                    chat,
-                    vec![Message {
-                        id: ui.next_demo_message(),
-                        timestamp: demo::now(),
-                        sender: demo::OWN_NAME.into(),
-                        sender_avatar: Some(demo::OWN_AVATAR),
-                        self_authored: true,
-                        outgoing: true,
-                        reply_to: None,
-                        reply_preview: None,
-                        can_edit: false,
-                        can_delete: true,
-                        forwarded: true,
-                        pinned: false,
-                        reactions: Vec::new(),
-                        edited: false,
-                        album: None,
-                        ..message
-                    }],
-                );
-                ui.start_demo_slow_mode(chat);
-                ui.toast("Сообщение переслано");
-                return;
-            }
-            let Some(client) = ui.client.borrow().clone() else {
-                return;
-            };
-            ui.sending.set(true);
-            ui.update_send_button();
-            ui.job(
-                async move { client.forward_message(source, message.id, chat).await },
-                move |ui, result| {
-                    ui.sending.set(false);
-                    ui.update_send_button();
-                    match result {
-                        Ok(message) => {
-                            ui.refresh_slow_mode_if_enabled(chat);
-                            if ui.selection.get() == Some(chat) && ui.search_anchor.get().is_none()
-                            {
-                                ui.messages.borrow_mut().insert(message.id, message);
-                                ui.render_history(true);
-                            }
-                            ui.refresh_chats();
-                            ui.toast("Сообщение переслано");
-                        }
-                        Err(error) => {
-                            let error = ui
-                                .note_slow_mode_error(chat, &error)
-                                .unwrap_or_else(|| error.to_string());
-                            ui.toast(&format!("Не удалось переслать сообщение. {error}"));
-                        }
+            if ui.chat_view(chat).is_some_and(|chat| chat.forum) {
+                ui.choose_forum_topic(chat, move |ui, topic| {
+                    if topic.closed {
+                        ui.toast("Тема закрыта");
+                    } else {
+                        ui.forward_to(
+                            source,
+                            message.clone(),
+                            Conversation {
+                                chat,
+                                topic: Some(topic.id),
+                            },
+                        );
                     }
-                },
-            );
+                });
+            } else {
+                ui.forward_to(source, message, chat.into());
+            }
         });
+    }
+
+    fn forward_to(self: &Rc<Self>, source: i64, message: Message, target: Conversation) {
+        let chat = target.chat;
+        if self.sending.get() {
+            self.toast("Дождитесь текущей отправки");
+            return;
+        }
+        if let Some(wait) = self.slow_mode_remaining(chat) {
+            self.toast(&slow_mode_status(wait));
+            return;
+        }
+        if self.is_demo.get() {
+            self.add_demo_messages(
+                target,
+                vec![Message {
+                    id: self.next_demo_message(),
+                    topic: target.topic,
+                    timestamp: demo::now(),
+                    sender: demo::OWN_NAME.into(),
+                    sender_avatar: Some(demo::OWN_AVATAR),
+                    self_authored: true,
+                    outgoing: true,
+                    reply_to: None,
+                    reply_preview: None,
+                    can_edit: false,
+                    can_delete: true,
+                    forwarded: true,
+                    pinned: false,
+                    reactions: Vec::new(),
+                    edited: false,
+                    album: None,
+                    ..message
+                }],
+            );
+            self.start_demo_slow_mode(chat);
+            self.toast("Сообщение переслано");
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        self.sending.set(true);
+        self.update_send_button();
+        self.job(
+            async move { client.forward_message(source, message.id, target).await },
+            move |ui, result| {
+                ui.sending.set(false);
+                ui.update_send_button();
+                match result {
+                    Ok(message) => {
+                        ui.refresh_slow_mode_if_enabled(chat);
+                        ui.history_cache.borrow_mut().remove_conversation(target);
+                        if ui.conversation() == Some(target) && ui.search_anchor.get().is_none() {
+                            ui.messages.borrow_mut().insert(message.id, message);
+                            ui.render_history(true);
+                        }
+                        ui.refresh_chats();
+                        ui.toast("Сообщение переслано");
+                    }
+                    Err(error) => {
+                        let error = ui
+                            .note_slow_mode_error(chat, &error)
+                            .unwrap_or_else(|| error.to_string());
+                        ui.toast(&format!("Не удалось переслать сообщение. {error}"));
+                    }
+                }
+            },
+        );
     }
 
     fn apply_text_edit(self: &Rc<Self>, chat: i64, id: i32, text: FormattedText) {
@@ -6040,14 +6386,9 @@ impl Ui {
             }
             self.render_chats();
         }
-        if self
-            .replies
-            .borrow()
-            .get(&chat)
-            .is_some_and(|reply| reply.id == id)
-        {
-            self.replies.borrow_mut().remove(&chat);
-        }
+        self.replies
+            .borrow_mut()
+            .retain(|target, reply| target.chat != chat || reply.id != id);
         if self.selection.get() == Some(chat) {
             self.messages.borrow_mut().remove(&id);
             self.update_send_button();

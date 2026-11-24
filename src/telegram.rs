@@ -1,6 +1,7 @@
 mod admin_log;
 mod chat_addresses;
 mod create_chat;
+mod forum_topics;
 mod group_permissions;
 mod invite_members;
 mod member_restrictions;
@@ -710,6 +711,7 @@ impl Telegram {
                     thumbnail(&media).map(|media| ChatImage::attachment(id, message.id(), media))
                 }),
                 group,
+                forum: forum_topics::is_forum(peer),
                 unread: raw.unread_count.max(0),
                 unread_mark: raw.unread_mark,
                 last_message_id: raw.top_message.max(0),
@@ -2083,6 +2085,7 @@ impl Telegram {
                     preview_sender: None,
                     preview_image: None,
                     group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
+                    forum: forum_topics::is_forum(peer),
                     unread: 0,
                     unread_mark: false,
                     last_message_id: 0,
@@ -2465,6 +2468,7 @@ impl Telegram {
         text: FormattedText,
         uploads: Vec<Upload>,
         reply_to: Option<i32>,
+        topic: Option<i32>,
     ) -> Result<Vec<Message>> {
         let peer = self.peer(id).await?;
         let self_id = self.self_id().await?;
@@ -2489,7 +2493,8 @@ impl Telegram {
                     media = media
                         .caption(&text.text)
                         .fmt_entities(entities.iter().cloned())
-                        .reply_to(reply_to);
+                        .reply_to(reply_to)
+                        .forum_topic(topic);
                 }
                 album.push(match kind {
                     UploadKind::File => media.file(uploaded),
@@ -2507,7 +2512,8 @@ impl Telegram {
         let mut message = InputMessage::new()
             .text(text.text)
             .fmt_entities(entities)
-            .reply_to(reply_to);
+            .reply_to(reply_to)
+            .forum_topic(topic);
         if let Some(upload) = uploads.into_iter().next() {
             let kind = upload.kind;
             let uploaded = self.upload_file(upload).await?;
@@ -2525,6 +2531,7 @@ impl Telegram {
         chat: i64,
         draft: PollDraft,
         random_id: i64,
+        topic: Option<i32>,
     ) -> Result<Option<Message>> {
         let poll = draft.validate()?;
         let text = |text| {
@@ -2576,7 +2583,13 @@ impl Telegram {
         let profile = self.profile().await;
         let message = self
             .client
-            .send_message(peer, InputMessage::new().media(media).random_id(random_id))
+            .send_message(
+                peer,
+                InputMessage::new()
+                    .media(media)
+                    .random_id(random_id)
+                    .forum_topic(topic),
+            )
             .await;
         match message {
             Ok(message) => Ok(Some(self.message_view(
@@ -3046,12 +3059,17 @@ impl Telegram {
         Ok(message_reactions(&message))
     }
 
-    pub async fn forward_message(&self, source: i64, id: i32, destination: i64) -> Result<Message> {
+    pub async fn forward_message(
+        &self,
+        source: i64,
+        id: i32,
+        destination: crate::model::Conversation,
+    ) -> Result<Message> {
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
         let profile = profile.as_deref();
         let source = self.peer(source).await?;
-        let destination = self.peer(destination).await?;
+        let destination_peer = self.peer(destination.chat).await?;
         let original = self
             .message_by_id(source, id)
             .await?
@@ -3059,7 +3077,7 @@ impl Telegram {
         ensure!(can_forward(&original), "Это сообщение нельзя переслать");
         let message = self
             .client
-            .forward_messages(destination, &[id], source)
+            .forward_messages_to_topic(destination_peer, destination.topic, &[id], source)
             .await?
             .into_iter()
             .next()
@@ -3882,6 +3900,7 @@ fn message_view(
     chat_author: Option<PeerId>,
     author: Option<ChatAuthor>,
 ) -> Message {
+    let topic = forum_topics::message_topic(&message.raw);
     let outgoing = message.outgoing();
     let attachment = attachment(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
@@ -3901,7 +3920,9 @@ fn message_view(
                     .reply_to_peer_id
                     .as_ref()
                     .is_none_or(|peer| PeerId::from(peer.clone()) == message.peer_id());
-                let id = header.reply_to_msg_id.filter(|_| same_chat);
+                let id = header
+                    .reply_to_msg_id
+                    .filter(|id| same_chat && Some(*id) != topic);
                 let quote = header
                     .quote_text
                     .as_ref()
@@ -3922,6 +3943,7 @@ fn message_view(
     };
     Message {
         id: message.id(),
+        topic,
         sender: author
             .as_ref()
             .map(|author| author.name.clone())

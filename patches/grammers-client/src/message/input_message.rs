@@ -28,6 +28,7 @@ pub struct InputMessage {
     pub(crate) random_id: Option<i64>,
     pub(crate) reply_markup: Option<tl::enums::ReplyMarkup>,
     pub(crate) reply_to: Option<i32>,
+    pub(crate) forum_topic: Option<i32>,
     pub(crate) schedule_date: Option<i32>,
     pub(crate) silent: bool,
     pub(crate) text: String,
@@ -38,6 +39,12 @@ pub struct InputMessage {
 }
 
 impl InputMessage {
+    /// Target a forum topic. Topic 1 is the General topic.
+    pub fn forum_topic(mut self, topic: Option<i32>) -> Self {
+        self.forum_topic = topic;
+        self
+    }
+
     /// Creates a new empty message for input.
     pub fn new() -> Self {
         Self::default()

@@ -86,26 +86,31 @@ impl Message {
                 saved_peer_id: None,
                 fwd_from: None,
                 via_bot_id: None,
-                reply_to: input.reply_to.map(|reply_to_msg_id| {
-                    tl::types::MessageReplyHeader {
-                        reply_to_scheduled: false,
-                        forum_topic: false,
-                        quote: false,
-                        reply_to_ephemeral: false,
-                        reply_to_msg_id: Some(reply_to_msg_id),
-                        reply_to_peer_id: None,
-                        reply_from: None,
-                        reply_media: None,
-                        reply_to_top_id: None,
-                        quote_text: None,
-                        quote_entities: None,
-                        quote_offset: None,
-                        todo_item_id: None,
-                        poll_option: None,
-                        quote_rich: None,
-                    }
-                    .into()
-                }),
+                reply_to: input
+                    .reply_to
+                    .or(input.forum_topic.filter(|&topic| topic > 1))
+                    .map(|reply_to_msg_id| {
+                        tl::types::MessageReplyHeader {
+                            reply_to_scheduled: false,
+                            forum_topic: input.forum_topic.is_some_and(|topic| topic > 1),
+                            quote: false,
+                            reply_to_ephemeral: false,
+                            reply_to_msg_id: Some(reply_to_msg_id),
+                            reply_to_peer_id: None,
+                            reply_from: None,
+                            reply_media: None,
+                            reply_to_top_id: input
+                                .forum_topic
+                                .filter(|&topic| topic > 1 && topic != reply_to_msg_id),
+                            quote_text: None,
+                            quote_entities: None,
+                            quote_offset: None,
+                            todo_item_id: None,
+                            poll_option: None,
+                            quote_rich: None,
+                        }
+                        .into()
+                    }),
                 date: updates.date,
                 message: input.text,
                 media: updates.media,
