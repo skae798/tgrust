@@ -2004,6 +2004,7 @@ pub struct Message {
     pub can_reply: bool,
     pub can_edit: bool,
     pub can_delete: bool,
+    pub can_close_poll: bool,
     pub can_forward: bool,
     pub forwarded: bool,
     pub pinned: bool,
@@ -2077,7 +2078,14 @@ pub struct PollVoteCount {
 
 impl PollUpdate {
     pub fn apply(&self, chat: i64, message: i32, poll: &mut Poll) -> bool {
-        if poll.id != self.id || self.target.is_some_and(|target| target != (chat, message)) {
+        if poll.id != self.id
+            || self.target.is_some_and(|target| target != (chat, message))
+            || (poll.closed
+                && self
+                    .definition
+                    .as_ref()
+                    .is_some_and(|incoming| !incoming.closed))
+        {
             return false;
         }
         let mut next = self.definition.clone().unwrap_or_else(|| poll.clone());
@@ -2206,6 +2214,12 @@ pub struct ReplyPreview {
 }
 
 impl Message {
+    pub fn open_poll_to_close(&self) -> Option<&Poll> {
+        self.poll.as_ref().filter(|poll| {
+            self.can_close_poll && !self.forwarded && !self.ephemeral && !poll.closed
+        })
+    }
+
     pub fn displayed_sender<'a>(&'a self, own_name: Option<&'a str>) -> &'a str {
         if self.self_authored
             && let Some(name) = own_name
@@ -3094,6 +3108,7 @@ mod tests {
                 can_reply: true,
                 can_edit: false,
                 can_delete: false,
+                can_close_poll: false,
                 can_forward: false,
                 forwarded: false,
                 pinned: false,

@@ -1154,6 +1154,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             outgoing: false,
             can_edit: false,
             can_delete: false,
+            can_close_poll: false,
             sender: "Анна".into(),
             sender_avatar: None,
             ..template.clone()
@@ -1206,6 +1207,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             message.self_authored = false;
             message.outgoing = false;
             message.can_delete = false;
+            message.can_close_poll = false;
         }
         return vec![quiz, meeting];
     }
@@ -1329,6 +1331,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
             can_delete: outgoing || chat == 2,
+            can_close_poll: false,
             can_forward: true,
             forwarded: false,
             pinned: false,
@@ -1366,6 +1369,26 @@ pub fn history(chat: i64) -> Vec<Message> {
         });
         messages.splice(..0, older);
     }
+    if chat == 3 {
+        let mut post = poll_message(
+            42,
+            PollDraft {
+                question: "Какой выпуск подготовить первым?".into(),
+                choices: vec!["Итоги недели".into(), "Ответы на вопросы".into()],
+                ..PollDraft::default()
+            },
+        );
+        post.sender = "Новости проекта".into();
+        post.sender_avatar = Some(Avatar {
+            peer: 3,
+            photo: 3,
+            dc: 0,
+        });
+        post.self_authored = false;
+        post.outgoing = false;
+        post.can_delete = false;
+        messages.insert(0, post);
+    }
     messages
 }
 
@@ -1392,6 +1415,7 @@ pub fn poll_message(id: i32, draft: PollDraft) -> Message {
         can_reply: true,
         can_edit: false,
         can_delete: true,
+        can_close_poll: true,
         can_forward: true,
         forwarded: false,
         pinned: false,

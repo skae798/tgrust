@@ -9,6 +9,7 @@ mod forum_topics;
 mod group_permissions;
 mod invite_members;
 mod member_restrictions;
+mod poll_management;
 pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
 
@@ -3975,6 +3976,7 @@ fn message_view(
         playback,
         audio,
         thumbnail,
+        can_close_poll: poll.is_some() && poll_management::can_close_poll(message),
         poll,
         reply_to,
         reply_preview,
