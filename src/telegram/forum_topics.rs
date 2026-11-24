@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use grammers_client::peer::Peer;
@@ -6,6 +7,7 @@ use grammers_client::tl::functions::messages::{
     GetForumTopics, GetForumTopicsById, ReadDiscussion,
 };
 
+use super::forum_management::topic_permissions;
 use super::{PeerKind, PeerRef, Telegram, TelegramMessage, enums, raw_peer_id};
 use crate::model::{
     FORUM_PAGE_SIZE, ForumCursor, ForumPage, ForumTopic, GENERAL_TOPIC, HISTORY_PAGE_SIZE,
@@ -61,30 +63,62 @@ impl Telegram {
         let next = last.filter(|last| {
             *last != cursor && (cursor.topic != 0 || result.count > result.topics.len() as i32)
         });
+        let mut permissions = topic_permissions(&result.chats, peer);
+        if permissions.is_none() && cursor.topic == 0 {
+            permissions =
+                tokio::time::timeout(Duration::from_secs(3), self.forum_permissions(peer))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+        }
         let topics = result
             .topics
             .into_iter()
             .filter_map(|topic| topic_view(topic, peer))
             .collect();
-        Ok(ForumPage { topics, next })
+        Ok(ForumPage {
+            topics,
+            next,
+            permissions,
+        })
     }
 
     pub async fn forum_topic(&self, id: i64, topic: i32) -> Result<ForumTopic> {
         ensure!(topic > 0, "Тема недоступна");
         let peer = self.forum_peer(id).await?;
-        let enums::messages::ForumTopics::Topics(result) = self
+        self.forum_topic_snapshot(peer, topic)
+            .await?
+            .context("Тема больше недоступна")
+    }
+
+    pub(super) async fn forum_topic_snapshot(
+        &self,
+        peer: PeerRef,
+        topic: i32,
+    ) -> Result<Option<ForumTopic>> {
+        let result = self
             .client
             .invoke(&GetForumTopicsById {
                 peer: peer.into(),
                 topics: vec![topic],
             })
-            .await?;
-        result
-            .topics
-            .into_iter()
-            .filter_map(|topic| topic_view(topic, peer))
-            .find(|item| item.id == topic)
-            .context("Тема больше недоступна")
+            .await;
+        let enums::messages::ForumTopics::Topics(result) = match result {
+            Ok(result) => result,
+            Err(error) if error.is("TOPIC_ID_INVALID") || error.is("TOPIC_DELETED") => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        for item in result.topics {
+            if matches!(&item, enums::ForumTopic::Deleted(item) if item.id == topic) {
+                return Ok(None);
+            }
+            if let Some(item) = topic_view(item, peer).filter(|item| item.id == topic) {
+                return Ok(Some(item));
+            }
+        }
+        anyhow::bail!("Telegram не вернул сведения об этой теме")
     }
 
     pub async fn forum_history(
@@ -171,7 +205,7 @@ impl Telegram {
         Ok(read)
     }
 
-    async fn forum_peer(&self, chat: i64) -> Result<PeerRef> {
+    pub(super) async fn forum_peer(&self, chat: i64) -> Result<PeerRef> {
         let peer = self.peer(chat).await?;
         ensure!(
             peer.id.kind() == PeerKind::Channel,
@@ -200,6 +234,7 @@ fn topic_view(raw: enums::ForumTopic, peer: PeerRef) -> Option<ForumTopic> {
         closed: topic.closed,
         hidden: topic.hidden,
         pinned: topic.pinned,
+        mine: topic.my,
     })
 }
 

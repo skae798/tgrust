@@ -394,6 +394,7 @@ pub struct ForumTopic {
     pub closed: bool,
     pub hidden: bool,
     pub pinned: bool,
+    pub mine: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -406,6 +407,98 @@ pub struct ForumCursor {
 pub struct ForumPage {
     pub topics: Vec<ForumTopic>,
     pub next: Option<ForumCursor>,
+    pub permissions: Option<ForumPermissions>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ForumPermissions {
+    pub create: bool,
+    pub manage: bool,
+    pub delete_messages: bool,
+}
+
+impl ForumPermissions {
+    pub fn allows(self, topic: &ForumTopic, change: &ForumTopicChange) -> bool {
+        match change {
+            ForumTopicChange::Rename(_) | ForumTopicChange::Closed(_) => self.manage || topic.mine,
+            ForumTopicChange::Hidden(_) => self.manage && topic.id == GENERAL_TOPIC,
+            ForumTopicChange::Pinned(_) => self.manage,
+            ForumTopicChange::Delete => {
+                topic.id != GENERAL_TOPIC && (self.delete_messages || topic.mine)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ForumTopicChange {
+    Rename(String),
+    Closed(bool),
+    Hidden(bool),
+    Pinned(bool),
+    Delete,
+}
+
+impl ForumTopicChange {
+    pub fn needs_write(&self, original: &ForumTopic, current: &ForumTopic) -> anyhow::Result<bool> {
+        use ForumTopicChange::*;
+        anyhow::ensure!(current.id == original.id, "Telegram вернул другую тему");
+        match self {
+            Rename(title) => {
+                let title = forum_topic_title(title)?;
+                anyhow::ensure!(
+                    current.title == original.title || current.title == title,
+                    "Название изменилось. Откройте тему снова"
+                );
+                Ok(current.title != title)
+            }
+            Closed(closed) => Ok(current.closed != *closed),
+            Hidden(hidden) => {
+                anyhow::ensure!(
+                    current.id == GENERAL_TOPIC,
+                    "Скрывать можно только общую тему"
+                );
+                Ok(current.hidden != *hidden)
+            }
+            Pinned(pinned) => Ok(current.pinned != *pinned),
+            Delete => {
+                anyhow::ensure!(current.id != GENERAL_TOPIC, "Общую тему удалить нельзя");
+                anyhow::ensure!(
+                    current.title == original.title,
+                    "Название изменилось. Проверьте тему перед удалением"
+                );
+                Ok(true)
+            }
+        }
+    }
+}
+
+pub enum ForumWrite {
+    Create {
+        title: String,
+        random_id: i64,
+    },
+    Change {
+        original: ForumTopic,
+        change: ForumTopicChange,
+    },
+}
+
+pub enum ForumWriteResult {
+    Created(ForumTopic),
+    Updated(ForumTopic),
+    Deleted(i32),
+    CreationUnconfirmed,
+}
+
+pub fn forum_topic_title(title: &str) -> anyhow::Result<String> {
+    let title = title.trim();
+    anyhow::ensure!(!title.is_empty(), "Введите название темы");
+    anyhow::ensure!(
+        title.len() <= 128 && !title.chars().any(char::is_control),
+        "Введите название без переносов, до 128 байт в UTF-8"
+    );
+    Ok(title.to_owned())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3049,6 +3142,75 @@ mod tests {
                 .messages
                 .contains_key(&110)
         );
+    }
+
+    #[test]
+    fn topic_authorship_and_admin_permissions_grant_distinct_actions() {
+        use ForumTopicChange::*;
+
+        let mut topic = ForumTopic {
+            id: 100,
+            title: "Тема".into(),
+            unread: 0,
+            closed: false,
+            hidden: false,
+            pinned: false,
+            mine: true,
+        };
+        let member = ForumPermissions::default();
+        assert!(member.allows(&topic, &Rename("Новое название".into())));
+        assert!(member.allows(&topic, &Closed(true)));
+        assert!(member.allows(&topic, &Delete));
+        assert!(!member.allows(&topic, &Pinned(true)));
+        topic.mine = false;
+        assert!(!member.allows(&topic, &Closed(true)));
+        assert!(!member.allows(&topic, &Delete));
+        let mut admin = ForumPermissions {
+            manage: true,
+            ..member
+        };
+        assert!(admin.allows(&topic, &Pinned(true)));
+        assert!(!admin.allows(&topic, &Hidden(true)));
+        assert!(!admin.allows(&topic, &Delete));
+        admin.delete_messages = true;
+        assert!(admin.allows(&topic, &Delete));
+        topic.id = GENERAL_TOPIC;
+        assert!(admin.allows(&topic, &Hidden(true)));
+        assert!(!admin.allows(&topic, &Delete));
+    }
+
+    #[test]
+    fn forum_topic_changes_keep_concurrent_edits_and_validate_utf8() {
+        use ForumTopicChange::*;
+
+        let original = ForumTopic {
+            id: 200,
+            title: "Прежнее".into(),
+            unread: 2,
+            closed: false,
+            hidden: false,
+            pinned: false,
+            mine: true,
+        };
+        let mut current = original.clone();
+        let rename = Rename(" Новое ".into());
+        current.unread = 3;
+        assert!(rename.needs_write(&original, &current).unwrap());
+        current.title = "Новое".into();
+        assert!(!rename.needs_write(&original, &current).unwrap());
+        assert!(Delete.needs_write(&original, &current).is_err());
+        current.title = "Параллельное".into();
+        assert!(rename.needs_write(&original, &current).is_err());
+        assert!(Pinned(true).needs_write(&original, &current).unwrap());
+        assert!(Hidden(true).needs_write(&original, &current).is_err());
+        current.id = 201;
+        assert!(Pinned(true).needs_write(&original, &current).is_err());
+
+        let limit = "я".repeat(64);
+        assert_eq!(forum_topic_title(&format!(" {limit} ")).unwrap(), limit);
+        assert!(forum_topic_title(&format!("{limit}я")).is_err());
+        assert!(forum_topic_title("а\nб").is_err());
+        assert!(forum_topic_title(" ").is_err());
     }
 
     #[test]

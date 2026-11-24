@@ -1,6 +1,7 @@
 mod admin_log;
 mod chat_addresses;
 mod create_chat;
+mod forum_management;
 mod forum_topics;
 mod group_permissions;
 mod invite_members;

@@ -5,14 +5,14 @@ use crate::model::{
     ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
     BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, CreatedChat,
-    FORUM_PAGE_SIZE, ForumCursor, ForumPage, ForumTopic, GENERAL_TOPIC, GroupPermission,
-    GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
-    InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest,
-    JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
-    MemberModeration, MemberPage, MemberRestriction, MemberRestrictionEdit,
-    MemberRestrictionSettings, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
-    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
-    restriction_now,
+    FORUM_PAGE_SIZE, ForumCursor, ForumPage, ForumPermissions, ForumTopic, ForumTopicChange,
+    ForumWrite, ForumWriteResult, GENERAL_TOPIC, GroupPermission, GroupPermissionSettings,
+    GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink,
+    InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor,
+    JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
+    MemberRestriction, MemberRestrictionEdit, MemberRestrictionSettings, MemberRole, Message,
+    NewChatDraft, NewChatKind, NewChatResult, PeerProfile, PlayableMedia, PlaybackProgress,
+    PlaybackSource, PollDraft, TextLink, forum_topic_title, restriction_now,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -1000,7 +1000,7 @@ pub fn blocked_page(ids: &[i64], offset: i32) -> crate::model::BlockedPage {
     }
 }
 
-pub fn forum_topic(id: i32) -> Option<ForumTopic> {
+fn forum_topic(id: i32) -> Option<ForumTopic> {
     let title = match id {
         GENERAL_TOPIC => "Общая".into(),
         100 => "Инфраструктура".into(),
@@ -1020,28 +1020,126 @@ pub fn forum_topic(id: i32) -> Option<ForumTopic> {
         closed: id == 300,
         hidden: false,
         pinned: id == GENERAL_TOPIC,
+        mine: id == 200,
     })
 }
 
-pub fn forum_topics(cursor: ForumCursor) -> ForumPage {
-    let all = [GENERAL_TOPIC, 100, 200, 300]
-        .into_iter()
-        .chain(301..=342)
-        .collect::<Vec<_>>();
-    let start = all
-        .iter()
-        .position(|&topic| topic == cursor.topic)
-        .map_or(0, |index| index + 1);
-    let end = (start + FORUM_PAGE_SIZE).min(all.len());
-    let topics = all[start..end]
-        .iter()
-        .filter_map(|&topic| forum_topic(topic))
-        .collect();
-    let next = (end < all.len()).then(|| ForumCursor {
-        topic: all[end - 1],
-        ..ForumCursor::default()
-    });
-    ForumPage { topics, next }
+const FORUM_PERMISSIONS: ForumPermissions = ForumPermissions {
+    create: true,
+    manage: true,
+    delete_messages: true,
+};
+
+#[derive(Default)]
+pub struct ForumTopics {
+    edits: HashMap<i32, Option<ForumTopic>>,
+    created: HashMap<i64, i32>,
+}
+
+impl ForumTopics {
+    pub fn topic(&self, id: i32) -> Option<ForumTopic> {
+        self.edits
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| forum_topic(id))
+    }
+
+    pub fn page(&self, cursor: ForumCursor) -> ForumPage {
+        let mut all: Vec<_> = [GENERAL_TOPIC, 100, 200, 300]
+            .into_iter()
+            .chain(301..=342)
+            .chain(self.created.values().copied())
+            .filter_map(|id| self.topic(id))
+            .collect();
+        all.sort_by_key(|topic| {
+            (
+                !topic.pinned,
+                if topic.id >= 1000 {
+                    -topic.id
+                } else {
+                    topic.id
+                },
+            )
+        });
+        let start = all
+            .iter()
+            .position(|topic| topic.id == cursor.topic)
+            .map_or(0, |index| index + 1);
+        let end = (start + FORUM_PAGE_SIZE).min(all.len());
+        let next = (end < all.len()).then(|| ForumCursor {
+            topic: all[end - 1].id,
+            ..ForumCursor::default()
+        });
+        ForumPage {
+            topics: all[start..end].to_vec(),
+            next,
+            permissions: Some(FORUM_PERMISSIONS),
+        }
+    }
+
+    pub fn write(&mut self, write: ForumWrite) -> anyhow::Result<ForumWriteResult> {
+        match write {
+            ForumWrite::Create { title, random_id } => {
+                if let Some(&id) = self.created.get(&random_id) {
+                    return Ok(self.topic(id).map_or(
+                        ForumWriteResult::CreationUnconfirmed,
+                        ForumWriteResult::Created,
+                    ));
+                }
+                let title = forum_topic_title(&title)?;
+                let id = 1000 + i32::try_from(self.created.len())?;
+                let topic = ForumTopic {
+                    id,
+                    title,
+                    unread: 0,
+                    closed: false,
+                    hidden: false,
+                    pinned: false,
+                    mine: true,
+                };
+                self.created.insert(random_id, id);
+                self.edits.insert(id, Some(topic.clone()));
+                Ok(ForumWriteResult::Created(topic))
+            }
+            ForumWrite::Change { original, change } => {
+                let id = original.id;
+                let mut topic = match self.topic(id) {
+                    Some(topic) => topic,
+                    None if id > GENERAL_TOPIC && matches!(change, ForumTopicChange::Delete) => {
+                        return Ok(ForumWriteResult::Deleted(id));
+                    }
+                    None => anyhow::bail!("Тема больше недоступна"),
+                };
+                anyhow::ensure!(
+                    FORUM_PERMISSIONS.allows(&topic, &change),
+                    "Нет права менять тему"
+                );
+                if !change.needs_write(&original, &topic)? {
+                    return Ok(ForumWriteResult::Updated(topic));
+                }
+                match change {
+                    ForumTopicChange::Rename(title) => topic.title = forum_topic_title(&title)?,
+                    ForumTopicChange::Closed(closed) => {
+                        topic.closed = closed;
+                        if !closed {
+                            topic.hidden = false;
+                        }
+                    }
+                    ForumTopicChange::Hidden(hidden) => {
+                        topic.hidden = hidden;
+                        topic.closed |= hidden;
+                    }
+                    ForumTopicChange::Pinned(pinned) => topic.pinned = pinned,
+                    ForumTopicChange::Delete => {
+                        self.edits.insert(id, None);
+                        return Ok(ForumWriteResult::Deleted(id));
+                    }
+                }
+                self.edits.insert(id, Some(topic.clone()));
+                Ok(ForumWriteResult::Updated(topic))
+            }
+        }
+    }
 }
 
 pub fn history(chat: i64) -> Vec<Message> {

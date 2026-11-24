@@ -23,8 +23,8 @@ use crate::model::{
     redact_spoilers,
 };
 use crate::model::{
-    ChatInfo, Conversation, ForumTopic, GENERAL_TOPIC, GroupPermissionEdit, GroupPermissions,
-    PlayableMedia, slow_mode_change,
+    ChatInfo, Conversation, ForumTopic, ForumWriteResult, GENERAL_TOPIC, GroupPermissionEdit,
+    GroupPermissions, PlayableMedia, slow_mode_change,
 };
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
@@ -179,6 +179,7 @@ struct Ui {
     history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     demo_read_topics: Rc<RefCell<HashSet<Conversation>>>,
+    demo_forums: Rc<RefCell<demo::ForumTopics>>,
     demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<Conversation, FormattedText>>,
     uploads: RefCell<HashMap<Conversation, Vec<Upload>>>,
@@ -704,6 +705,7 @@ pub fn open(
         history_refreshed: Cell::new(None),
         demo_messages: RefCell::new(HashMap::new()),
         demo_read_topics: Rc::new(RefCell::new(HashSet::new())),
+        demo_forums: Rc::new(RefCell::new(demo::ForumTopics::default())),
         demo_next_message: Cell::new(200),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
@@ -3703,10 +3705,8 @@ impl Ui {
         else {
             return;
         };
-        let generation = self.generation.get();
-        self.choose_forum_topic(chat, move |ui, topic| {
+        self.choose_forum_topic(chat, true, move |ui, topic| {
             if ui.selection.get() == Some(chat)
-                && ui.generation.get() == generation
                 && let Some(chat) = ui.chat_view(chat)
             {
                 ui.show_conversation(chat, Some(topic), None);
@@ -3717,6 +3717,7 @@ impl Ui {
     fn choose_forum_topic(
         self: &Rc<Self>,
         chat: i64,
+        manage: bool,
         choose: impl Fn(&Rc<Self>, ForumTopic) + 'static,
     ) {
         if self.chat_dialog_open() {
@@ -3728,13 +3729,40 @@ impl Ui {
         let demo = self.is_demo.get();
         let client = self.client.borrow().clone();
         let read_topics = self.demo_read_topics.clone();
+        let demo_forums = self.demo_forums.clone();
+        let management = manage.then(|| {
+            let client = client.clone();
+            let demo_forums = demo_forums.clone();
+            crate::forum_topics::Management {
+                write: Box::new(move |write| {
+                    let client = client.clone();
+                    let write = if demo {
+                        let result = demo_forums.borrow_mut().write(write);
+                        return Box::pin(async move { result });
+                    } else {
+                        write
+                    };
+                    Box::pin(async move {
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .write_forum_topic(chat, write)
+                            .await
+                    })
+                }),
+                changed: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |result| ui.apply_forum_change(chat, result)
+                )),
+            }
+        });
         let picker = crate::forum_topics::open(
             &window,
             self.runtime.clone(),
             move |cursor| {
                 let client = client.clone();
                 let sample = demo.then(|| {
-                    let mut page = demo::forum_topics(cursor);
+                    let mut page = demo_forums.borrow().page(cursor);
                     let read = read_topics.borrow();
                     for topic in &mut page.topics {
                         if read.contains(&Conversation {
@@ -3756,6 +3784,7 @@ impl Ui {
                         .await
                 })
             },
+            management,
             glib::clone!(
                 #[weak(rename_to = ui)]
                 self,
@@ -3763,6 +3792,67 @@ impl Ui {
             ),
         );
         self.topic_picker.set(Some(&picker));
+    }
+
+    fn apply_forum_change(self: &Rc<Self>, chat: i64, result: &ForumWriteResult) {
+        match result {
+            ForumWriteResult::Updated(topic) => {
+                let target = Conversation {
+                    chat,
+                    topic: Some(topic.id),
+                };
+                if self.conversation() == Some(target) {
+                    self.title.set_subtitle(&topic.title);
+                    self.selected_topic.replace(Some(topic.clone()));
+                    self.set_chat_writability(
+                        self.chat_view(chat).is_some_and(|chat| chat.can_write),
+                    );
+                }
+            }
+            ForumWriteResult::Deleted(id) => {
+                let target = Conversation {
+                    chat,
+                    topic: Some(*id),
+                };
+                if self.conversation() == Some(target)
+                    && let Some(chat) = self.chat_view(chat)
+                {
+                    self.show_conversation(chat, None, None);
+                }
+                self.history_cache.borrow_mut().remove_conversation(target);
+                self.drafts.borrow_mut().remove(&target);
+                self.replies.borrow_mut().remove(&target);
+                self.uploads.borrow_mut().remove(&target);
+                if self.is_demo.get() {
+                    self.demo_read_topics.borrow_mut().remove(&target);
+                    let mut histories = self.demo_messages.borrow_mut();
+                    let history = histories.entry(chat).or_insert_with(|| demo::history(chat));
+                    history.retain(|message| message.topic != target.topic);
+                    if let Some(view) = self
+                        .chats
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|item| item.id == chat)
+                    {
+                        let last = history.last();
+                        view.preview = last.map_or_else(String::new, |message| {
+                            message.preview_text().into_owned()
+                        });
+                        view.preview_sender = last.map(|message| message.sender.clone());
+                        view.preview_image = last.and_then(|message| {
+                            message
+                                .thumbnail
+                                .map(|media| ChatImage::attachment(chat, message.id, media))
+                        });
+                        view.last_message_id = last.map_or(0, |message| message.id);
+                    }
+                    drop(histories);
+                    self.render_chats();
+                }
+            }
+            ForumWriteResult::Created(_) | ForumWriteResult::CreationUnconfirmed => {}
+        }
+        self.refresh_chats();
     }
 
     fn open_forum_message(self: &Rc<Self>, chat: i64, topic: Option<i32>, anchor: i32) {
@@ -3779,7 +3869,8 @@ impl Ui {
                     .find(|message| message.id == anchor)
                     .map(|message| message.topic.unwrap_or(GENERAL_TOPIC))
             });
-            if let Some(topic) = topic.and_then(demo::forum_topic) {
+            let topic = topic.and_then(|id| self.demo_forums.borrow().topic(id));
+            if let Some(topic) = topic {
                 self.show_conversation(view, Some(topic), Some(anchor));
             }
             return;
@@ -6167,7 +6258,7 @@ impl Ui {
                 return;
             };
             if ui.chat_view(chat).is_some_and(|chat| chat.forum) {
-                ui.choose_forum_topic(chat, move |ui, topic| {
+                ui.choose_forum_topic(chat, false, move |ui, topic| {
                     if topic.closed {
                         ui.toast("Тема закрыта");
                     } else {
