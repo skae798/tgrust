@@ -16,6 +16,7 @@ mod join_requests;
 mod links;
 mod media_stream;
 mod media_viewer;
+mod member_restrictions;
 mod model;
 mod new_chat;
 mod own_profile;

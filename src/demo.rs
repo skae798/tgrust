@@ -8,8 +8,10 @@ use crate::model::{
     GroupPermission, GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction,
     InviteCursor, InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome,
     JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
-    MemberModeration, MemberPage, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
+    MemberModeration, MemberPage, MemberRestriction, MemberRestrictionEdit,
+    MemberRestrictionSettings, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
     PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
+    restriction_now,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -21,6 +23,7 @@ pub const OWN_AVATAR: Avatar = Avatar {
 pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
 pub const SLOW_MODE_GROUP: i64 = 8;
+pub const MODERATION_GROUP: i64 = 9;
 pub const SLOW_MODE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
@@ -42,6 +45,13 @@ pub fn chats() -> Vec<Chat> {
             0,
             false,
         ),
+        (
+            MODERATION_GROUP,
+            "Демо модерации",
+            "Разрешения и ограничения участников",
+            0,
+            false,
+        ),
     ]
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
@@ -50,13 +60,14 @@ pub fn chats() -> Vec<Chat> {
         last_activity: now() - id,
         title: title.to_owned(),
         preview: preview.to_owned(),
-        preview_sender: matches!(id, 1 | 6 | SLOW_MODE_GROUP).then(|| "Анна".to_owned()),
+        preview_sender: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP)
+            .then(|| "Анна".to_owned()),
         preview_image: history(id).last().and_then(|message| {
             message
                 .thumbnail
                 .map(|media| ChatImage::attachment(id, message.id, media))
         }),
-        group: matches!(id, 1 | 6 | SLOW_MODE_GROUP),
+        group: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP),
         unread,
         unread_mark: false,
         last_message_id: history(id).last().map_or(0, |message| message.id),
@@ -71,7 +82,7 @@ pub fn chats() -> Vec<Chat> {
         }),
         archived: id == 3,
         kind: match id {
-            1 | 6 | SLOW_MODE_GROUP => ChatKind::Group,
+            1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP => ChatKind::Group,
             3 => ChatKind::Broadcast,
             7 => ChatKind::Bot,
             _ => ChatKind::User,
@@ -164,6 +175,9 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             SLOW_MODE_GROUP => {
                 "В этой демонстрационной группе участники отправляют сообщения раз в 10 секунд."
             }
+            MODERATION_GROUP => {
+                "В этой демонстрационной супергруппе можно менять разрешения и ограничения."
+            }
             _ => "Объявления и новости проекта. Демонстрационный канал.",
         }
         .to_owned(),
@@ -174,18 +188,19 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
                 6 => "@demo_tgrust_polls",
                 7 => "@demo_tgrust_bot",
                 SLOW_MODE_GROUP => "@demo_tgrust_slow_mode",
+                MODERATION_GROUP => "@demo_tgrust_moderation",
                 _ => "@demo_tgrust_news",
             }
             .to_owned(),
         ],
         phone: chat.saved_messages.then(|| "+00000000000".to_owned()),
-        members: matches!(id, 1 | 3 | 6).then_some(if id == 6 { 8 } else { 45 }),
+        members: matches!(id, 1 | 3 | 6 | MODERATION_GROUP).then_some(if id == 6 { 8 } else { 45 }),
         online_members: matches!(id, 1 | 6).then_some(2),
         verified: id == 3,
         scam: false,
         fake: false,
         can_edit_chat: matches!(id, 1 | 3),
-        can_view_members: matches!(id, 1 | 3 | 6),
+        can_view_members: matches!(id, 1 | 3 | 6 | MODERATION_GROUP),
         moderation: demo_moderation(id),
         admin_policy: demo_admin_policy(id),
         can_manage_invites: matches!(id, 1 | 3),
@@ -206,7 +221,14 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
                 },
             ],
         }),
-        group_permissions: (id == 1).then(|| group_permissions(GroupPermissions::all(), false)),
+        group_permissions: match id {
+            1 => Some(group_permissions(GroupPermissions::all(), false)),
+            MODERATION_GROUP => Some(GroupPermissionSettings {
+                slow_mode: Some(0),
+                ..group_permissions(GroupPermissions::all(), false)
+            }),
+            _ => None,
+        },
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -535,6 +557,7 @@ impl JoinRequests {
 #[derive(Default)]
 pub struct MemberChanges {
     moderation: HashMap<(i64, i64), MemberChange>,
+    restrictions: HashMap<(i64, i64), MemberRestriction>,
     invited: HashMap<(i64, i64), Contact>,
 }
 
@@ -685,7 +708,7 @@ pub fn admin_log(chat: i64, query: AdminLogQuery, before: Option<i64>) -> AdminL
 fn demo_moderation(chat: i64) -> Option<MemberModeration> {
     match chat {
         1 => Some(MemberModeration::Remove),
-        3 => Some(MemberModeration::Ban),
+        3 | MODERATION_GROUP => Some(MemberModeration::Ban),
         _ => None,
     }
 }
@@ -717,11 +740,74 @@ fn demo_member_role(chat: i64, member: i64, changes: &MemberChanges) -> Option<M
         2 => MemberRole::Administrator,
         3..=8 => MemberRole::Member,
         9..=45 if chat != 6 => MemberRole::Member,
-        46..=47 if chat == 3 => MemberRole::Banned,
+        46..=47 if matches!(chat, 3 | MODERATION_GROUP) => MemberRole::Banned,
         _ if changes.invited.contains_key(&(chat, member)) => MemberRole::Member,
         _ => return None,
     };
-    Some(role)
+    Some(
+        if role == MemberRole::Member && personal_restriction(changes, chat, member).active() {
+            MemberRole::Restricted
+        } else {
+            role
+        },
+    )
+}
+
+fn personal_restriction(changes: &MemberChanges, chat: i64, member: i64) -> MemberRestriction {
+    let personal = changes
+        .restrictions
+        .get(&(chat, member))
+        .copied()
+        .unwrap_or_else(|| {
+            if chat == MODERATION_GROUP && member == 5 {
+                MemberRestriction {
+                    allowed: GroupPermissions::all().with(GroupPermission::Voice, false),
+                    ..MemberRestriction::default()
+                }
+            } else {
+                MemberRestriction::default()
+            }
+        });
+    if personal.until == 0 || personal.until > restriction_now() {
+        personal
+    } else {
+        MemberRestriction::default()
+    }
+}
+
+pub fn member_restriction(
+    changes: &MemberChanges,
+    chat: i64,
+    member: i64,
+    allowed: GroupPermissions,
+) -> anyhow::Result<MemberRestrictionSettings> {
+    anyhow::ensure!(
+        chat == MODERATION_GROUP
+            && matches!(
+                demo_member_role(chat, member, changes),
+                Some(MemberRole::Member | MemberRole::Restricted)
+            ),
+        "Ограничения участника недоступны"
+    );
+    Ok(MemberRestrictionSettings {
+        group: group_permissions(allowed, false),
+        personal: personal_restriction(changes, chat, member),
+    })
+}
+
+pub fn edit_member_restriction(
+    changes: &mut MemberChanges,
+    chat: i64,
+    member: i64,
+    allowed: GroupPermissions,
+    original: MemberRestrictionSettings,
+    edit: MemberRestrictionEdit,
+) -> anyhow::Result<()> {
+    let current = member_restriction(changes, chat, member, allowed)?;
+    if let Some(next) = current.prepare(original, edit, restriction_now())? {
+        changes.restrictions.insert((chat, member), next);
+    }
+    Ok(())
 }
 
 fn demo_admin_state(chat: i64, member: i64, changes: &MemberChanges) -> Option<AdminState> {
@@ -772,13 +858,18 @@ pub fn change_member(
         "Это действие с участником недоступно"
     );
     changes.moderation.insert((chat, member), change);
+    if change == MemberChange::Ban {
+        changes
+            .restrictions
+            .insert((chat, member), MemberRestriction::default());
+    }
     Ok(())
 }
 
 pub fn member_count(chat: i64, changes: &MemberChanges) -> u32 {
     member_ids(chat, changes)
         .filter_map(|id| demo_member_role(chat, id, changes))
-        .filter(|role| *role != MemberRole::Banned)
+        .filter(|role| role.in_chat())
         .count() as u32
 }
 
@@ -968,6 +1059,7 @@ pub fn history(chat: i64) -> Vec<Message> {
         ],
         3 => vec![("Новости проекта", "Опубликован план на неделю", false, None)],
         7 => vec![("Бот проекта", "Доступные команды проекта", false, None)],
+        MODERATION_GROUP => vec![("Анна", "Разрешения и ограничения участников", false, None)],
         SLOW_MODE_GROUP => vec![(
             "Анна",
             "Интервал между сообщениями — 10 секунд",

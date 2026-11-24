@@ -439,6 +439,10 @@ impl GroupPermissions {
         let bit = 1 << permission as u32;
         Self((self.0 & !bit) | if enabled { bit } else { 0 })
     }
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1117,6 +1121,7 @@ pub enum MemberFilter {
     All,
     Admins,
     Bots,
+    Restricted,
     Banned,
 }
 
@@ -1125,7 +1130,22 @@ pub enum MemberRole {
     Owner,
     Administrator,
     Member,
+    Restricted,
+    RestrictedFormer,
     Banned,
+}
+
+impl MemberRole {
+    pub fn restricted(self) -> bool {
+        matches!(self, Self::Restricted | Self::RestrictedFormer)
+    }
+
+    pub fn in_chat(self) -> bool {
+        matches!(
+            self,
+            Self::Owner | Self::Administrator | Self::Member | Self::Restricted
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1308,7 +1328,7 @@ impl MemberModeration {
     pub fn action(self, role: MemberRole) -> Option<MemberChange> {
         match (self, role) {
             (Self::Remove, MemberRole::Member) => Some(MemberChange::Remove),
-            (Self::Ban, MemberRole::Member) => Some(MemberChange::Ban),
+            (Self::Ban, MemberRole::Member | MemberRole::Restricted) => Some(MemberChange::Ban),
             (Self::Ban, MemberRole::Banned) => Some(MemberChange::Unban),
             _ => None,
         }
@@ -1329,12 +1349,147 @@ pub struct ChatMember {
 impl MemberFilter {
     pub fn includes(self, member: &ChatMember) -> bool {
         match self {
-            Self::All => member.role != MemberRole::Banned,
+            Self::All => member.role.in_chat(),
             Self::Admins => matches!(member.role, MemberRole::Owner | MemberRole::Administrator),
-            Self::Bots => member.bot && member.role != MemberRole::Banned,
+            Self::Bots => member.bot && member.role.in_chat(),
+            Self::Restricted => member.role.restricted(),
             Self::Banned => member.role == MemberRole::Banned,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberRestriction {
+    pub allowed: GroupPermissions,
+    pub until: i32,
+    pub other_flags: bool,
+}
+
+impl Default for MemberRestriction {
+    fn default() -> Self {
+        Self {
+            allowed: GroupPermissions::all(),
+            until: 0,
+            other_flags: false,
+        }
+    }
+}
+
+impl MemberRestriction {
+    pub fn active(self) -> bool {
+        self.other_flags || self.allowed != GroupPermissions::all()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MemberRestrictionSettings {
+    pub group: GroupPermissionSettings,
+    pub personal: MemberRestriction,
+}
+
+#[derive(Clone, Copy)]
+pub enum MemberRestrictionEdit {
+    Save {
+        allowed: GroupPermissions,
+        until: Option<i32>,
+    },
+    Clear,
+}
+
+impl MemberRestrictionSettings {
+    pub fn view(self) -> GroupPermissionSettings {
+        use GroupPermission::{LinkPreviews, Text, Topics};
+        let allowed = self.group.allowed.intersect(self.personal.allowed);
+        GroupPermissionSettings {
+            allowed: allowed.with(LinkPreviews, allowed.has(Text) && allowed.has(LinkPreviews)),
+            editable: self
+                .group
+                .allowed
+                .with(Topics, self.group.forum && self.group.allowed.has(Topics)),
+            slow_mode: None,
+            ..self.group
+        }
+    }
+
+    pub fn prepare(
+        self,
+        original: Self,
+        edit: MemberRestrictionEdit,
+        now: i32,
+    ) -> anyhow::Result<Option<MemberRestriction>> {
+        use GroupPermission::{LinkPreviews, Text};
+        let mut next = self.personal;
+        match edit {
+            MemberRestrictionEdit::Clear => {
+                if self.personal.active() {
+                    anyhow::ensure!(
+                        original.personal == self.personal,
+                        "Ограничения участника изменились. Откройте редактор снова"
+                    );
+                }
+                next = MemberRestriction::default();
+            }
+            MemberRestrictionEdit::Save { allowed, until } => {
+                let original_view = original.view();
+                let current_view = self.view();
+                let text_changed = original_view.allowed.has(Text) != allowed.has(Text);
+                for (permission, _) in GroupPermission::OPTIONS {
+                    let enabled = allowed.has(permission);
+                    let changed = original_view.allowed.has(permission) != enabled;
+                    let set_previews = permission == LinkPreviews
+                        && text_changed
+                        && allowed.has(Text)
+                        && original_view.editable.has(LinkPreviews);
+                    if !changed && !set_previews {
+                        continue;
+                    }
+                    if permission == LinkPreviews && !allowed.has(Text) && !enabled {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        original_view.editable.has(permission)
+                            && current_view.editable.has(permission),
+                        "Общие разрешения изменились. Откройте редактор снова"
+                    );
+                    next.allowed = next.allowed.with(permission, enabled);
+                }
+                if self.personal.allowed.has(Text) && !next.allowed.has(Text) {
+                    next.allowed = next.allowed.with(LinkPreviews, false);
+                }
+                if allowed.has(LinkPreviews)
+                    && !current_view.allowed.has(LinkPreviews)
+                    && original_view.allowed.has(LinkPreviews) != allowed.has(LinkPreviews)
+                {
+                    anyhow::ensure!(
+                        next.allowed.has(Text) && self.group.allowed.has(Text),
+                        "Для предпросмотра ссылок нужна отправка текста"
+                    );
+                }
+                if !next.active() {
+                    next = MemberRestriction::default();
+                } else if let Some(until) = until {
+                    next.until = until;
+                }
+            }
+        }
+        if next == self.personal {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            next.until == 0
+                || (30..=366 * 86_400).contains(&(i64::from(next.until) - i64::from(now))),
+            "Укажите новый срок. Telegram принимает от 30 секунд до 366 дней"
+        );
+        Ok(Some(next))
+    }
+}
+
+pub fn restriction_now() -> i32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|now| i32::try_from(now.as_secs()).ok())
+        .unwrap_or(i32::MAX)
 }
 
 pub struct MemberPage {

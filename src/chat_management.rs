@@ -171,8 +171,14 @@ pub struct MembersContext {
     pub load: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub avatar: AvatarLoader,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
+    pub restrictions: Option<MemberRestrictionsContext>,
     pub invite: Option<crate::invite_members::OpenInvite>,
     pub refresh_profile: Box<dyn Fn()>,
+}
+
+pub struct MemberRestrictionsContext {
+    pub load: crate::member_restrictions::Load,
+    pub save: crate::member_restrictions::Save,
 }
 
 pub fn members(
@@ -203,6 +209,9 @@ pub fn members(
         ]);
     } else if admin_policy.is_some() {
         choices.push((MemberFilter::Admins, "Администраторы"));
+    }
+    if context.restrictions.is_some() {
+        choices.push((MemberFilter::Restricted, "С ограничениями"));
     }
     if moderation == Some(MemberModeration::Ban) {
         choices.push((MemberFilter::Banned, "Заблокированные"));
@@ -406,6 +415,8 @@ impl Members {
                 MemberRole::Owner => "Владелец",
                 MemberRole::Administrator => "Администратор",
                 MemberRole::Member => "Участник",
+                MemberRole::Restricted => "Ограничен",
+                MemberRole::RestrictedFormer => "Ограничен · вне группы",
                 MemberRole::Banned => "Заблокирован",
             };
             row.set_subtitle(&if member.bot {
@@ -418,6 +429,27 @@ impl Members {
                 (self.context.avatar)(&avatar, photo);
             }
             row.add_prefix(&avatar);
+            if self.context.restrictions.is_some()
+                && member.can_update
+                && member.id > 0
+                && (member.role == MemberRole::Member || member.role.restricted())
+            {
+                let button = gtk::Button::from_icon_name("changes-prevent-symbolic");
+                button.set_valign(gtk::Align::Center);
+                button.set_tooltip_text(Some("Ограничения участника"));
+                button.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "Ограничения — {}",
+                    member.name
+                ))]);
+                let name = member.name.clone();
+                let id = member.id;
+                button.connect_clicked(glib::clone!(
+                    #[weak(rename_to = state)]
+                    self,
+                    move |button| state.edit_restriction(button, id, name.clone())
+                ));
+                row.add_suffix(&button);
+            }
             if member.can_update
                 && let Some(action) = self.moderation.and_then(|mode| mode.action(member.role))
             {
@@ -677,6 +709,65 @@ impl Members {
             match result {
                 Ok(()) => state.reset(),
                 Err(error) => state.set_status(&format!("Не удалось изменить участника. {error}")),
+            }
+        });
+    }
+
+    fn edit_restriction(self: &Rc<Self>, button: &gtk::Button, id: i64, name: String) {
+        let Some(context) = self.context.restrictions.as_ref() else {
+            return;
+        };
+        if self.closed.get() || self.task.borrow().is_some() || self.writing.replace(true) {
+            return;
+        }
+        self.set_controls_sensitive(false);
+        self.set_status("Загрузка ограничений…");
+        let task = self.context.runtime.spawn((context.load)(id));
+        let state = self.clone();
+        let button = button.downgrade();
+        glib::spawn_future_local(async move {
+            let result = task
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result);
+            state.writing.set(false);
+            let Some(button) = button.upgrade().filter(|_| !state.closed.get()) else {
+                return;
+            };
+            state.set_controls_sensitive(true);
+            match result {
+                Ok(original) => {
+                    state.set_status("");
+                    let save = Rc::downgrade(&state);
+                    let refresh = save.clone();
+                    crate::member_restrictions::open(
+                        &button,
+                        state.context.runtime.clone(),
+                        &name,
+                        original,
+                        move |edit| {
+                            if let Some(state) = save.upgrade()
+                                && let Some(context) = state.context.restrictions.as_ref()
+                            {
+                                (context.save)(id, original, edit)
+                            } else {
+                                Box::pin(async {
+                                    anyhow::bail!("Список участников закрыт")
+                                })
+                            }
+                        },
+                        move || {
+                            if let Some(state) = refresh.upgrade() {
+                                state.changed.set(true);
+                                state.filters.grab_focus();
+                                state.reset();
+                            }
+                        },
+                    );
+                }
+                Err(error) => {
+                    state.set_status(&format!("Не удалось получить ограничения. {error}"))
+                }
             }
         });
     }
