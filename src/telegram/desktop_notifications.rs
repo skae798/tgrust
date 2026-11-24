@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use grammers_client::peer::Peer;
@@ -13,16 +13,36 @@ use crate::model::{ChatKind, IncomingMessage};
 
 pub(crate) struct PendingNotification {
     message: IncomingMessage,
-    discussion: Option<Discussion>,
+    channel: Option<ChannelHint>,
+    reply_root: Option<i32>,
+    addressed: bool,
 }
 
-struct Discussion {
-    root: i32,
-    addressed: bool,
+#[derive(Clone, Copy)]
+struct ChannelHint {
+    member: Option<bool>,
+    linked_group: bool,
+}
+
+impl ChannelHint {
+    fn from_channel(channel: &types::Channel) -> Self {
+        Self {
+            // A minimal record does not carry reliable membership information.
+            member: (!channel.min).then_some(!channel.left),
+            linked_group: channel.megagroup && channel.has_link,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ChannelAudience {
+    member: bool,
+    source: Option<i64>,
 }
 
 #[derive(Default)]
 pub(crate) struct NotificationFilter {
+    channels: HashMap<i64, (Instant, ChannelAudience)>,
     // The origin of an existing thread does not change. Mute settings are checked separately.
     origins: HashMap<(i64, i32), Option<i64>>,
 }
@@ -49,14 +69,14 @@ pub(super) fn notification_for(
         return None;
     }
     let peer = message.peer()?;
-    if matches!(peer, Peer::User(user) if user.is_self()) {
-        return None;
-    }
-    let group = match peer {
+    let channel = match peer {
+        Peer::User(user) if user.is_self() => return None,
         Peer::Group(group) => match &group.raw {
-            enums::Chat::Channel(raw) if raw.megagroup => Some(raw.has_link),
-            _ => None,
+            enums::Chat::Channel(raw) => Some(ChannelHint::from_channel(raw)),
+            enums::Chat::Chat(raw) if !raw.left && !raw.deactivated => None,
+            _ => return None,
         },
+        Peer::Channel(channel) => Some(ChannelHint::from_channel(&channel.raw)),
         _ => None,
     };
     candidate(
@@ -64,7 +84,7 @@ pub(super) fn notification_for(
         message.peer_id().bot_api_dialog_id()?,
         peer.name().unwrap_or("Telegram"),
         chat_kind(peer),
-        group,
+        channel,
     )
 }
 
@@ -73,32 +93,37 @@ fn candidate(
     chat: i64,
     title: &str,
     kind: ChatKind,
-    linked_group: Option<bool>,
+    channel: Option<ChannelHint>,
 ) -> Option<PendingNotification> {
     // A channel post has its own notification. Its automatic copy is only the thread root.
-    if linked_group.is_some_and(|linked| discussion_origin(raw, chat, linked).is_some()) {
+    if kind == ChatKind::Group
+        && channel.is_some_and(|hint| discussion_origin(raw, chat, hint.linked_group).is_some())
+    {
         return None;
     }
-    let discussion = if linked_group == Some(true)
-        && let Some(enums::MessageReplyHeader::Header(reply)) = &raw.reply_to
-        && !reply.forum_topic
-        && reply
-            .reply_to_peer_id
-            .as_ref()
-            .is_none_or(|peer| channel_dialog_id(peer) == Some(chat))
-    {
-        reply
-            .reply_to_top_id
-            .or(reply.reply_to_msg_id)
-            .filter(|&root| root > 0 && root != raw.id)
-            .map(|root| Discussion {
-                root,
-                // Telegram includes direct replies to the current account in this flag.
-                addressed: raw.mentioned,
-            })
-    } else {
-        None
+    let reply_root = match &raw.reply_to {
+        Some(enums::MessageReplyHeader::Header(reply))
+            if kind == ChatKind::Group
+                && !reply.forum_topic
+                && reply
+                    .reply_to_peer_id
+                    .as_ref()
+                    .is_none_or(|peer| channel_dialog_id(peer) == Some(chat)) =>
+        {
+            reply
+                .reply_to_top_id
+                .or(reply.reply_to_msg_id)
+                .filter(|&root| root > 0 && root != raw.id)
+        }
+        _ => None,
     };
+    // Telegram includes replies to the current account in the mention flag.
+    let addressed = raw.mentioned;
+    if channel.is_some_and(|hint| {
+        hint.member == Some(false) && (!hint.linked_group || !addressed || reply_root.is_none())
+    }) {
+        return None;
+    }
     Some(PendingNotification {
         message: IncomingMessage {
             chat,
@@ -107,7 +132,9 @@ fn candidate(
             title: title.to_owned(),
             kind,
         },
-        discussion,
+        channel,
+        reply_root,
+        addressed,
     })
 }
 
@@ -147,6 +174,7 @@ impl Telegram {
         filter
             .resolve(
                 pending,
+                |chat| self.notification_audience(chat),
                 |chat, root| async move {
                     let peer = self.notification_peer(chat).await?;
                     Ok(self
@@ -159,9 +187,61 @@ impl Telegram {
             .await
     }
 
+    async fn notification_audience(&self, chat: i64) -> Result<ChannelAudience> {
+        let peer = self.notification_peer(chat).await?;
+        let full = self.full_chat(peer).await?;
+        let enums::ChatFull::ChannelFull(details) = full.full_chat else {
+            anyhow::bail!("Telegram вернул другой тип чата");
+        };
+        let raw = full
+            .chats
+            .iter()
+            .find_map(|chat| match chat {
+                enums::Chat::Channel(raw) if Some(raw.id) == peer.id.bare_id() && !raw.min => {
+                    Some(raw)
+                }
+                _ => None,
+            })
+            .context("Telegram не подтвердил участие в чате")?;
+        let member = !raw.left;
+        let linked = if raw.megagroup {
+            details.linked_chat_id.and_then(PeerId::channel)
+        } else {
+            None
+        };
+        if let Some(linked) = linked
+            && let Some(source) = full.chats.into_iter().find_map(|chat| match chat {
+                enums::Chat::Channel(channel)
+                    if Some(channel.id) == linked.bare_id()
+                        && channel.broadcast
+                        && !channel.min =>
+                {
+                    Some(channel)
+                }
+                _ => None,
+            })
+            && let (Some(id), Some(auth)) = (linked.bot_api_dialog_id(), source.access_hash)
+        {
+            self.peers.write().await.insert(
+                id,
+                PeerRef {
+                    id: linked,
+                    auth: grammers_session::types::PeerAuth::from_hash(auth),
+                },
+            );
+        }
+        Ok(ChannelAudience {
+            member,
+            source: linked.and_then(PeerId::bot_api_dialog_id),
+        })
+    }
+
     async fn notification_peer(&self, chat: i64) -> Result<PeerRef> {
         let id = PeerId::from_bot_api_dialog_id(chat).context("Чат не найден")?;
-        self.session.peer_ref(id).await?.context("Чат не найден")
+        if let Some(peer) = self.session.peer_ref(id).await? {
+            return Ok(peer);
+        }
+        self.peer(chat).await
     }
 
     async fn notification_enabled(
@@ -205,54 +285,88 @@ impl Telegram {
 }
 
 impl NotificationFilter {
-    async fn resolve<Fetch, Enabled>(
+    async fn resolve<Audience, Fetch, Enabled>(
         &mut self,
         pending: PendingNotification,
+        mut lookup_audience: impl FnMut(i64) -> Audience,
         mut fetch_root: impl FnMut(i64, i32) -> Fetch,
         mut enabled: impl FnMut(i64, ChatKind, Option<(i64, i32)>) -> Enabled,
     ) -> Result<Option<IncomingMessage>>
     where
+        Audience: Future<Output = Result<ChannelAudience>>,
         Fetch: Future<Output = Result<Option<enums::Message>>>,
         Enabled: Future<Output = Result<bool>>,
     {
         let mut message = pending.message;
-        if let Some(discussion) = pending.discussion {
-            let key = (message.chat, discussion.root);
-            let channel = if let Some(channel) = self.origins.get(&key) {
-                *channel
-            } else {
-                let Some(root) = fetch_root(key.0, key.1).await? else {
-                    return Ok(None);
-                };
-                if root.id() != discussion.root {
-                    return Ok(None);
+        if let Some(hint) = pending.channel
+            && (hint.member.is_none() || hint.linked_group)
+        {
+            let audience = match self.channels.get(&message.chat) {
+                Some((checked, audience)) if checked.elapsed() < Duration::from_secs(60) => {
+                    *audience
                 }
-                let channel = match root {
-                    enums::Message::Message(raw)
-                        if channel_dialog_id(&raw.peer_id) == Some(message.chat) =>
-                    {
-                        discussion_origin(&raw, message.chat, true)
+                _ => {
+                    let audience = lookup_audience(message.chat).await?;
+                    if self.channels.len() >= 256 {
+                        self.channels.clear();
                     }
-                    enums::Message::Service(raw)
-                        if channel_dialog_id(&raw.peer_id) == Some(message.chat) =>
-                    {
-                        None
-                    }
-                    _ => return Ok(None),
-                };
-                if self.origins.len() >= 256 {
-                    self.origins.clear();
+                    self.channels
+                        .insert(message.chat, (Instant::now(), audience));
+                    audience
                 }
-                self.origins.insert(key, channel);
-                channel
             };
-            if let Some(channel) = channel {
-                if !discussion.addressed
-                    || !enabled(channel, ChatKind::Broadcast, Some(key)).await?
-                {
+            if !audience.member
+                && (audience.source.is_none() || !pending.addressed || pending.reply_root.is_none())
+            {
+                return Ok(None);
+            }
+            let mut source = audience.source;
+            let mut source_context = None;
+            if (audience.source.is_some() || hint.linked_group)
+                && let Some(root) = pending.reply_root
+            {
+                let key = (message.chat, root);
+                let origin = if let Some(origin) = self.origins.get(&key) {
+                    *origin
+                } else {
+                    let Some(message_root) = fetch_root(key.0, key.1).await? else {
+                        return Ok(None);
+                    };
+                    if message_root.id() != root {
+                        return Ok(None);
+                    }
+                    let origin = match message_root {
+                        enums::Message::Message(raw)
+                            if channel_dialog_id(&raw.peer_id) == Some(message.chat) =>
+                        {
+                            discussion_origin(&raw, message.chat, true)
+                        }
+                        enums::Message::Service(raw)
+                            if channel_dialog_id(&raw.peer_id) == Some(message.chat) =>
+                        {
+                            None
+                        }
+                        _ => return Ok(None),
+                    };
+                    if self.origins.len() >= 256 {
+                        self.origins.clear();
+                    }
+                    self.origins.insert(key, origin);
+                    origin
+                };
+                if let Some(origin) = origin {
+                    if !pending.addressed {
+                        return Ok(None);
+                    }
+                    source = Some(origin);
+                    source_context = Some(key);
+                }
+            }
+            if let Some(source) = source {
+                if !enabled(source, ChatKind::Broadcast, source_context).await? {
                     return Ok(None);
                 }
-                message.origin_channel = Some(channel);
+                message.origin_channel = Some(source);
             }
         }
         Ok(enabled(message.chat, message.kind, None)
@@ -356,7 +470,32 @@ mod tests {
     }
 
     fn pending(raw: &types::Message) -> Option<PendingNotification> {
-        candidate(raw, GROUP, "Группа обсуждения", ChatKind::Group, Some(true))
+        group_pending(raw, Some(true), true)
+    }
+
+    fn group_pending(
+        raw: &types::Message,
+        member: Option<bool>,
+        linked_group: bool,
+    ) -> Option<PendingNotification> {
+        candidate(
+            raw,
+            GROUP,
+            "Группа обсуждения",
+            ChatKind::Group,
+            Some(ChannelHint {
+                member,
+                linked_group,
+            }),
+        )
+    }
+
+    async fn linked_audience(chat: i64) -> Result<ChannelAudience> {
+        assert_eq!(chat, GROUP);
+        Ok(ChannelAudience {
+            member: true,
+            source: Some(SOURCE),
+        })
     }
 
     #[tokio::test]
@@ -364,6 +503,7 @@ mod tests {
         let notification = NotificationFilter::default()
             .resolve(
                 pending(&reply(true, true)).unwrap(),
+                linked_audience,
                 |chat, root| async move {
                     assert_eq!((chat, root), (GROUP, ROOT));
                     Ok(Some(automatic_post().into()))
@@ -389,6 +529,7 @@ mod tests {
         let comment = filter
             .resolve(
                 pending(&reply(false, false)).unwrap(),
+                linked_audience,
                 |_, root| async move {
                     assert_eq!(root, ROOT);
                     Ok(Some(automatic_post().into()))
@@ -402,11 +543,14 @@ mod tests {
         let normal_reply = NotificationFilter::default()
             .resolve(
                 pending(&reply(false, false)).unwrap(),
+                linked_audience,
                 |_, root| async move { Ok(Some(raw_message(root).into())) },
-                |chat, kind, root| async move {
-                    assert_eq!(chat, GROUP);
-                    assert!(kind == ChatKind::Group);
-                    assert_eq!(root, None);
+                |chat, kind, context| async move {
+                    assert!(
+                        (chat == GROUP && kind == ChatKind::Group)
+                            || (chat == SOURCE && kind == ChatKind::Broadcast)
+                    );
+                    assert_eq!(context, None);
                     Ok(true)
                 },
             )
@@ -414,7 +558,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(normal_reply.chat, GROUP);
-        assert_eq!(normal_reply.origin_channel, None);
+        assert_eq!(normal_reply.origin_channel, Some(SOURCE));
+    }
+
+    #[tokio::test]
+    async fn linked_channel_mute_also_covers_messages_without_a_post_root() {
+        for raw in [raw_message(23), reply(false, false)] {
+            let notification = NotificationFilter::default()
+                .resolve(
+                    pending(&raw).unwrap(),
+                    linked_audience,
+                    |_, root| async move {
+                        Ok(Some(
+                            types::MessageService {
+                                out: false,
+                                mentioned: false,
+                                media_unread: false,
+                                reactions_are_possible: false,
+                                silent: false,
+                                post: false,
+                                legacy: false,
+                                id: root,
+                                from_id: None,
+                                peer_id: PeerId::from_bot_api_dialog_id(GROUP).unwrap().into(),
+                                saved_peer_id: None,
+                                reply_to: None,
+                                date: 1,
+                                action: enums::MessageAction::Empty,
+                                reactions: None,
+                                ttl_period: None,
+                            }
+                            .into(),
+                        ))
+                    },
+                    |chat, _, _| async move { Ok(chat != SOURCE) },
+                )
+                .await
+                .unwrap();
+            assert!(
+                notification.is_none(),
+                "мута связанного канала недостаточно без корня поста"
+            );
+        }
     }
 
     #[tokio::test]
@@ -425,6 +610,7 @@ mod tests {
             let result = filter
                 .resolve(
                     pending(&reply(true, false)).unwrap(),
+                    linked_audience,
                     |_, _| {
                         fetches += 1;
                         async { Ok(Some(automatic_post().into())) }
@@ -439,6 +625,48 @@ mod tests {
             );
         }
         assert_eq!(fetches, 1);
+    }
+
+    #[tokio::test]
+    async fn nonmember_and_partial_group_records_do_not_emit_unaddressed_updates() {
+        for raw in [raw_message(23), reply(false, false), reply(false, true)] {
+            assert!(group_pending(&raw, Some(false), true).is_none());
+            let result = NotificationFilter::default()
+                .resolve(
+                    group_pending(&raw, None, false).unwrap(),
+                    |_| async {
+                        Ok(ChannelAudience {
+                            member: false,
+                            source: Some(SOURCE),
+                        })
+                    },
+                    |_, _| async { panic!("unaddressed updates need no thread lookup") },
+                    |_, _, _| async { panic!("unaddressed updates need no mute lookup") },
+                )
+                .await
+                .unwrap();
+            assert!(result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_member_in_a_regular_supergroup_keeps_group_notifications() {
+        let result = NotificationFilter::default()
+            .resolve(
+                group_pending(&reply(false, false), Some(true), false).unwrap(),
+                |_| async { panic!("a full unlinked group needs no audience lookup") },
+                |_, _| async { panic!("ordinary groups need no thread lookup") },
+                |chat, kind, context| async move {
+                    assert_eq!(chat, GROUP);
+                    assert!(kind == ChatKind::Group);
+                    assert_eq!(context, None);
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.origin_channel, None);
     }
 
     #[test]
