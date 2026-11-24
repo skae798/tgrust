@@ -155,6 +155,22 @@ fn input_forum_reply(reply_to: Option<i32>, topic: Option<i32>) -> Option<tl::en
     Some(header.into())
 }
 
+fn retain_album_media(medias: &mut Vec<InputMedia>) -> Result<(), InvocationError> {
+    // The first item carries the destination and caption. Do not send an
+    // incomplete forum album or fall back to General if that item failed.
+    if medias
+        .first()
+        .is_some_and(|media| media.forum_topic.is_some())
+        && medias.iter().any(|media| media.media.is_none())
+    {
+        return Err(InvocationError::Dropped(
+            "A forum album is missing an attachment.",
+        ));
+    }
+    medias.retain(|media| media.media.is_some());
+    Ok(())
+}
+
 /// Flatten a `messages.Messages` response into its messages, users and chats.
 ///
 /// Panics on `NotModified`, which is only returned when a non-zero `hash` was sent.
@@ -778,7 +794,7 @@ impl Client {
             }
         }
 
-        medias.retain(|media| media.media.is_some());
+        retain_album_media(&mut medias)?;
 
         let first_media_reply = match medias.first() {
             Some(media) => input_forum_reply(media.reply_to, media.forum_topic),
@@ -1444,6 +1460,25 @@ impl Client {
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+
+    #[test]
+    fn a_forum_album_with_a_missing_item_is_never_sent_to_general() {
+        let media = || InputMedia::new().photo_url("https://example.invalid/sample.jpg");
+        let mut missing_first = vec![InputMedia::new().forum_topic(Some(42)), media()];
+        assert!(retain_album_media(&mut missing_first).is_err());
+        let mut missing_later = vec![media().forum_topic(Some(42)), InputMedia::new()];
+        assert!(retain_album_media(&mut missing_later).is_err());
+        let mut general = vec![InputMedia::new().forum_topic(Some(1)), media()];
+        assert!(retain_album_media(&mut general).is_err());
+
+        let mut ordinary = vec![InputMedia::new(), media()];
+        assert!(retain_album_media(&mut ordinary).is_ok());
+        assert_eq!(ordinary.len(), 1);
+        let mut complete = vec![media().forum_topic(Some(42)), media()];
+        assert!(retain_album_media(&mut complete).is_ok());
+        assert_eq!(complete.len(), 2);
+        assert_eq!(complete[0].forum_topic, Some(42));
+    }
 
     #[test]
     fn forum_reply_headers_distinguish_general_root_and_nested_replies() {
