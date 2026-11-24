@@ -243,6 +243,8 @@ impl Editor {
         );
         self.attempted.set(true);
         dialog.set_can_close(false);
+        let focus = dialog.focus();
+        dialog.set_focus(None::<&gtk::Widget>);
         self.form.set_sensitive(false);
         self.feedback(if deleting {
             "Удаление темы…"
@@ -271,6 +273,7 @@ impl Editor {
                 Ok(ForumWriteResult::CreationUnconfirmed) => {
                     editor.name.set_editable(false);
                     editor.form.set_sensitive(true);
+                    dialog.set_focus(focus.as_ref());
                     editor.feedback("Создание пока не подтверждено. Повторите запрос или закройте окно и проверьте список тем.");
                 }
                 Ok(result) => {
@@ -279,6 +282,7 @@ impl Editor {
                 }
                 Err(error) => {
                     editor.form.set_sensitive(true);
+                    dialog.set_focus(focus.as_ref());
                     editor.feedback(&format!("Не удалось сохранить изменение. {error}"));
                 }
             }
