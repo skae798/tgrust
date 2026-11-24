@@ -145,6 +145,16 @@ fn input_reply_to(reply_to_msg_id: i32) -> tl::enums::InputReplyTo {
     .into()
 }
 
+fn input_forum_reply(reply_to: Option<i32>, topic: Option<i32>) -> Option<tl::enums::InputReplyTo> {
+    let root = topic.filter(|&topic| topic > 1);
+    let reply_to = reply_to.or(root)?;
+    let tl::enums::InputReplyTo::Message(mut header) = input_reply_to(reply_to) else {
+        unreachable!()
+    };
+    header.top_msg_id = root.filter(|root| *root != reply_to);
+    Some(header.into())
+}
+
 /// Flatten a `messages.Messages` response into its messages, users and chats.
 ///
 /// Panics on `NotModified`, which is only returned when a non-zero `hash` was sent.
@@ -613,7 +623,7 @@ impl Client {
                 background: message.background,
                 clear_draft: message.clear_draft,
                 peer: peer.into(),
-                reply_to: message.reply_to.map(input_reply_to),
+                reply_to: input_forum_reply(message.reply_to, message.forum_topic),
                 media,
                 message: message.text.clone(),
                 random_id,
@@ -639,7 +649,7 @@ impl Client {
                 background: message.background,
                 clear_draft: message.clear_draft,
                 peer: peer.into(),
-                reply_to: message.reply_to.map(input_reply_to),
+                reply_to: input_forum_reply(message.reply_to, message.forum_topic),
                 message: message.text.clone(),
                 random_id,
                 reply_markup: message.reply_markup.clone(),
@@ -771,7 +781,7 @@ impl Client {
         medias.retain(|media| media.media.is_some());
 
         let first_media_reply = match medias.first() {
-            Some(media) => media.reply_to,
+            Some(media) => input_forum_reply(media.reply_to, media.forum_topic),
             None => return Err(InvocationError::Dropped("No media left after filtering.")),
         };
 
@@ -798,7 +808,7 @@ impl Client {
                 background: false,
                 clear_draft: false,
                 peer: peer.into(),
-                reply_to: first_media_reply.map(input_reply_to),
+                reply_to: first_media_reply,
                 schedule_date: None,
                 multi_media,
                 send_as: None,
@@ -962,6 +972,18 @@ impl Client {
         message_ids: &[i32],
         source: S,
     ) -> Result<Vec<Option<Message>>, InvocationError> {
+        self.forward_messages_to_topic(destination, None, message_ids, source)
+            .await
+    }
+
+    /// Forward messages to a specific forum topic.
+    pub async fn forward_messages_to_topic<C: Into<PeerRef>, S: Into<PeerRef>>(
+        &self,
+        destination: C,
+        topic: Option<i32>,
+        message_ids: &[i32],
+        source: S,
+    ) -> Result<Vec<Option<Message>>, InvocationError> {
         // TODO let user customize more options
         let peer = destination.into();
         let request = tl::functions::messages::ForwardMessages {
@@ -974,7 +996,7 @@ impl Client {
             id: message_ids.to_vec(),
             random_id: generate_random_ids(message_ids.len()),
             to_peer: peer.into(),
-            top_msg_id: None,
+            top_msg_id: topic.filter(|&topic| topic > 1),
             reply_to: None,
             schedule_date: None,
             schedule_repeat_period: None,
@@ -1188,6 +1210,38 @@ impl Client {
         Ok(message_ids.iter().map(|id| map.remove(id)).collect())
     }
 
+    /// Fetch a page from one forum topic, resolving the peers returned with it.
+    pub async fn get_forum_history(
+        &self,
+        peer: PeerRef,
+        topic: i32,
+        offset_id: i32,
+        add_offset: i32,
+        limit: i32,
+    ) -> Result<Vec<Message>, InvocationError> {
+        let response = self
+            .invoke(&tl::functions::messages::GetReplies {
+                peer: peer.into(),
+                msg_id: topic,
+                offset_id,
+                offset_date: 0,
+                add_offset,
+                limit,
+                max_id: i32::MAX,
+                min_id: 0,
+                hash: 0,
+            })
+            .await?;
+        let (messages, users, chats) = unpack_messages(response);
+        let peers = self.build_peer_map(users, chats).await;
+        Ok(messages
+            .into_iter()
+            .filter(|message| !matches!(message, tl::enums::Message::Empty(_)))
+            .map(|message| Message::from_raw(self, message, Some(peer), peers.handle()))
+            .filter(|message| message.peer_id() == peer.id)
+            .collect())
+    }
+
     /// Get the latest pin from a peer.
     ///
     /// # Examples
@@ -1390,6 +1444,23 @@ impl Client {
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+
+    #[test]
+    fn forum_reply_headers_distinguish_general_root_and_nested_replies() {
+        assert!(input_forum_reply(None, Some(1)).is_none());
+        let header = |reply, topic| {
+            let tl::enums::InputReplyTo::Message(header) = input_forum_reply(reply, topic).unwrap()
+            else {
+                unreachable!()
+            };
+            (header.reply_to_msg_id, header.top_msg_id)
+        };
+        assert_eq!(header(None, Some(42)), (42, None));
+        assert_eq!(header(Some(42), Some(42)), (42, None));
+        assert_eq!(header(Some(48), Some(42)), (48, Some(42)));
+        assert_eq!(header(Some(11), Some(1)), (11, None));
+        assert_eq!(header(Some(11), None), (11, None));
+    }
 
     #[test]
     fn global_search_continues_after_a_short_page_with_low_chat_local_ids() {

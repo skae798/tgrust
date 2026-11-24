@@ -5,9 +5,10 @@ use crate::model::{
     ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
     BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, CreatedChat,
-    GroupPermission, GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction,
-    InviteCursor, InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome,
-    JoinRequest, JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
+    FORUM_PAGE_SIZE, ForumCursor, ForumPage, ForumTopic, GENERAL_TOPIC, GroupPermission,
+    GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
+    InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest,
+    JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
     MemberModeration, MemberPage, MemberRestriction, MemberRestrictionEdit,
     MemberRestrictionSettings, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
     PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
@@ -24,6 +25,7 @@ pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
 pub const SLOW_MODE_GROUP: i64 = 8;
 pub const MODERATION_GROUP: i64 = 9;
+pub const FORUM_CHAT: i64 = 14;
 pub const SLOW_MODE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
@@ -52,6 +54,7 @@ pub fn chats() -> Vec<Chat> {
             0,
             false,
         ),
+        (FORUM_CHAT, "Демофорум", "Обсуждение по темам", 3, false),
     ]
     .into_iter()
     .map(|(id, title, preview, unread, broadcast)| Chat {
@@ -60,14 +63,15 @@ pub fn chats() -> Vec<Chat> {
         last_activity: now() - id,
         title: title.to_owned(),
         preview: preview.to_owned(),
-        preview_sender: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP)
+        preview_sender: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP | FORUM_CHAT)
             .then(|| "Анна".to_owned()),
         preview_image: history(id).last().and_then(|message| {
             message
                 .thumbnail
                 .map(|media| ChatImage::attachment(id, message.id, media))
         }),
-        group: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP),
+        group: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP | FORUM_CHAT),
+        forum: id == FORUM_CHAT,
         unread,
         unread_mark: false,
         last_message_id: history(id).last().map_or(0, |message| message.id),
@@ -82,7 +86,7 @@ pub fn chats() -> Vec<Chat> {
         }),
         archived: id == 3,
         kind: match id {
-            1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP => ChatKind::Group,
+            1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP | FORUM_CHAT => ChatKind::Group,
             3 => ChatKind::Broadcast,
             7 => ChatKind::Bot,
             _ => ChatKind::User,
@@ -178,6 +182,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             MODERATION_GROUP => {
                 "В этой демонстрационной супергруппе можно менять разрешения и ограничения."
             }
+            FORUM_CHAT => "Демонстрационная супергруппа с темами.",
             _ => "Объявления и новости проекта. Демонстрационный канал.",
         }
         .to_owned(),
@@ -189,6 +194,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
                 7 => "@demo_tgrust_bot",
                 SLOW_MODE_GROUP => "@demo_tgrust_slow_mode",
                 MODERATION_GROUP => "@demo_tgrust_moderation",
+                FORUM_CHAT => "@demo_tgrust_forum",
                 _ => "@demo_tgrust_news",
             }
             .to_owned(),
@@ -994,7 +1000,82 @@ pub fn blocked_page(ids: &[i64], offset: i32) -> crate::model::BlockedPage {
     }
 }
 
+pub fn forum_topic(id: i32) -> Option<ForumTopic> {
+    let title = match id {
+        GENERAL_TOPIC => "Общая".into(),
+        100 => "Инфраструктура".into(),
+        200 => "Обсуждение макетов".into(),
+        300 => "Завершённое обсуждение".into(),
+        301..=342 => format!("Архивная тема {id}"),
+        _ => return None,
+    };
+    Some(ForumTopic {
+        id,
+        title,
+        unread: match id {
+            100 => 2,
+            200 => 1,
+            _ => 0,
+        },
+        closed: id == 300,
+        hidden: false,
+        pinned: id == GENERAL_TOPIC,
+    })
+}
+
+pub fn forum_topics(cursor: ForumCursor) -> ForumPage {
+    let all = [GENERAL_TOPIC, 100, 200, 300]
+        .into_iter()
+        .chain(301..=342)
+        .collect::<Vec<_>>();
+    let start = all
+        .iter()
+        .position(|&topic| topic == cursor.topic)
+        .map_or(0, |index| index + 1);
+    let end = (start + FORUM_PAGE_SIZE).min(all.len());
+    let topics = all[start..end]
+        .iter()
+        .filter_map(|&topic| forum_topic(topic))
+        .collect();
+    let next = (end < all.len()).then(|| ForumCursor {
+        topic: all[end - 1],
+        ..ForumCursor::default()
+    });
+    ForumPage { topics, next }
+}
+
 pub fn history(chat: i64) -> Vec<Message> {
+    if chat == FORUM_CHAT {
+        let template = poll_message(0, PollDraft::default());
+        let text_message = |id, topic, text| Message {
+            id,
+            topic: Some(topic),
+            text,
+            poll: None,
+            self_authored: false,
+            outgoing: false,
+            can_edit: false,
+            can_delete: false,
+            sender: "Анна".into(),
+            sender_avatar: None,
+            ..template.clone()
+        };
+        let mut messages = vec![text_message(
+            20,
+            GENERAL_TOPIC,
+            "Общий разговор форума".into(),
+        )];
+        for (topic, title, count) in [
+            (100, "Инфраструктура", 65),
+            (200, "Макеты", 5),
+            (300, "Завершённая тема", 1),
+        ] {
+            messages.extend((1..=count).map(|index| {
+                text_message(topic + index, topic, format!("{title} · запись {index}"))
+            }));
+        }
+        return messages;
+    }
     if chat == 6 {
         let mut meeting = poll_message(
             2,
@@ -1083,6 +1164,7 @@ pub fn history(chat: i64) -> Vec<Message> {
         .enumerate()
         .map(|(index, (sender, text, outgoing, attachment))| Message {
             id: index as i32 + if chat == 1 { 81 } else { 1 },
+            topic: None,
             sender: sender.to_owned(),
             sender_avatar: if outgoing {
                 Some(OWN_AVATAR)
@@ -1164,6 +1246,7 @@ pub fn history(chat: i64) -> Vec<Message> {
         let older = (1..=80).map(|id| {
             let mut message = Message {
                 id,
+                topic: None,
                 timestamp: today - 2 * day + i64::from(id) * 60,
                 text: format!("Заметка о проекте № {id}"),
                 ..sample.clone()
@@ -1191,6 +1274,7 @@ pub fn history(chat: i64) -> Vec<Message> {
 pub fn poll_message(id: i32, draft: PollDraft) -> Message {
     Message {
         id,
+        topic: None,
         sender: OWN_NAME.into(),
         sender_avatar: Some(OWN_AVATAR),
         self_authored: true,

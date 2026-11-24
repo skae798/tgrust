@@ -21,6 +21,7 @@ pub struct Chat {
     pub preview_sender: Option<String>,
     pub preview_image: Option<ChatImage>,
     pub group: bool,
+    pub forum: bool,
     pub unread: i32,
     pub unread_mark: bool,
     pub last_message_id: i32,
@@ -96,6 +97,7 @@ impl Contact {
             preview_sender: None,
             preview_image: None,
             group: false,
+            forum: false,
             unread: 0,
             unread_mark: false,
             last_message_id: 0,
@@ -368,6 +370,43 @@ pub struct PeerProfile {
 }
 
 pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
+
+pub const GENERAL_TOPIC: i32 = 1;
+pub const FORUM_PAGE_SIZE: usize = 40;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Conversation {
+    pub chat: i64,
+    pub topic: Option<i32>,
+}
+
+impl From<i64> for Conversation {
+    fn from(chat: i64) -> Self {
+        Self { chat, topic: None }
+    }
+}
+
+#[derive(Clone)]
+pub struct ForumTopic {
+    pub id: i32,
+    pub title: String,
+    pub unread: i32,
+    pub closed: bool,
+    pub hidden: bool,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ForumCursor {
+    pub date: i32,
+    pub message: i32,
+    pub topic: i32,
+}
+
+pub struct ForumPage {
+    pub topics: Vec<ForumTopic>,
+    pub next: Option<ForumCursor>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupPermission {
@@ -1056,6 +1095,7 @@ impl NewChatDraft {
             preview_sender: None,
             preview_image: None,
             group: self.kind != NewChatKind::Channel,
+            forum: false,
             unread: 0,
             unread_mark: false,
             last_message_id: 0,
@@ -1851,6 +1891,7 @@ impl PlaybackSource {
 #[derive(Clone)]
 pub struct Message {
     pub id: i32,
+    pub topic: Option<i32>,
     pub sender: String,
     pub sender_avatar: Option<Avatar>,
     pub self_authored: bool,
@@ -2191,7 +2232,7 @@ impl HistoryRevision {
 
 #[derive(Default)]
 pub struct HistoryCache {
-    chats: HashMap<i64, CachedHistory>,
+    chats: HashMap<Conversation, CachedHistory>,
 }
 
 pub struct CachedHistory {
@@ -2207,24 +2248,32 @@ impl HistoryCache {
         for (&chat, history) in &mut self.chats {
             for (&id, message) in &mut history.messages {
                 if let Some(poll) = &mut message.poll {
-                    update(chat, id, poll);
+                    update(chat.chat, id, poll);
                 }
             }
         }
     }
 
     pub fn remove(&mut self, chat: i64) {
-        self.chats.remove(&chat);
+        self.chats.retain(|target, _| target.chat != chat);
     }
 
-    pub fn restore(&mut self, chat: i64, now: Instant) -> Option<CachedHistory> {
+    pub fn remove_conversation(&mut self, target: Conversation) {
+        self.chats.remove(&target);
+    }
+
+    pub fn restore(
+        &mut self,
+        chat: impl Into<Conversation>,
+        now: Instant,
+    ) -> Option<CachedHistory> {
         self.expire(now);
-        self.chats.remove(&chat)
+        self.chats.remove(&chat.into())
     }
 
     pub fn store(
         &mut self,
-        chat: i64,
+        chat: impl Into<Conversation>,
         mut messages: BTreeMap<i32, Message>,
         has_older: bool,
         revision: HistoryRevision,
@@ -2255,7 +2304,7 @@ impl HistoryCache {
             self.chats.remove(&oldest);
         }
         self.chats.insert(
-            chat,
+            chat.into(),
             CachedHistory {
                 messages,
                 has_older: has_older || uncached > 0,
@@ -2902,6 +2951,7 @@ mod tests {
             preview_sender: None,
             preview_image: None,
             group: true,
+            forum: false,
             unread: 0,
             unread_mark: false,
             last_message_id: 0,
@@ -2930,6 +2980,7 @@ mod tests {
         ids.iter()
             .map(|&id| Message {
                 id,
+                topic: None,
                 sender: "Тест".into(),
                 sender_avatar: None,
                 self_authored: false,
@@ -2962,6 +3013,42 @@ mod tests {
 
     fn history(ids: &[i32]) -> BTreeMap<i32, Message> {
         messages(ids).into_iter().map(|msg| (msg.id, msg)).collect()
+    }
+
+    #[test]
+    fn forum_topics_use_separate_cached_histories() {
+        let first = Conversation {
+            chat: 7,
+            topic: Some(100),
+        };
+        let second = Conversation {
+            chat: 7,
+            topic: Some(200),
+        };
+        let now = Instant::now();
+        let mut cache = HistoryCache::default();
+        for (target, id) in [(first, 110), (second, 210)] {
+            let page = messages(&[id])
+                .into_iter()
+                .map(|message| (message.id, message))
+                .collect();
+            cache.store(target, page, false, HistoryRevision::default(), now, now);
+        }
+        assert!(cache.restore(7, now).is_none());
+        assert!(
+            cache
+                .restore(second, now)
+                .unwrap()
+                .messages
+                .contains_key(&210)
+        );
+        assert!(
+            cache
+                .restore(first, now)
+                .unwrap()
+                .messages
+                .contains_key(&110)
+        );
     }
 
     #[test]
