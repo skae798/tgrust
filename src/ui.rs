@@ -1566,13 +1566,16 @@ impl Ui {
         let (allowed, mut desktop_messages) = tokio::sync::mpsc::channel(32);
         let notification_client = client.clone();
         self.runtime.spawn(async move {
+            let mut filter = crate::telegram::NotificationFilter::default();
             while let Some(message) = messages.recv().await {
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
-                    notification_client.notification_enabled(message.chat, message.kind),
+                    notification_client.desktop_notification(&mut filter, message),
                 )
                 .await;
-                if matches!(result, Ok(Ok(true))) && allowed.send(message).await.is_err() {
+                if let Ok(Ok(Some(message))) = result
+                    && allowed.send(message).await.is_err()
+                {
                     break;
                 }
             }
@@ -1642,13 +1645,15 @@ impl Ui {
     }
 
     fn notify_message(&self, message: &IncomingMessage) {
-        if self.muting_chats.borrow().contains(&message.chat)
-            || self
-                .chats
-                .borrow()
-                .iter()
-                .any(|chat| chat.id == message.chat && chat.muted)
-        {
+        let muted = |id| {
+            self.muting_chats.borrow().contains(&id)
+                || self
+                    .chats
+                    .borrow()
+                    .iter()
+                    .any(|chat| chat.id == id && chat.muted)
+        };
+        if muted(message.chat) || message.origin_channel.is_some_and(muted) {
             return;
         }
         let Some(app) = self

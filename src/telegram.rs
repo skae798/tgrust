@@ -1,6 +1,9 @@
 mod admin_log;
 mod chat_addresses;
 mod create_chat;
+mod desktop_notifications;
+pub(crate) use desktop_notifications::NotificationFilter;
+use desktop_notifications::{PendingNotification, notification_for};
 mod forum_management;
 mod forum_topics;
 mod group_permissions;
@@ -43,12 +46,12 @@ use crate::model::{
 use crate::model::{
     AttachmentThumbnail, Avatar, BLOCKED_PAGE_SIZE, BlockedPage, BlockedPeer, Chat, ChatFolder,
     ChatImage, ChatKind, Contact, DeviceChange, DeviceSession, DeviceSessions, FormattedText,
-    HISTORY_PAGE_SIZE, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message, OwnProfile,
-    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, Poll, PollChoice, PollDraft,
-    PollUpdate, PollVoteCount, PrivacyAudience, PrivacyChange, PrivacyKey, PrivacySetting,
-    ProfileDetails, ProfileEdit, ProfileEditResult, Reaction, ReadRequest, ReplyPreview,
-    SearchBuffer, SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload,
-    UploadKind, redact_spoilers,
+    HISTORY_PAGE_SIZE, HistoryRevision, MAX_ALBUM_ITEMS, Message, OwnProfile, PeerProfile,
+    PlayableMedia, PlaybackProgress, PlaybackSource, Poll, PollChoice, PollDraft, PollUpdate,
+    PollVoteCount, PrivacyAudience, PrivacyChange, PrivacyKey, PrivacySetting, ProfileDetails,
+    ProfileEdit, ProfileEditResult, Reaction, ReadRequest, ReplyPreview, SearchBuffer,
+    SearchHandle, SearchHit, SearchPage, TextSpan, TextStyle, UpdateStatus, Upload, UploadKind,
+    redact_spoilers,
 };
 use crate::session_runner::SessionRunner;
 use crate::storage::{
@@ -453,7 +456,7 @@ impl Telegram {
     pub async fn listen(
         self: Arc<Self>,
         mut stop: watch::Receiver<bool>,
-        incoming: mpsc::Sender<IncomingMessage>,
+        incoming: mpsc::Sender<PendingNotification>,
     ) -> Result<()> {
         let Some(receiver) = self.updates.lock().await.take() else {
             return Ok(());
@@ -1681,24 +1684,6 @@ impl Telegram {
         ensure!(confirmed, "Telegram не подтвердил изменение блокировки");
         self.invalidate_blocked();
         Ok(())
-    }
-
-    pub async fn notification_enabled(&self, chat: i64, kind: ChatKind) -> Result<bool> {
-        use grammers_client::tl::functions::account::GetNotifySettings;
-
-        let id = PeerId::from_bot_api_dialog_id(chat).context("Чат не найден")?;
-        let peer = self.session.peer_ref(id).await?.context("Чат не найден")?;
-        let enums::PeerNotifySettings::Settings(settings) = self
-            .client
-            .invoke(&GetNotifySettings {
-                peer: types::InputNotifyPeer { peer: peer.into() }.into(),
-            })
-            .await?;
-        let mute_until = match settings.mute_until {
-            Some(until) => until,
-            None => self.default_mute_until(kind).await?,
-        };
-        Ok(!is_muted(mute_until, SystemTime::now()))
     }
 
     async fn default_mute_until(&self, kind: ChatKind) -> Result<i32> {
@@ -4415,36 +4400,6 @@ fn notification_settings(
 fn is_muted(until: i32, now: SystemTime) -> bool {
     u64::try_from(until)
         .is_ok_and(|until| until > now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
-}
-
-fn notification_for(message: &TelegramMessage, started: SystemTime) -> Option<IncomingMessage> {
-    let enums::Message::Message(raw) = &message.raw else {
-        return None;
-    };
-    let timestamp = UNIX_EPOCH + Duration::from_secs(u64::try_from(raw.date).ok()?);
-    if raw.out
-        || raw.silent
-        || raw.ttl_period.is_some()
-        || matches!(&raw.media, Some(enums::MessageMedia::Photo(photo)) if photo.ttl_seconds.is_some())
-        || matches!(&raw.media, Some(enums::MessageMedia::Document(document)) if document.ttl_seconds.is_some())
-        || timestamp.duration_since(UNIX_EPOCH).ok()?.as_secs()
-            < started.duration_since(UNIX_EPOCH).ok()?.as_secs()
-        || SystemTime::now()
-            .duration_since(timestamp)
-            .is_ok_and(|age| age > Duration::from_secs(60))
-    {
-        return None;
-    }
-    let peer = message.peer()?;
-    if matches!(peer, Peer::User(user) if user.is_self()) {
-        return None;
-    }
-    Some(IncomingMessage {
-        chat: message.peer_id().bot_api_dialog_id()?,
-        message: message.id(),
-        title: peer.name().unwrap_or("Telegram").to_owned(),
-        kind: chat_kind(peer),
-    })
 }
 
 fn playable_media(media: &Media) -> Option<PlayableMedia> {

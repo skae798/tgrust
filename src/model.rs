@@ -2416,6 +2416,7 @@ impl HistoryCache {
 
 pub struct IncomingMessage {
     pub chat: i64,
+    pub origin_channel: Option<i64>,
     pub message: i32,
     pub title: String,
     pub kind: ChatKind,
