@@ -23,6 +23,7 @@ fn label(text: &str) -> gtk::Label {
 pub fn card(poll: &Poll) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let question = label(&poll.question);
+    question.set_selectable(true);
     question.add_css_class("heading");
     card.append(&question);
     let kind = match (poll.quiz, poll.public) {
@@ -162,6 +163,7 @@ pub fn vote(
 
 pub fn create(
     window: &adw::ApplicationWindow,
+    allow_open_answers: bool,
     send: impl Fn(PollDraft, i64) -> SendPoll + 'static,
 ) -> adw::Dialog {
     let dialog = adw::Dialog::builder()
@@ -218,6 +220,17 @@ pub fn create(
     settings.add(&multiple);
     settings.add(&public);
     content.append(&settings);
+    let open_answers = adw::SwitchRow::builder()
+        .title("Участники могут добавлять варианты")
+        .visible(false)
+        .build();
+    if allow_open_answers {
+        public
+            .bind_property("active", &open_answers, "visible")
+            .sync_create()
+            .build();
+        settings.add(&open_answers);
+    }
     let status = label("");
     status.add_css_class("dim-label");
     content.append(&status);
@@ -236,6 +249,7 @@ pub fn create(
         move |_| {
             let draft = PollDraft {
                 question: question.text().into(),
+                open_answers: allow_open_answers && public.is_active() && open_answers.is_active(),
                 choices: choices
                     .borrow()
                     .iter()

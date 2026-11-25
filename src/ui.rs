@@ -1,3 +1,5 @@
+mod poll_answers;
+
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -26,6 +28,7 @@ use crate::model::{
     ChatInfo, Conversation, ForumTopic, ForumWriteResult, GENERAL_TOPIC, GroupPermissionEdit,
     GroupPermissions, PlayableMedia, slow_mode_change,
 };
+use crate::poll_dialog;
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -185,10 +188,12 @@ struct Ui {
     uploads: RefCell<HashMap<Conversation, Vec<Upload>>>,
     replies: RefCell<HashMap<Conversation, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
-    voting: RefCell<HashSet<(i64, i32)>>,
+    poll_actions: RefCell<HashSet<(i64, i32)>>,
     poll_revision: Cell<u64>,
     recent_polls: RefCell<VecDeque<(u64, PollUpdate)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
+    poll_answer_limits: Cell<(usize, i32)>,
+    poll_answer_refreshes: RefCell<HashMap<(i64, i32), poll_answers::AnswerRefresh>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
     inline_audio: RefCell<Option<InlineAudio>>,
@@ -711,10 +716,15 @@ pub fn open(
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
         reacting: RefCell::new(HashSet::new()),
-        voting: RefCell::new(HashSet::new()),
+        poll_actions: RefCell::new(HashSet::new()),
         poll_revision: Cell::new(0),
         recent_polls: RefCell::new(VecDeque::new()),
         images: RefCell::new(HashMap::new()),
+        poll_answer_limits: Cell::new((
+            crate::model::MAX_POLL_CHOICES,
+            crate::model::POLL_ANSWER_DELETE_PERIOD,
+        )),
+        poll_answer_refreshes: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
         inline_audio: RefCell::new(None),
@@ -1527,6 +1537,34 @@ impl Ui {
             },
         );
         let mut changes = client.changes();
+        let options_client = client.clone();
+        self.job(
+            async move { Ok(options_client.poll_answer_limits().await) },
+            |ui, result| {
+                if let Ok(limits) = result {
+                    ui.poll_answer_limits.set(limits);
+                }
+            },
+        );
+        let mut answers = client.poll_answer_changes();
+        let mut answer_stop = self.stop.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            loop {
+                let change = tokio::select! {
+                    _ = answer_stop.changed() => break,
+                    change = answers.recv() => change,
+                };
+                let Some(ui) = weak.upgrade() else { break };
+                match change {
+                    Ok((chat, id)) => ui.refresh_open_poll(chat, id),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        ui.refresh_visible_open_polls();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         let mut polls = client.poll_updates();
         let mut poll_stop = self.stop.clone();
         let weak = Rc::downgrade(self);
@@ -5275,6 +5313,9 @@ impl Ui {
                 ),
             );
         }
+        if let Some(target) = target {
+            self.add_poll_answer_actions(&menu, target, message);
+        }
         if message.can_reply {
             if self.input.is_sensitive() {
                 let reply = Reply {
@@ -5665,7 +5706,8 @@ impl Ui {
         };
         let chat = target.chat;
         let weak = Rc::downgrade(self);
-        let dialog = crate::poll_dialog::create(&window, move |draft, random_id| {
+        let allow_open = self.chat_view(chat).is_some_and(|chat| !chat.broadcast);
+        let send = move |draft: crate::model::PollDraft, random_id| {
             let weak = weak.clone();
             Box::pin(async move {
                 let ui = weak.upgrade().context("Аккаунт закрыт")?;
@@ -5720,8 +5762,9 @@ impl Ui {
                     ui.refresh_chats();
                 }
                 Ok(())
-            })
-        });
+            }) as _
+        };
+        let dialog = poll_dialog::create(&window, allow_open, send);
         dialog.connect_closed(glib::clone!(
             #[weak(rename_to = ui)]
             self,
@@ -5744,7 +5787,7 @@ impl Ui {
             "Голосовать"
         });
         button.set_halign(gtk::Align::Start);
-        button.set_sensitive(!self.voting.borrow().contains(&(chat, id)));
+        button.set_sensitive(!self.poll_actions.borrow().contains(&(chat, id)));
         button.connect_clicked(glib::clone!(
             #[weak(rename_to = ui)]
             self,
@@ -5820,7 +5863,7 @@ impl Ui {
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
-        if !self.voting.borrow_mut().insert((chat, id)) {
+        if !self.poll_actions.borrow_mut().insert((chat, id)) {
             return;
         }
         self.render_poll_change();
@@ -5834,7 +5877,7 @@ impl Ui {
                 .context("Telegram не подтвердил голос вовремя")?
             },
             move |ui, result| {
-                ui.voting.borrow_mut().remove(&(chat, id));
+                ui.poll_actions.borrow_mut().remove(&(chat, id));
                 match result {
                     Ok(Some(update)) => ui.apply_poll_update(update),
                     Ok(None) => {
@@ -5855,6 +5898,7 @@ impl Ui {
     }
 
     fn apply_poll_update(self: &Rc<Self>, update: PollUpdate) {
+        self.invalidate_pending_answer_refreshes(&update);
         self.history_cache
             .borrow_mut()
             .update_polls(|chat, id, poll| {

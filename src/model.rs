@@ -2015,8 +2015,10 @@ pub struct Message {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Poll {
+    pub open_answers: bool,
     pub id: i64,
     pub question: String,
+    pub creator: bool,
     pub choices: Vec<PollChoice>,
     pub closed: bool,
     pub public: bool,
@@ -2034,6 +2036,13 @@ pub struct PollChoice {
     pub votes: Option<i32>,
     pub chosen: bool,
     pub correct: bool,
+    pub addition: Option<PollAnswerAddition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollAnswerAddition {
+    pub author: i64,
+    pub date: i32,
 }
 
 impl Poll {
@@ -2054,6 +2063,44 @@ impl Poll {
                     && self.choices.iter().any(|choice| &choice.option == option)
             })
     }
+
+    pub fn answers_open(&self) -> bool {
+        self.open_answers && !self.quiz && !self.closed
+    }
+
+    pub fn can_delete_answer(
+        &self,
+        choice: &PollChoice,
+        own_id: Option<i64>,
+        now: i32,
+        period: i32,
+    ) -> bool {
+        self.answers_open()
+            && self.choices.len() > 2
+            && choice.addition.is_some_and(|addition| {
+                addition.date > 0
+                    && (self.creator
+                        || (own_id == Some(addition.author)
+                            && (0..period).contains(&now.saturating_sub(addition.date))))
+            })
+    }
+}
+
+pub const POLL_ANSWER_DELETE_PERIOD: i32 = 300;
+
+pub enum PollAnswerChange {
+    Add(String),
+    Delete(Vec<u8>),
+}
+
+pub fn normalized_poll_answer(text: &str) -> anyhow::Result<String> {
+    let text = text.trim();
+    anyhow::ensure!(!text.is_empty(), "Введите вариант ответа");
+    anyhow::ensure!(
+        text.chars().count() <= 100,
+        "Вариант должен быть до 100 символов"
+    );
+    Ok(text.to_owned())
 }
 
 #[derive(Clone)]
@@ -2114,6 +2161,7 @@ pub const MAX_POLL_CHOICES: usize = 12;
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PollDraft {
     pub question: String,
+    pub open_answers: bool,
     pub choices: Vec<String>,
     pub multiple: bool,
     pub public: bool,
@@ -2121,6 +2169,10 @@ pub struct PollDraft {
 
 impl PollDraft {
     pub fn validate(self) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !self.open_answers || self.public,
+            "Добавление вариантов доступно в публичном опросе"
+        );
         let question = self.question.trim().to_owned();
         anyhow::ensure!(!question.is_empty(), "Введите вопрос");
         anyhow::ensure!(
@@ -2158,8 +2210,10 @@ impl PollDraft {
 
     pub fn into_poll(self, id: i64) -> Poll {
         Poll {
+            open_answers: self.open_answers,
             id,
             question: self.question,
+            creator: true,
             choices: self
                 .choices
                 .into_iter()
@@ -2170,6 +2224,7 @@ impl PollDraft {
                     votes: None,
                     chosen: false,
                     correct: false,
+                    addition: None,
                 })
                 .collect(),
             closed: false,
@@ -2337,6 +2392,21 @@ pub struct CachedHistory {
 }
 
 impl HistoryCache {
+    pub fn open_poll_id(&self, chat: i64, id: i32) -> Option<i64> {
+        self.chats
+            .iter()
+            .filter(|(target, _)| target.chat == chat)
+            .find_map(|(_, cached)| {
+                cached
+                    .messages
+                    .get(&id)?
+                    .poll
+                    .as_ref()
+                    .filter(|poll| poll.open_answers)
+                    .map(|poll| poll.id)
+            })
+    }
+
     pub fn update_polls(&mut self, mut update: impl FnMut(i64, i32, &mut Poll)) {
         for (&chat, history) in &mut self.chats {
             for (&id, message) in &mut history.messages {
@@ -3240,7 +3310,7 @@ mod tests {
             question: "  Когда? ".into(),
             choices: vec!["Сейчас".into(), " ".into(), "Завтра ".into()],
             multiple: true,
-            public: false,
+            ..PollDraft::default()
         };
         let mut invalid = draft.clone();
         invalid.choices.push(" Завтра".into());
@@ -3339,6 +3409,95 @@ mod tests {
             Some(7),
         ));
         assert_eq!(current.into_keys().collect::<Vec<_>>(), [50, 51]);
+    }
+
+    #[test]
+    fn open_poll_requires_public_voting_and_limits_answer_text() {
+        let mut draft = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            open_answers: true,
+            ..PollDraft::default()
+        };
+        assert!(draft.clone().validate().is_err());
+        draft.public = true;
+        assert!(draft.validate().unwrap().into_poll(17).answers_open());
+        let text = "я".repeat(100);
+        assert_eq!(
+            normalized_poll_answer(&format!("  {text}\n")).unwrap(),
+            text
+        );
+        assert!(normalized_poll_answer(&format!("{text}я")).is_err());
+        assert!(normalized_poll_answer(" \n ").is_err());
+    }
+
+    #[test]
+    fn added_poll_answer_can_only_be_deleted_by_creator_or_recent_author() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into(), "В пятницу".into()],
+            public: true,
+            open_answers: true,
+            ..PollDraft::default()
+        }
+        .into_poll(17);
+        poll.creator = false;
+        poll.choices[2].addition = Some(PollAnswerAddition {
+            author: 42,
+            date: 100,
+        });
+        let period = POLL_ANSWER_DELETE_PERIOD;
+        let added = poll.choices[2].clone();
+        assert!(poll.can_delete_answer(&added, Some(42), 100 + period - 1, period));
+        assert!(!poll.can_delete_answer(&added, Some(47), 100, period));
+        assert!(!poll.can_delete_answer(&added, Some(42), 100 + period, period));
+        poll.creator = true;
+        assert!(poll.can_delete_answer(&added, None, 100 + period, period));
+        assert!(!poll.can_delete_answer(&poll.choices[0], Some(42), 100, period));
+        poll.closed = true;
+        assert!(!poll.can_delete_answer(&added, Some(42), 100, period));
+        poll.closed = false;
+        poll.choices.remove(0);
+        assert!(!poll.can_delete_answer(&added, Some(42), 100, period));
+    }
+
+    #[test]
+    fn open_poll_definition_updates_keep_votes_with_the_same_option_id() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into(), "В пятницу".into()],
+            public: true,
+            open_answers: true,
+            ..PollDraft::default()
+        }
+        .into_poll(17);
+        poll.choices[1].chosen = true;
+        poll.choices[1].votes = Some(3);
+        poll.choices[2].addition = Some(PollAnswerAddition {
+            author: 42,
+            date: 100,
+        });
+        let mut definition = poll.clone();
+        definition.choices.remove(2);
+        definition.choices.reverse();
+        definition.choices[0].chosen = false;
+        definition.choices[0].votes = None;
+        let update = PollUpdate {
+            id: poll.id,
+            target: Some((90, 10)),
+            definition: Some(definition),
+            results: None,
+            total: Some(4),
+            solution: None,
+            partial: true,
+        };
+        assert!(!update.apply(90, 11, &mut poll));
+        assert!(update.apply(90, 10, &mut poll));
+        assert_eq!(poll.choices.len(), 2);
+        assert_eq!(poll.choices[0].label, "Завтра");
+        assert!(poll.choices[0].chosen);
+        assert_eq!(poll.choices[0].votes, Some(3));
+        assert_eq!(poll.total, Some(4));
     }
 
     #[test]
