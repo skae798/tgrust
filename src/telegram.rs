@@ -2519,7 +2519,8 @@ impl Telegram {
         random_id: i64,
         topic: Option<i32>,
     ) -> Result<Option<Message>> {
-        let media = poll_media(draft.validate()?, random_id);
+        let poll = draft.validate()?;
+        let media = poll_media(poll, random_id);
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
