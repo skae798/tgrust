@@ -188,6 +188,8 @@ struct Ui {
     voting: RefCell<HashSet<(i64, i32)>>,
     poll_revision: Cell<u64>,
     recent_polls: RefCell<VecDeque<(u64, PollUpdate)>>,
+    poll_deadline_source: RefCell<Option<glib::SourceId>>,
+    elapsed_polls: RefCell<HashSet<(i32, i64)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
@@ -714,6 +716,8 @@ pub fn open(
         voting: RefCell::new(HashSet::new()),
         poll_revision: Cell::new(0),
         recent_polls: RefCell::new(VecDeque::new()),
+        poll_deadline_source: RefCell::new(None),
+        elapsed_polls: RefCell::new(HashSet::new()),
         images: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
@@ -1196,6 +1200,7 @@ pub fn open(
                 viewer.close();
             }
             ui.inline_audio.take();
+            ui.cancel_poll_deadline();
             ui.window.set(None);
             if let Some(cancel) = ui.qr_cancel.take() {
                 cancel.send_replace(true);
@@ -3942,6 +3947,10 @@ impl Ui {
         if previous != Some(target) || anchor.is_some() {
             self.inline_audio.take();
         }
+        if previous != Some(target) {
+            self.cancel_poll_deadline();
+            self.elapsed_polls.borrow_mut().clear();
+        }
         if self.chats.borrow().iter().any(|item| item.id == id) {
             let in_folder = !self.archive.is_active()
                 && self
@@ -4594,6 +4603,7 @@ impl Ui {
     }
 
     fn render_history(self: &Rc<Self>, bottom: bool) {
+        self.arm_poll_deadline();
         let position = if bottom {
             HistoryScroll::Bottom
         } else {
@@ -5669,6 +5679,9 @@ impl Ui {
             let weak = weak.clone();
             Box::pin(async move {
                 let ui = weak.upgrade().context("Аккаунт закрыт")?;
+                if ui.is_demo.get() {
+                    draft.close_fields(demo::now(), crate::model::POLL_DEFAULT_MAX_SECONDS)?;
+                }
                 if let Some(wait) = ui.slow_mode_remaining(chat) {
                     anyhow::bail!("{}", slow_mode_status(wait));
                 }
@@ -5893,6 +5906,106 @@ impl Ui {
 
     fn render_poll_change(self: &Rc<Self>) {
         self.render_history(false);
+    }
+
+    fn cancel_poll_deadline(&self) {
+        if let Some(source) = self.poll_deadline_source.take() {
+            source.remove();
+        }
+    }
+
+    fn arm_poll_deadline(self: &Rc<Self>) {
+        self.cancel_poll_deadline();
+        let Some(target) = self.conversation() else {
+            return;
+        };
+        let handled = self.elapsed_polls.borrow();
+        let next = self
+            .messages
+            .borrow()
+            .iter()
+            .filter_map(|(&id, message)| {
+                let poll = message.poll.as_ref()?;
+                (!poll.closed && !handled.contains(&(id, poll.id)))
+                    .then_some(poll.closes_at)
+                    .flatten()
+            })
+            .min();
+        if let Some(next) = next {
+            let delay = next
+                .saturating_sub(crate::model::unix_now())
+                .clamp(0, 86_400) as u64;
+            let weak = Rc::downgrade(self);
+            let source = glib::timeout_add_local_once(Duration::from_secs(delay), move || {
+                let Some(ui) = weak.upgrade() else { return };
+                ui.poll_deadline_source.take();
+                if ui.conversation() == Some(target) {
+                    ui.finish_elapsed_polls(target);
+                }
+            });
+            self.poll_deadline_source.replace(Some(source));
+        }
+    }
+
+    fn finish_elapsed_polls(self: &Rc<Self>, target: Conversation) {
+        let now = crate::model::unix_now();
+        let elapsed: Vec<_> = {
+            let mut handled = self.elapsed_polls.borrow_mut();
+            self.messages
+                .borrow()
+                .iter()
+                .filter_map(|(&id, message)| {
+                    let poll = message.poll.as_ref()?;
+                    (!poll.closed
+                        && poll.closes_at.is_some_and(|deadline| deadline <= now)
+                        && handled.insert((id, poll.id)))
+                    .then(|| (id, poll.clone()))
+                })
+                .collect()
+        };
+        if elapsed.is_empty() {
+            self.arm_poll_deadline();
+            return;
+        }
+        if self.is_demo.get() {
+            for (_, mut poll) in elapsed {
+                poll.closed = true;
+                self.apply_poll_update(PollUpdate {
+                    id: poll.id,
+                    target: None,
+                    definition: Some(poll),
+                    results: None,
+                    total: None,
+                    solution: None,
+                    partial: false,
+                });
+            }
+            return;
+        }
+        self.render_poll_change();
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let expected: Vec<_> = elapsed
+            .into_iter()
+            .map(|(id, poll)| (id, poll.id))
+            .collect();
+        self.job(
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(12),
+                    client.refresh_timed_polls(target.chat, &expected),
+                )
+                .await?
+            },
+            |ui, result| {
+                if let Ok(updates) = result {
+                    for update in updates {
+                        ui.apply_poll_update(update);
+                    }
+                }
+            },
+        );
     }
 
     fn send_message(self: &Rc<Self>) {

@@ -8,6 +8,8 @@ use gtk::glib;
 
 use crate::model::{MAX_POLL_CHOICES, Poll, PollDraft};
 
+use crate::model::{PollDeadline, unix_now};
+
 type SendPoll = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
 
 fn label(text: &str) -> gtk::Label {
@@ -21,6 +23,18 @@ fn label(text: &str) -> gtk::Label {
 }
 
 pub fn card(poll: &Poll) -> gtk::Box {
+    let show_results = poll.results_visible();
+    let masked = (!show_results).then(|| {
+        let mut poll = poll.clone();
+        poll.total = None;
+        poll.solution = None;
+        for choice in &mut poll.choices {
+            choice.correct = false;
+            choice.votes = None;
+        }
+        poll
+    });
+    let poll = masked.as_ref().unwrap_or(poll);
     let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let question = label(&poll.question);
     question.add_css_class("heading");
@@ -75,6 +89,27 @@ pub fn card(poll: &Poll) -> gtk::Box {
         (true, None) => "Опрос закрыт".to_owned(),
         (false, Some(total)) => format!("Всего проголосовало: {total}"),
         (false, None) => String::new(),
+    };
+    let mut elapsed = false;
+    if !poll.closed
+        && let Some(deadline) = poll.closes_at
+    {
+        elapsed = deadline <= unix_now();
+        if !elapsed
+            && let Ok(time) = glib::DateTime::from_unix_local(deadline)
+            && let Ok(text) = time.format("%x %H:%M")
+        {
+            let deadline = label(&format!("До {text}"));
+            deadline.add_css_class("dim-label");
+            card.append(&deadline);
+        }
+    }
+    let status = if elapsed {
+        "Приём голосов завершён. Ожидаются итоги Telegram.".into()
+    } else if !show_results {
+        "Итоги появятся после завершения".into()
+    } else {
+        status
     };
     if !status.is_empty() {
         let status = label(&status);
@@ -217,6 +252,7 @@ pub fn create(
         .build();
     settings.add(&multiple);
     settings.add(&public);
+    let timing = TimingControls::append(&settings);
     content.append(&settings);
     let status = label("");
     status.add_css_class("dim-label");
@@ -235,6 +271,15 @@ pub fn create(
         status,
         move |_| {
             let draft = PollDraft {
+                deadline: match timing.deadline() {
+                    Ok(deadline) => deadline,
+                    Err(error) => {
+                        status.set_text(&error.to_string());
+                        status.set_visible(true);
+                        return;
+                    }
+                },
+                hide_results_until_close: timing.mode.selected() != 0 && timing.hide.is_active(),
                 question: question.text().into(),
                 choices: choices
                     .borrow()
@@ -296,4 +341,99 @@ pub fn create(
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(window));
     dialog
+}
+
+const POLL_PERIODS: [(&str, i32); 6] = [
+    ("Через минуту", 60),
+    ("Через час", 3600),
+    ("Через 3 часа", 3 * 3600),
+    ("Через 8 часов", 8 * 3600),
+    ("Через сутки", 24 * 3600),
+    ("Через 3 дня", 72 * 3600),
+];
+const CUSTOM_TIME: u32 = POLL_PERIODS.len() as u32 + 1;
+
+struct TimingControls {
+    mode: adw::ComboRow,
+    date: adw::EntryRow,
+    hide: adw::SwitchRow,
+}
+
+impl TimingControls {
+    fn append(settings: &adw::PreferencesGroup) -> Self {
+        let choices: Vec<_> = std::iter::once("Без срока")
+            .chain(POLL_PERIODS.map(|(label, _)| label))
+            .chain(["Дата и время"])
+            .collect();
+        let mode = adw::ComboRow::builder()
+            .title("Завершение опроса")
+            .model(&gtk::StringList::new(&choices))
+            .selected(0)
+            .build();
+        settings.add(&mode);
+        let date = adw::EntryRow::builder()
+            .title("Дата и время")
+            .visible(false)
+            .build();
+        date.set_tooltip_text(Some("Местное время, ГГГГ-ММ-ДД ЧЧ:ММ"));
+        if let Ok(tomorrow) = glib::DateTime::from_unix_local(unix_now() + 86_400)
+            && let Ok(formatted) = tomorrow.format("%Y-%m-%d %H:%M")
+        {
+            date.set_text(&formatted);
+        }
+        settings.add(&date);
+        let hide = adw::SwitchRow::builder()
+            .title("Скрыть итоги до завершения")
+            .visible(false)
+            .build();
+        settings.add(&hide);
+        mode.connect_selected_notify(glib::clone!(
+            #[weak]
+            date,
+            #[weak]
+            hide,
+            move |mode| {
+                date.set_visible(mode.selected() == CUSTOM_TIME);
+                hide.set_visible(mode.selected() != 0);
+            }
+        ));
+        Self { mode, date, hide }
+    }
+
+    fn deadline(&self) -> anyhow::Result<Option<PollDeadline>> {
+        match self.mode.selected() {
+            0 => Ok(None),
+            CUSTOM_TIME => Ok(Some(PollDeadline::At(local_deadline(&self.date.text())?))),
+            index => Ok(POLL_PERIODS
+                .get(index as usize - 1)
+                .map(|(_, seconds)| PollDeadline::After(*seconds))),
+        }
+    }
+}
+
+fn local_deadline(text: &str) -> anyhow::Result<i64> {
+    let text = text.trim();
+    let iso = format!("{}:00", text.replace(' ', "T"));
+    let date = glib::DateTime::from_iso8601(&iso, Some(&glib::TimeZone::local()))
+        .map_err(|_| anyhow::anyhow!("Введите местное время в формате ГГГГ-ММ-ДД ЧЧ:ММ"))?;
+    anyhow::ensure!(
+        date.format("%Y-%m-%d %H:%M")?.as_str() == text,
+        "Введите местное время в формате ГГГГ-ММ-ДД ЧЧ:ММ"
+    );
+    Ok(date.to_unix())
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn custom_deadline_accepts_unambiguous_local_input_and_rejects_invalid_dates() {
+        let time = glib::DateTime::from_unix_local(1_800_000_000).unwrap();
+        let minute = time.format("%Y-%m-%d %H:%M").unwrap();
+        let parsed = local_deadline(&minute).unwrap();
+        assert!(parsed <= time.to_unix() && time.to_unix() - parsed < 60);
+        assert!(local_deadline("2026-02-30 17:00").is_err());
+        assert!(local_deadline("2026-02-28 17:00Z").is_err());
+    }
 }

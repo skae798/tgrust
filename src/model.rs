@@ -2017,6 +2017,8 @@ pub struct Message {
 pub struct Poll {
     pub id: i64,
     pub question: String,
+    pub creator: bool,
+    pub hide_results_until_close: bool,
     pub choices: Vec<PollChoice>,
     pub closed: bool,
     pub public: bool,
@@ -2025,6 +2027,7 @@ pub struct Poll {
     pub revoting_disabled: bool,
     pub total: Option<i32>,
     pub solution: Option<String>,
+    pub closes_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2042,7 +2045,18 @@ impl Poll {
     }
 
     pub fn can_vote(&self) -> bool {
-        !self.closed && (!self.revoting_disabled || !self.has_vote()) && self.choices.len() >= 2
+        self.can_vote_at(unix_now())
+    }
+
+    pub fn can_vote_at(&self, now: i64) -> bool {
+        !self.closed
+            && self.closes_at.is_none_or(|deadline| deadline > now)
+            && (!self.revoting_disabled || !self.has_vote())
+            && self.choices.len() >= 2
+    }
+
+    pub fn results_visible(&self) -> bool {
+        !self.hide_results_until_close || self.creator || self.closed
     }
 
     pub fn accepts(&self, options: &[Vec<u8>]) -> bool {
@@ -2082,6 +2096,7 @@ impl PollUpdate {
         }
         let mut next = self.definition.clone().unwrap_or_else(|| poll.clone());
         next.closed |= poll.closed;
+        next.closes_at = next.closes_at.or(poll.closes_at);
         for choice in &mut next.choices {
             if let Some(old) = poll.choices.iter().find(|old| old.option == choice.option) {
                 choice.chosen = old.chosen;
@@ -2110,9 +2125,34 @@ impl PollUpdate {
 }
 
 pub const MAX_POLL_CHOICES: usize = 12;
+pub const POLL_MIN_SECONDS: i32 = 60;
+pub const POLL_DEFAULT_MAX_SECONDS: i32 = 2_628_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollDeadline {
+    After(i32),
+    At(i64),
+}
+
+impl PollDeadline {
+    pub fn closes_at(self, now: i64) -> i64 {
+        match self {
+            Self::After(seconds) => now.saturating_add(i64::from(seconds)),
+            Self::At(time) => time,
+        }
+    }
+}
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PollDraft {
+    pub deadline: Option<PollDeadline>,
+    pub hide_results_until_close: bool,
     pub question: String,
     pub choices: Vec<String>,
     pub multiple: bool,
@@ -2120,6 +2160,35 @@ pub struct PollDraft {
 }
 
 impl PollDraft {
+    pub fn close_fields(&self, now: i64, max: i32) -> anyhow::Result<(Option<i32>, Option<i32>)> {
+        let Some(deadline) = self.deadline else {
+            anyhow::ensure!(
+                !self.hide_results_until_close,
+                "Для скрытия результатов задайте срок опроса"
+            );
+            return Ok((None, None));
+        };
+        let seconds = deadline.closes_at(now).saturating_sub(now);
+        anyhow::ensure!(
+            seconds >= i64::from(POLL_MIN_SECONDS),
+            "До завершения должна оставаться хотя бы минута"
+        );
+        anyhow::ensure!(
+            seconds <= i64::from(max),
+            "Срок опроса превышает лимит Telegram ({max} с)"
+        );
+        match deadline {
+            PollDeadline::After(seconds) => Ok((Some(seconds), None)),
+            PollDeadline::At(time) => Ok((
+                None,
+                Some(
+                    i32::try_from(time)
+                        .map_err(|_| anyhow::anyhow!("Дата завершения вне диапазона Telegram"))?,
+                ),
+            )),
+        }
+    }
+
     pub fn validate(self) -> anyhow::Result<Self> {
         let question = self.question.trim().to_owned();
         anyhow::ensure!(!question.is_empty(), "Введите вопрос");
@@ -2160,6 +2229,8 @@ impl PollDraft {
         Poll {
             id,
             question: self.question,
+            creator: true,
+            hide_results_until_close: false,
             choices: self
                 .choices
                 .into_iter()
@@ -2179,6 +2250,7 @@ impl PollDraft {
             revoting_disabled: false,
             total: None,
             solution: None,
+            closes_at: None,
         }
     }
 }
@@ -3240,7 +3312,7 @@ mod tests {
             question: "  Когда? ".into(),
             choices: vec!["Сейчас".into(), " ".into(), "Завтра ".into()],
             multiple: true,
-            public: false,
+            ..PollDraft::default()
         };
         let mut invalid = draft.clone();
         invalid.choices.push(" Завтра".into());
@@ -3369,5 +3441,59 @@ mod tests {
             Some(3),
         ));
         assert_eq!(current.into_keys().collect::<Vec<_>>(), [1, 2, 4]);
+    }
+
+    #[test]
+    fn timed_poll_encodes_one_deadline_and_uses_the_current_server_limit() {
+        let now = 1_800_000_000;
+        let mut draft = PollDraft {
+            deadline: Some(PollDeadline::After(60)),
+            ..PollDraft::default()
+        };
+        assert_eq!(draft.close_fields(now, 120).unwrap(), (Some(60), None));
+        draft.deadline = Some(PollDeadline::At(now + 120));
+        assert_eq!(
+            draft.close_fields(now, 120).unwrap(),
+            (None, Some(1_800_000_120))
+        );
+        assert!(draft.close_fields(now, 119).is_err());
+        assert!(draft.close_fields(now + 61, 120).is_err());
+        draft.deadline = None;
+        draft.hide_results_until_close = true;
+        assert!(draft.close_fields(now, 120).is_err());
+    }
+
+    #[test]
+    fn elapsed_deadline_stops_voting_and_waits_for_server_confirmation_to_show_results() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            ..PollDraft::default()
+        }
+        .into_poll(7);
+        poll.creator = false;
+        poll.closes_at = Some(1_800_000_000);
+        poll.hide_results_until_close = true;
+        assert!(poll.can_vote_at(1_799_999_999));
+        assert!(!poll.can_vote_at(1_800_000_000));
+        assert!(!poll.results_visible());
+        let mut confirmed = poll.clone();
+        confirmed.closes_at = None;
+        confirmed.closed = true;
+        assert!(
+            PollUpdate {
+                id: 7,
+                target: Some((3, 4)),
+                definition: Some(confirmed),
+                results: None,
+                total: Some(4),
+                solution: None,
+                partial: false,
+            }
+            .apply(3, 4, &mut poll)
+        );
+        assert_eq!(poll.closes_at, Some(1_800_000_000));
+        assert!(poll.results_visible());
+        assert!(!poll.can_vote_at(1_799_999_999));
     }
 }

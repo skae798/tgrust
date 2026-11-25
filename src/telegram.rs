@@ -11,6 +11,7 @@ mod invite_members;
 mod member_restrictions;
 pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
+mod poll_timing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2519,6 +2520,10 @@ impl Telegram {
         random_id: i64,
         topic: Option<i32>,
     ) -> Result<Option<Message>> {
+        let max_seconds = self.poll_close_limit(draft.deadline.is_some()).await;
+        let (close_period, close_date) =
+            draft.close_fields(crate::model::unix_now(), max_seconds)?;
+        let hide_results = draft.hide_results_until_close;
         let poll = draft.validate()?;
         let text = |text| {
             types::TextWithEntities {
@@ -2565,6 +2570,11 @@ impl Telegram {
             solution_media: None,
         };
         let peer = self.peer(chat).await?;
+        let mut media = media;
+        let enums::Poll::Poll(poll) = &mut media.poll;
+        poll.close_period = close_period;
+        poll.close_date = close_date;
+        poll.hide_results_until_close = hide_results;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
         let message = self
@@ -2604,7 +2614,7 @@ impl Telegram {
         let Some(Media::Poll(raw)) = message.media() else {
             bail!("Опрос больше недоступен")
         };
-        let poll = poll_view(&raw);
+        let poll = poll_timing::poll_view_at(&raw, &message);
         ensure!(
             poll.id == expected && poll.accepts(&options),
             "Этот голос больше недоступен"
@@ -2645,7 +2655,7 @@ impl Telegram {
                 Some(Media::Poll(raw)) if raw.raw.id == expected => Some(poll_results(
                     expected,
                     Some((chat, id)),
-                    Some(poll_definition(&raw.raw)),
+                    Some(poll_timing::poll_view_at(&raw, &message)),
                     &raw.raw_results,
                 )),
                 _ => None,
@@ -3896,7 +3906,7 @@ fn message_view(
     let audio = attachment.as_ref().and_then(|(media, _)| audio_info(media));
     let thumbnail = attachment.as_ref().and_then(|(media, _)| thumbnail(media));
     let poll = match message.media() {
-        Some(Media::Poll(raw)) => Some(poll_view(&raw)),
+        Some(Media::Poll(raw)) => Some(poll_timing::poll_view_at(&raw, message)),
         _ => None,
     };
     let (reply_to, reply_preview) = match &message.raw {
@@ -4005,6 +4015,8 @@ fn poll_definition(raw: &types::Poll) -> Poll {
     Poll {
         id: raw.id,
         question: poll_question(&raw.question),
+        creator: raw.creator,
+        hide_results_until_close: raw.hide_results_until_close,
         choices: raw
             .answers
             .iter()
@@ -4021,22 +4033,14 @@ fn poll_definition(raw: &types::Poll) -> Poll {
                 })
             })
             .collect(),
-        closed: raw.closed
-            || raw.close_date.is_some_and(|date| {
-                u64::try_from(date).is_ok_and(|date| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        >= date
-                })
-            }),
+        closed: raw.closed,
         public: raw.public_voters,
         multiple: raw.multiple_choice,
         quiz: raw.quiz,
         revoting_disabled: raw.revoting_disabled,
         total: None,
         solution: None,
+        closes_at: raw.close_date.filter(|date| *date > 0).map(i64::from),
     }
 }
 
