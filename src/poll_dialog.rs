@@ -23,6 +23,7 @@ fn label(text: &str) -> gtk::Label {
 pub fn card(poll: &Poll) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let question = label(&poll.question);
+    question.set_selectable(true);
     question.add_css_class("heading");
     card.append(&question);
     let kind = match (poll.quiz, poll.public) {

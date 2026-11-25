@@ -26,6 +26,7 @@ pub const FILE_CONTENT: &str = "Подготовить макеты, согла�
 pub const SLOW_MODE_GROUP: i64 = 8;
 pub const MODERATION_GROUP: i64 = 9;
 pub const FORUM_CHAT: i64 = 14;
+const PUBLIC_POLL_ID: i32 = 73;
 pub const SLOW_MODE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
@@ -38,7 +39,13 @@ pub fn chats() -> Vec<Chat> {
         (2, "Избранное", "Проверить сборку на ноутбуке", 0, false),
         (3, "Новости проекта", "Опубликован план на неделю", 0, true),
         (5, "Демомедиа", "Видео и аудио", 0, false),
-        (6, "Демоопросы", "Опрос · Когда провести встречу?", 0, false),
+        (
+            6,
+            "Демоопросы",
+            "Опрос · Когда открыть обсуждение проекта?",
+            0,
+            false,
+        ),
         (7, "Бот проекта", "Доступные команды проекта", 0, false),
         (
             SLOW_MODE_GROUP,
@@ -1207,7 +1214,29 @@ pub fn history(chat: i64) -> Vec<Message> {
             message.outgoing = false;
             message.can_delete = false;
         }
-        return vec![quiz, meeting];
+        let mut poll = PollDraft {
+            question: "Когда открыть обсуждение проекта?".into(),
+            choices: vec![
+                "В четверг".into(),
+                "В пятницу".into(),
+                "После выходных".into(),
+            ],
+            multiple: true,
+            ..PollDraft::default()
+        }
+        .into_poll(i64::from(PUBLIC_POLL_ID));
+        poll.public = true;
+        poll.creator = false;
+        poll.total = Some(60);
+        for (choice, count) in poll.choices.iter_mut().zip([40, 30, 0]) {
+            choice.votes = Some(count);
+        }
+        let public = Message {
+            id: PUBLIC_POLL_ID,
+            poll: Some(poll),
+            ..meeting.clone()
+        };
+        return vec![quiz, meeting, public];
     }
     let today = now();
     let samples = match chat {
@@ -1546,5 +1575,113 @@ mod join_request_tests {
         assert_eq!(queue.page(1, None).total, 29);
         assert_eq!(queue.page(3, None).total, 30);
         assert_eq!(queue.page(3, None).requests[0].cursor.user, user);
+    }
+}
+
+pub fn poll_voter_page(
+    poll: &crate::model::Poll,
+    option: Option<&[u8]>,
+    offset: Option<&str>,
+) -> crate::model::PollVoterPage {
+    use crate::model::{POLL_VOTERS_PAGE_SIZE, PollVoter, PollVoterPage};
+
+    let mut votes = Vec::new();
+    if poll.has_vote() {
+        votes.push((1, OWN_NAME.to_owned(), Some(OWN_AVATAR), {
+            poll.choices
+                .iter()
+                .filter(|choice| choice.chosen)
+                .map(|choice| choice.option.as_slice())
+                .collect::<Vec<_>>()
+        }));
+    }
+    if poll.id == i64::from(PUBLIC_POLL_ID) {
+        for index in 1..=60 {
+            let mut answers = Vec::new();
+            if index <= 40 {
+                answers.push(&[0][..]);
+            }
+            if index > 40 || index <= 10 {
+                answers.push(&[1][..]);
+            }
+            votes.push((
+                10_000 + index,
+                format!("Участник {index:02}"),
+                None,
+                answers,
+            ));
+        }
+    }
+    votes.retain(|(_, _, _, options)| option.is_none_or(|option| options.contains(&option)));
+    let total = votes.len();
+    let start = offset
+        .and_then(|offset| offset.parse::<usize>().ok())
+        .unwrap_or_default();
+    let voters: Vec<_> = votes
+        .into_iter()
+        .skip(start)
+        .take(POLL_VOTERS_PAGE_SIZE as usize)
+        .map(|(peer, name, avatar, options)| PollVoter {
+            peer,
+            name,
+            avatar,
+            answers: poll
+                .choices
+                .iter()
+                .filter(|choice| options.contains(&choice.option.as_slice()))
+                .map(|choice| choice.label.clone())
+                .collect(),
+        })
+        .collect();
+    let next = start.saturating_add(voters.len());
+    PollVoterPage {
+        voters,
+        total: total as i32,
+        next: (next < total).then(|| next.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod poll_voter_tests {
+    use super::*;
+
+    #[test]
+    fn demo_voters_paginate_each_option_independently() {
+        let message = history(6)
+            .into_iter()
+            .find(|message| message.id == PUBLIC_POLL_ID)
+            .expect("public demo poll");
+        let mut poll = message.poll.expect("public demo poll");
+        assert!(!poll.can_list_voters());
+        poll.choices[0].chosen = true;
+        assert!(poll.can_list_voters());
+
+        let first = poll_voter_page(&poll, None, None);
+        let second = poll_voter_page(&poll, None, first.next.as_deref());
+        let last = poll_voter_page(&poll, None, second.next.as_deref());
+        assert_eq!(
+            (first.voters.len(), second.voters.len(), last.voters.len()),
+            (24, 24, 13)
+        );
+        assert_eq!(first.total, 61);
+        assert_eq!(first.next.as_deref(), Some("24"));
+        assert!(last.next.is_none());
+        assert!(
+            first
+                .voters
+                .iter()
+                .all(|voter| second.voters.iter().all(|other| voter.peer != other.peer))
+        );
+
+        let friday = poll_voter_page(&poll, Some(&[1]), None);
+        assert_eq!(friday.total, 30);
+        assert!(
+            friday
+                .voters
+                .iter()
+                .all(|voter| voter.answers.iter().any(|answer| answer == "В пятницу"))
+        );
+        let empty = poll_voter_page(&poll, Some(&[2]), None);
+        assert!(empty.voters.is_empty() && empty.next.is_none());
     }
 }

@@ -107,6 +107,7 @@ struct Ui {
     demo_join_requests: Rc<RefCell<demo::JoinRequests>>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     poll_dialog: glib::WeakRef<adw::Dialog>,
+    poll_voters_dialog: glib::WeakRef<adw::Dialog>,
     own_name: RefCell<Option<String>>,
     own_avatar: Cell<Option<Option<Avatar>>>,
     account_label: gtk::Label,
@@ -631,6 +632,7 @@ pub fn open(
         demo_join_requests: Rc::new(RefCell::new(demo::JoinRequests::default())),
         own_profile_dialog: glib::WeakRef::new(),
         poll_dialog: glib::WeakRef::new(),
+        poll_voters_dialog: glib::WeakRef::new(),
         own_name: RefCell::new(None),
         own_avatar: Cell::new(None),
         account_label: menu_label,
@@ -2334,6 +2336,7 @@ impl Ui {
             &self.profile_dialog,
             &self.own_profile_dialog,
             &self.poll_dialog,
+            &self.poll_voters_dialog,
             &self.contacts_dialog,
             &self.create_chat_dialog,
             &self.devices_dialog,
@@ -4015,6 +4018,11 @@ impl Ui {
                 );
             }
         }
+        if previous != Some(target)
+            && let Some(dialog) = self.poll_voters_dialog.upgrade()
+        {
+            dialog.force_close();
+        }
         self.selection.set(Some(id));
         self.selected_topic.replace(topic);
         self.update_archive_button();
@@ -5256,6 +5264,21 @@ impl Ui {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let id = message.id;
         let target = self.conversation();
+        if let Some(target) = target
+            && let Some(poll) = message.poll.as_ref()
+            && self.can_list_poll_voters(chat, poll)
+        {
+            let poll_id = poll.id;
+            add_menu_button(
+                &menu,
+                "Кто проголосовал",
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.open_poll_voters(target, id, poll_id)
+                ),
+            );
+        }
         if let Some((text, selected)) = copy {
             add_menu_button(
                 &menu,
@@ -5731,6 +5754,60 @@ impl Ui {
             }
         ));
         self.poll_dialog.set(Some(&dialog));
+    }
+
+    fn can_list_poll_voters(&self, chat: i64, poll: &Poll) -> bool {
+        poll.can_list_voters() && self.chat_view(chat).is_some_and(|chat| !chat.broadcast)
+    }
+
+    fn open_poll_voters(self: &Rc<Self>, target: Conversation, id: i32, poll_id: i64) {
+        if self.conversation() != Some(target) || self.chat_dialog_open() {
+            return;
+        }
+        let Some(window) = self.window.upgrade() else {
+            return;
+        };
+        let Some(poll) = self
+            .messages
+            .borrow()
+            .get(&id)
+            .and_then(|message| message.poll.clone())
+            .filter(|poll| poll.id == poll_id && self.can_list_poll_voters(target.chat, poll))
+        else {
+            return;
+        };
+        let demo = self.is_demo.get().then(|| poll.clone());
+        let client = self.client.borrow().clone();
+        let dialog = crate::poll_voters::dialog(
+            &poll,
+            crate::poll_voters::VoterContext {
+                runtime: self.runtime.clone(),
+                load: Box::new(move |option, offset| {
+                    let client = client.clone();
+                    let demo = demo.clone();
+                    Box::pin(async move {
+                        if let Some(poll) = demo {
+                            return Ok(demo::poll_voter_page(
+                                &poll,
+                                option.as_deref(),
+                                offset.as_deref(),
+                            ));
+                        }
+                        client
+                            .context("Нет подключения к Telegram")?
+                            .poll_voters(target.chat, id, poll_id, option, offset)
+                            .await
+                    })
+                }),
+                avatar: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |avatar, photo| ui.load_avatar(avatar, ChatImage::Avatar(photo))
+                )),
+            },
+        );
+        self.poll_voters_dialog.set(Some(&dialog));
+        dialog.present(Some(&window));
     }
 
     fn poll_card(self: &Rc<Self>, chat: i64, id: i32, poll: &Poll) -> gtk::Box {

@@ -2017,6 +2017,8 @@ pub struct Message {
 pub struct Poll {
     pub id: i64,
     pub question: String,
+    pub creator: bool,
+    pub hide_results_until_close: bool,
     pub choices: Vec<PollChoice>,
     pub closed: bool,
     pub public: bool,
@@ -2037,6 +2039,12 @@ pub struct PollChoice {
 }
 
 impl Poll {
+    pub fn can_list_voters(&self) -> bool {
+        self.public
+            && (self.creator || self.closed || (!self.hide_results_until_close && self.has_vote()))
+            && self.total.is_some_and(|total| total > 0)
+    }
+
     pub fn has_vote(&self) -> bool {
         self.choices.iter().any(|choice| choice.chosen)
     }
@@ -2054,6 +2062,21 @@ impl Poll {
                     && self.choices.iter().any(|choice| &choice.option == option)
             })
     }
+}
+
+pub const POLL_VOTERS_PAGE_SIZE: i32 = 24;
+
+pub struct PollVoter {
+    pub peer: i64,
+    pub name: String,
+    pub avatar: Option<Avatar>,
+    pub answers: Vec<String>,
+}
+
+pub struct PollVoterPage {
+    pub voters: Vec<PollVoter>,
+    pub total: i32,
+    pub next: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2160,6 +2183,8 @@ impl PollDraft {
         Poll {
             id,
             question: self.question,
+            creator: true,
+            hide_results_until_close: false,
             choices: self
                 .choices
                 .into_iter()
@@ -3297,6 +3322,30 @@ mod tests {
         assert!(update.apply(-100, 10, &mut poll));
         assert_eq!(poll.total, Some(3));
         assert!(!poll.can_vote());
+    }
+
+    #[test]
+    fn voter_names_require_visible_public_results() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            public: true,
+            ..PollDraft::default()
+        }
+        .into_poll(72);
+        assert!(!poll.can_list_voters());
+        poll.total = Some(3);
+        assert!(poll.can_list_voters());
+        poll.creator = false;
+        assert!(!poll.can_list_voters());
+        poll.choices[0].chosen = true;
+        assert!(poll.can_list_voters());
+        poll.hide_results_until_close = true;
+        assert!(!poll.can_list_voters());
+        poll.closed = true;
+        assert!(poll.can_list_voters());
+        poll.public = false;
+        assert!(!poll.can_list_voters());
     }
 
     #[test]

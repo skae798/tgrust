@@ -2,6 +2,7 @@ mod admin_log;
 mod chat_addresses;
 mod create_chat;
 mod desktop_notifications;
+mod poll_voters;
 pub(crate) use desktop_notifications::NotificationFilter;
 use desktop_notifications::{PendingNotification, notification_for};
 mod forum_management;
@@ -4005,6 +4006,8 @@ fn poll_definition(raw: &types::Poll) -> Poll {
     Poll {
         id: raw.id,
         question: poll_question(&raw.question),
+        creator: raw.creator,
+        hide_results_until_close: raw.hide_results_until_close,
         choices: raw
             .answers
             .iter()
