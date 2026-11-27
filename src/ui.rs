@@ -179,7 +179,7 @@ struct Ui {
     history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
     demo_read_topics: Rc<RefCell<HashSet<Conversation>>>,
-    demo_forums: Rc<RefCell<demo::ForumTopics>>,
+    demo_forums: Rc<RefCell<HashMap<i64, demo::ForumTopics>>>,
     demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<Conversation, FormattedText>>,
     uploads: RefCell<HashMap<Conversation, Vec<Upload>>>,
@@ -705,7 +705,7 @@ pub fn open(
         history_refreshed: Cell::new(None),
         demo_messages: RefCell::new(HashMap::new()),
         demo_read_topics: Rc::new(RefCell::new(HashSet::new())),
-        demo_forums: Rc::new(RefCell::new(demo::ForumTopics::default())),
+        demo_forums: Rc::new(RefCell::new(HashMap::new())),
         demo_next_message: Cell::new(200),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
@@ -1734,26 +1734,27 @@ impl Ui {
             } else {
                 match result {
                     Ok(chats) => {
-                        let previous_slow_mode = ui.selection.get().and_then(|id| {
-                            ui.chats
-                                .borrow()
-                                .iter()
-                                .find(|chat| chat.id == id)
-                                .map(|chat| chat.slow_mode_enabled)
-                        });
+                        let previous = ui.selection.get().and_then(|id| ui.chat_view(id));
                         for chat in chats.iter().filter(|chat| chat.unread == 0 || chat.muted) {
                             ui.withdraw_chat_notification(chat.id);
                         }
                         ui.chats.replace(chats);
                         if let Some(id) = ui.selection.get()
-                            && let Some(chat) = ui.chats.borrow().iter().find(|chat| chat.id == id)
+                            && let Some(chat) = ui.chat_view(id)
                         {
-                            ui.set_chat_writability(chat.can_write);
-                            if chat.slow_mode_enabled && previous_slow_mode != Some(true) {
-                                ui.refresh_slow_mode(chat.id);
-                            } else if !chat.slow_mode_enabled && previous_slow_mode == Some(true) {
+                            let previous_slow_mode =
+                                previous.as_ref().is_some_and(|old| old.slow_mode_enabled);
+                            if !chat.slow_mode_enabled && previous_slow_mode {
                                 ui.slow_mode_requests.borrow_mut().remove(&id);
                                 ui.set_slow_mode_wait(id, Duration::ZERO);
+                            }
+                            if previous.is_some_and(|old| old.forum != chat.forum) {
+                                ui.reload_forum_view(chat);
+                            } else {
+                                ui.set_chat_writability(chat.can_write);
+                                if chat.slow_mode_enabled && !previous_slow_mode {
+                                    ui.refresh_slow_mode(chat.id);
+                                }
                             }
                         }
                         ui.render_chats();
@@ -3050,6 +3051,7 @@ impl Ui {
         let edit_client = client.clone();
         let address_client = client.clone();
         let permissions_client = client.clone();
+        let forum_client = client.clone();
         let member_client = client.clone();
         let moderation_client = client.clone();
         let restriction_loader = client.clone();
@@ -3062,6 +3064,7 @@ impl Ui {
         let demo_members = self.demo_member_changes.clone();
         let demo_blocked = self.demo_blocked.clone();
         let demo_profile = self.demo_profile.clone();
+        let profile_ui = Rc::downgrade(self);
         let dialog = crate::profile::open(
             &window,
             crate::profile::ProfileContext {
@@ -3075,6 +3078,11 @@ impl Ui {
                     let group_permissions = demo_group_permissions.borrow().get(&id).copied();
                     let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
                     let created = demo_created_chats.borrow().get(&id).cloned();
+                    let demo_forum = demo
+                        && profile_ui
+                            .upgrade()
+                            .and_then(|ui| ui.chat_view(id))
+                            .is_some_and(|chat| chat.forum);
                     let added = demo_members.borrow().invited_count(id);
                     Box::pin(async move {
                         if demo {
@@ -3089,6 +3097,9 @@ impl Ui {
                                 profile
                             };
                             profile.blocked = profile.blocked.map(|_| blocked);
+                            if let Some(mode) = &mut profile.forum_mode {
+                                mode.enabled = demo_forum;
+                            }
                             if let Some(addresses) = chat_addresses.or(profile.addresses.take()) {
                                 profile.usernames = addresses.active_usernames();
                                 profile.addresses = Some(addresses);
@@ -3103,6 +3114,7 @@ impl Ui {
                                 profile.group_permissions =
                                     Some(crate::model::GroupPermissionSettings {
                                         slow_mode: saved.slow_mode,
+                                        forum: demo_forum,
                                         ..demo::group_permissions(saved.allowed, public)
                                     });
                             }
@@ -3160,6 +3172,24 @@ impl Ui {
                     #[weak(rename_to = ui)]
                     self,
                     move |info| ui.apply_chat_info(id, info)
+                )),
+                set_forum_mode: Box::new(move |confirmed| {
+                    let client = forum_client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            Ok(!confirmed.enabled)
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .set_forum_mode(id, confirmed)
+                                .await
+                        }
+                    })
+                }),
+                forum_mode_changed: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |enabled| ui.apply_forum_mode(id, enabled)
                 )),
                 edit_addresses: Box::new({
                     let demo_addresses = self.demo_chat_addresses.clone();
@@ -3583,6 +3613,48 @@ impl Ui {
         self.render_chats();
     }
 
+    fn apply_forum_mode(self: &Rc<Self>, id: i64, enabled: bool) {
+        let changed = self.chat_view(id).is_some_and(|chat| chat.forum != enabled);
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|chat| chat.id == id)
+        {
+            chat.forum = enabled;
+        }
+        if let Some(chat) = self
+            .external_chat
+            .borrow_mut()
+            .as_mut()
+            .filter(|chat| chat.id == id)
+        {
+            chat.forum = enabled;
+        }
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
+        if changed {
+            if self.selection.get() == Some(id)
+                && let Some(chat) = self.chat_view(id)
+            {
+                self.reload_forum_view(chat);
+            } else {
+                self.history_cache.borrow_mut().remove(id);
+            }
+        }
+        self.render_chats();
+        self.refresh_chats();
+    }
+
+    fn reload_forum_view(self: &Rc<Self>, chat: Chat) {
+        self.history_cache.borrow_mut().remove(chat.id);
+        self.history_refreshed.set(None);
+        if let Some(picker) = self.topic_picker.upgrade() {
+            picker.close();
+        }
+        self.display_conversation(chat, None, None, self.split.shows_content());
+    }
+
     fn open_message_search(self: &Rc<Self>, scoped: bool) {
         if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
             || self.chat_dialog_open()
@@ -3712,7 +3784,7 @@ impl Ui {
         };
         self.choose_forum_topic(chat, true, move |ui, topic| {
             if ui.selection.get() == Some(chat)
-                && let Some(chat) = ui.chat_view(chat)
+                && let Some(chat) = ui.chat_view(chat).filter(|view| view.forum)
             {
                 ui.show_conversation(chat, Some(topic), None);
             }
@@ -3742,7 +3814,11 @@ impl Ui {
                 write: Box::new(move |write| {
                     let client = client.clone();
                     let write = if demo {
-                        let result = demo_forums.borrow_mut().write(write);
+                        let result = demo_forums
+                            .borrow_mut()
+                            .entry(chat)
+                            .or_insert_with(|| demo::ForumTopics::for_chat(chat))
+                            .write(write);
                         return Box::pin(async move { result });
                     } else {
                         write
@@ -3767,7 +3843,11 @@ impl Ui {
             move |cursor| {
                 let client = client.clone();
                 let sample = demo.then(|| {
-                    let mut page = demo_forums.borrow().page(cursor);
+                    let mut page = demo_forums
+                        .borrow_mut()
+                        .entry(chat)
+                        .or_insert_with(|| demo::ForumTopics::for_chat(chat))
+                        .page(cursor);
                     let read = read_topics.borrow();
                     for topic in &mut page.topics {
                         if read.contains(&Conversation {
@@ -3874,7 +3954,13 @@ impl Ui {
                     .find(|message| message.id == anchor)
                     .map(|message| message.topic.unwrap_or(GENERAL_TOPIC))
             });
-            let topic = topic.and_then(|id| self.demo_forums.borrow().topic(id));
+            let topic = topic.and_then(|id| {
+                self.demo_forums
+                    .borrow_mut()
+                    .entry(chat)
+                    .or_insert_with(|| demo::ForumTopics::for_chat(chat))
+                    .topic(id)
+            });
             if let Some(topic) = topic {
                 self.show_conversation(view, Some(topic), Some(anchor));
             }
@@ -3916,14 +4002,26 @@ impl Ui {
         topic: Option<ForumTopic>,
         anchor: Option<i32>,
     ) {
+        self.display_conversation(chat, topic, anchor, true);
+    }
+
+    fn display_conversation(
+        self: &Rc<Self>,
+        chat: Chat,
+        topic: Option<ForumTopic>,
+        anchor: Option<i32>,
+        reveal: bool,
+    ) {
         let id = chat.id;
         let target = Conversation {
             chat: id,
             topic: topic.as_ref().map(|topic| topic.id),
         };
         let overview = chat.forum && topic.is_none();
+        let visible = reveal || !self.split.is_collapsed();
         let previous = self.conversation();
-        if self.is_demo.get()
+        if visible
+            && self.is_demo.get()
             && anchor.is_none()
             && let Some(topic) = &topic
             && self.demo_read_topics.borrow_mut().insert(target)
@@ -3935,7 +4033,9 @@ impl Ui {
         {
             chat.unread = (chat.unread - topic.unread).max(0);
         }
-        self.withdraw_chat_notification(id);
+        if visible {
+            self.withdraw_chat_notification(id);
+        }
         if chat.slow_mode_enabled {
             self.refresh_slow_mode(id);
         }
@@ -3961,9 +4061,12 @@ impl Ui {
                 }),
         );
         self.topics_button.set_visible(chat.forum);
-        self.split.set_show_content(true);
+        if reveal {
+            self.split.set_show_content(true);
+        }
         let client = self.client.borrow().clone();
-        if !chat.forum
+        if visible
+            && !chat.forum
             && self.unread_overrides.borrow_mut().remove(&id)
             && let Some(client) = &client
         {
@@ -3984,7 +4087,9 @@ impl Ui {
         {
             self.selected_topic.replace(topic);
             self.set_chat_writability(chat.can_write);
-            self.focus_composer();
+            if visible {
+                self.focus_composer();
+            }
             if self.is_demo.get()
                 || self.history_refreshed.get().is_some_and(|refreshed| {
                     self.history_revision
@@ -3992,9 +4097,11 @@ impl Ui {
                         .is_fresh(refreshed, revision, now)
                 })
             {
-                self.mark_cached_conversation_read(&chat, target);
+                if visible {
+                    self.mark_cached_conversation_read(&chat, target);
+                }
             } else {
-                self.load_history(None, true);
+                self.load_history(None, visible);
             }
             return;
         }
@@ -4042,7 +4149,9 @@ impl Ui {
         if overview {
             buffer.set_text("");
             self.set_chat_writability(false);
-            self.open_topics_button.grab_focus();
+            if visible {
+                self.open_topics_button.grab_focus();
+            }
             return;
         }
         if let Some(draft) = self.drafts.borrow().get(&target) {
@@ -4069,16 +4178,19 @@ impl Ui {
                 self.render_chats();
             }
             if fresh {
-                self.mark_cached_conversation_read(&chat, target);
+                if visible {
+                    self.mark_cached_conversation_read(&chat, target);
+                }
             } else {
-                self.load_history(None, true);
+                self.load_history(None, visible);
             }
         } else if self.is_demo.get() {
             let (messages, has_older, _) = self.demo_history(target, None, anchor);
             self.messages
                 .borrow_mut()
                 .extend(messages.into_iter().map(|message| (message.id, message)));
-            if !chat.forum
+            if visible
+                && !chat.forum
                 && let Some(chat) = self
                     .chats
                     .borrow_mut()
@@ -4096,9 +4208,9 @@ impl Ui {
             self.render_history(anchor.is_none());
         } else {
             self.render_history(true);
-            self.load_history(None, true);
+            self.load_history(None, visible);
         }
-        if anchor.is_none() {
+        if visible && anchor.is_none() {
             self.focus_composer();
         }
     }

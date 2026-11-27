@@ -5,6 +5,7 @@ mod desktop_notifications;
 pub(crate) use desktop_notifications::NotificationFilter;
 use desktop_notifications::{PendingNotification, notification_for};
 mod forum_management;
+mod forum_mode;
 mod forum_topics;
 mod group_permissions;
 mod invite_members;
@@ -846,6 +847,10 @@ impl Telegram {
                 }
             }
             enums::ChatFull::ChannelFull(full) => {
+                if let Some(mode) = &mut profile.forum_mode {
+                    mode.linked_discussion = full.linked_chat_id.is_some();
+                    mode.hidden_history = full.hidden_prehistory;
+                }
                 if let Some(permissions) = &mut profile.group_permissions {
                     permissions.slow_mode = Some(full.slowmode_seconds.unwrap_or_default());
                 }
@@ -3540,6 +3545,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         can_read_admin_log: false,
         addresses: None,
         group_permissions: group_permissions::group_permissions(peer).map(|(settings, _)| settings),
+        forum_mode: None,
         bot_commands: Vec::new(),
     };
     let channel = match peer {
@@ -3589,6 +3595,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         Peer::Community(_) => None,
     };
     if let Some(channel) = channel {
+        profile.forum_mode = forum_mode::owner_forum_mode(channel);
         profile.admin_policy = channel_admin_policy(channel);
         profile.can_read_admin_log = !channel.left
             && !channel.min
