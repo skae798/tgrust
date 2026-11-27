@@ -205,6 +205,16 @@ pub fn open(
     api_hash: Option<String>,
     runtime: Runtime,
 ) -> adw::ApplicationWindow {
+    build_window(app, accounts, account, api_hash, runtime).0
+}
+
+fn build_window(
+    app: &adw::Application,
+    accounts: Rc<Accounts>,
+    account: Account,
+    api_hash: Option<String>,
+    runtime: Runtime,
+) -> (adw::ApplicationWindow, Rc<Ui>) {
     let demo = matches!(account, Account::Demo(_));
     let title = if matches!(account, Account::Welcome | Account::Demo(0)) {
         "tgrust".into()
@@ -1219,7 +1229,7 @@ pub fn open(
     } else {
         ui.connect();
     }
-    window
+    (window, ui)
 }
 
 impl Ui {
@@ -6567,6 +6577,7 @@ impl Ui {
     }
 
     fn apply_deletion(self: &Rc<Self>, chat: i64, id: i32) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.is_demo.get()
             && let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
         {
@@ -6633,6 +6644,7 @@ impl Ui {
     }
 
     fn apply_message_pin(self: &Rc<Self>, chat: i64, id: i32, pinned: bool) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.selection.get() != Some(chat) {
             return;
         }
@@ -6693,6 +6705,7 @@ impl Ui {
     }
 
     fn apply_reactions(self: &Rc<Self>, chat: i64, id: i32, reactions: Vec<Reaction>) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.selection.get() == Some(chat) {
             if let Some(message) = self.messages.borrow_mut().get_mut(&id) {
                 message.reactions = reactions;
@@ -7209,6 +7222,85 @@ mod tests {
             caption.select_region(2, 7);
             assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
             assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn completed_message_actions_survive_switching_away_and_back() {
+        gtk::test_synced(|| {
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.CacheTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !(340..=360).contains(&window.width()) && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // X11 client-side shadows can subtract 10 px from the requested width.
+            assert!((340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            while !ui.input.is_mapped() && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ui.input.grab_focus());
+            assert_eq!(
+                gtk::prelude::RootExt::focus(&window),
+                Some(ui.input.clone().upcast())
+            );
+            let id = *ui.messages.borrow().last_key_value().unwrap().0;
+            ui.input.buffer().set_text("Черновик первого чата");
+            ui.show_chat(2, None);
+            ui.input.buffer().set_text("Черновик второго чата");
+            ui.set_message_pinned(1, id, true);
+            ui.show_chat(1, None);
+            assert!(
+                ui.messages.borrow()[&id].pinned,
+                "Completed pin was lost to a cached page"
+            );
+            ui.show_chat(2, None);
+            ui.toggle_reaction(1, id, "👍".into());
+            ui.show_chat(1, None);
+            assert!(
+                ui.messages.borrow()[&id]
+                    .reactions
+                    .iter()
+                    .any(|reaction| reaction.emoji == "👍" && reaction.chosen),
+                "Completed reaction was lost to a cached page"
+            );
+            ui.show_chat(2, None);
+            ui.apply_deletion(1, id);
+            ui.show_chat(1, None);
+            assert!(
+                !ui.messages.borrow().contains_key(&id),
+                "Deleted message reappeared from a cached page"
+            );
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик первого чата"
+            );
+            ui.show_chat(2, None);
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик второго чата"
+            );
+            window.close();
         });
     }
 
