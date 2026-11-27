@@ -366,7 +366,35 @@ pub struct PeerProfile {
     pub can_read_admin_log: bool,
     pub addresses: Option<ChatAddresses>,
     pub group_permissions: Option<GroupPermissionSettings>,
+    pub forum_mode: Option<ForumMode>,
     pub bot_commands: Vec<BotCommand>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForumMode {
+    pub enabled: bool,
+    pub linked_discussion: bool,
+    pub hidden_history: bool,
+}
+
+impl ForumMode {
+    pub fn needs_change(self, confirmed: Self) -> anyhow::Result<bool> {
+        let enable = !confirmed.enabled;
+        if self.enabled == enable {
+            return Ok(false);
+        }
+        if enable {
+            anyhow::ensure!(
+                !self.linked_discussion,
+                "Темы недоступны в группе обсуждения, привязанной к каналу"
+            );
+            anyhow::ensure!(
+                !self.hidden_history || confirmed.hidden_history,
+                "Видимость истории изменилась. Откройте настройки тем снова"
+            );
+        }
+        Ok(true)
+    }
 }
 
 pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
@@ -1137,6 +1165,7 @@ pub enum NewChatKind {
 #[derive(Clone)]
 pub struct NewChatDraft {
     pub kind: NewChatKind,
+    pub forum: bool,
     pub info: ChatInfo,
     pub username: String,
     pub members: Vec<Contact>,
@@ -1164,6 +1193,10 @@ impl NewChatDraft {
             "Публичное имя доступно для супергрупп и каналов"
         );
         anyhow::ensure!(
+            !self.forum || self.kind == NewChatKind::Supergroup,
+            "Темы доступны в супергруппах"
+        );
+        anyhow::ensure!(
             self.kind != NewChatKind::Group || !self.members.is_empty(),
             "Выберите хотя бы одного участника"
         );
@@ -1188,7 +1221,7 @@ impl NewChatDraft {
             preview_sender: None,
             preview_image: None,
             group: self.kind != NewChatKind::Channel,
-            forum: false,
+            forum: self.forum,
             unread: 0,
             unread_mark: false,
             last_message_id: 0,
@@ -2563,6 +2596,7 @@ mod tests {
     fn chat_creation_validates_type_address_and_unique_contacts() {
         let mut draft = NewChatDraft {
             kind: NewChatKind::Group,
+            forum: false,
             info: ChatInfo {
                 title: "  План  ".into(),
                 about: " Справка ".into(),
@@ -2586,12 +2620,28 @@ mod tests {
         assert_eq!(group.info.title, "План");
         assert_eq!(group.info.about, "Справка");
         assert_eq!(group.members.len(), 1);
+        draft.forum = true;
+        assert!(draft.clone().validate().is_err());
+        draft.kind = NewChatKind::Supergroup;
+        assert!(
+            draft
+                .clone()
+                .validate()
+                .unwrap()
+                .chat(-1000000000234, 0)
+                .forum
+        );
+        draft.kind = NewChatKind::Group;
+        draft.forum = false;
         draft.username = " @project_1 ".into();
         assert!(draft.clone().validate().is_err());
         draft.kind = NewChatKind::Channel;
         let channel = draft.clone().validate().unwrap();
         assert_eq!(channel.username, "project_1");
         assert!(channel.chat(-1000000000234, 0).can_write);
+        draft.forum = true;
+        assert!(draft.clone().validate().is_err());
+        draft.forum = false;
         draft.members[0].kind = ChatKind::Bot;
         assert!(draft.validate().is_err());
         for invalid in [
@@ -3178,6 +3228,35 @@ mod tests {
         topic.id = GENERAL_TOPIC;
         assert!(admin.allows(&topic, &Hidden(true)));
         assert!(!admin.allows(&topic, &Delete));
+    }
+
+    #[test]
+    fn enabling_topics_rechecks_linked_discussions_and_history_consent() {
+        let disabled = ForumMode {
+            enabled: false,
+            linked_discussion: false,
+            hidden_history: false,
+        };
+        let enabled = ForumMode {
+            enabled: true,
+            ..disabled
+        };
+        let hidden = ForumMode {
+            hidden_history: true,
+            ..disabled
+        };
+        let linked = ForumMode {
+            linked_discussion: true,
+            ..disabled
+        };
+        assert!(disabled.needs_change(disabled).unwrap());
+        assert!(!enabled.needs_change(disabled).unwrap());
+        assert!(hidden.needs_change(disabled).is_err());
+        assert!(hidden.needs_change(hidden).unwrap());
+        assert!(disabled.needs_change(hidden).unwrap());
+        assert!(linked.needs_change(disabled).is_err());
+        assert!(enabled.needs_change(enabled).unwrap());
+        assert!(!disabled.needs_change(enabled).unwrap());
     }
 
     #[test]

@@ -5,14 +5,15 @@ use crate::model::{
     ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
     BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, CreatedChat,
-    FORUM_PAGE_SIZE, ForumCursor, ForumPage, ForumPermissions, ForumTopic, ForumTopicChange,
-    ForumWrite, ForumWriteResult, GENERAL_TOPIC, GroupPermission, GroupPermissionSettings,
-    GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink,
-    InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor,
-    JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
-    MemberRestriction, MemberRestrictionEdit, MemberRestrictionSettings, MemberRole, Message,
-    NewChatDraft, NewChatKind, NewChatResult, PeerProfile, PlayableMedia, PlaybackProgress,
-    PlaybackSource, PollDraft, TextLink, forum_topic_title, restriction_now,
+    FORUM_PAGE_SIZE, ForumCursor, ForumMode, ForumPage, ForumPermissions, ForumTopic,
+    ForumTopicChange, ForumWrite, ForumWriteResult, GENERAL_TOPIC, GroupPermission,
+    GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
+    InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest,
+    JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
+    MemberModeration, MemberPage, MemberRestriction, MemberRestrictionEdit,
+    MemberRestrictionSettings, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
+    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
+    forum_topic_title, restriction_now,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -152,6 +153,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             can_read_admin_log: false,
             addresses: None,
             group_permissions: None,
+            forum_mode: None,
             bot_commands: Vec::new(),
         });
     }
@@ -235,6 +237,11 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             }),
             _ => None,
         },
+        forum_mode: (id == FORUM_CHAT).then_some(ForumMode {
+            enabled: true,
+            linked_discussion: false,
+            hidden_history: false,
+        }),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -310,7 +317,13 @@ pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
         }),
         group_permissions: (!broadcast).then(|| GroupPermissionSettings {
             slow_mode: (draft.kind == NewChatKind::Supergroup).then_some(0),
+            forum: draft.forum,
             ..group_permissions(GroupPermissions::all(), !draft.username.is_empty())
+        }),
+        forum_mode: (draft.kind == NewChatKind::Supergroup).then_some(ForumMode {
+            enabled: draft.forum,
+            linked_discussion: false,
+            hidden_history: false,
         }),
         bot_commands: Vec::new(),
     }
@@ -1032,16 +1045,29 @@ const FORUM_PERMISSIONS: ForumPermissions = ForumPermissions {
 
 #[derive(Default)]
 pub struct ForumTopics {
+    seeded: bool,
     edits: HashMap<i32, Option<ForumTopic>>,
     created: HashMap<i64, i32>,
 }
 
 impl ForumTopics {
+    pub fn for_chat(chat: i64) -> Self {
+        Self {
+            seeded: chat == FORUM_CHAT,
+            ..Self::default()
+        }
+    }
+
     pub fn topic(&self, id: i32) -> Option<ForumTopic> {
-        self.edits
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| forum_topic(id))
+        self.edits.get(&id).cloned().unwrap_or_else(|| {
+            if self.seeded || id == GENERAL_TOPIC {
+                let mut topic = forum_topic(id)?;
+                topic.pinned &= self.seeded;
+                Some(topic)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn page(&self, cursor: ForumCursor) -> ForumPage {
