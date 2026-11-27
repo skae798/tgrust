@@ -5,7 +5,8 @@ use std::io::Cursor;
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::media::{Document, Sticker as TelegramSticker};
 use grammers_client::tl::functions::messages::{
-    GetAllStickers, GetFavedStickers, GetRecentStickers, GetStickerSet, SaveRecentSticker,
+    FaveSticker, GetAllStickers, GetFavedStickers, GetRecentStickers, GetStickerSet,
+    SaveRecentSticker,
 };
 
 use super::*;
@@ -13,6 +14,7 @@ use crate::model::{Sticker, StickerCollection, StickerKind, StickerSource};
 
 #[derive(Default)]
 pub(super) struct StickerCache {
+    favorites: HashSet<i64>,
     sets: HashMap<i64, enums::InputStickerSet>,
     documents: HashMap<i64, CachedSticker>,
 }
@@ -31,6 +33,7 @@ enum Origin {
 
 impl Telegram {
     pub async fn sticker_collections(&self) -> Result<Vec<StickerCollection>> {
+        self.sticker_list(StickerSource::Favorites).await?;
         let mut collections = vec![
             StickerCollection {
                 source: StickerSource::Recent,
@@ -69,6 +72,11 @@ impl Telegram {
     }
 
     pub async fn sticker_list(&self, source: StickerSource) -> Result<Vec<Sticker>> {
+        let _favorites = if source == StickerSource::Favorites {
+            Some(self.sticker_settings.lock().await)
+        } else {
+            None
+        };
         let documents = match source {
             StickerSource::Recent => {
                 let enums::messages::RecentStickers::Stickers(result) = self
@@ -83,14 +91,7 @@ impl Telegram {
                 };
                 result.stickers
             }
-            StickerSource::Favorites => {
-                let enums::messages::FavedStickers::Stickers(result) =
-                    self.client.invoke(&GetFavedStickers { hash: 0 }).await?
-                else {
-                    bail!("Telegram не прислал избранные стикеры");
-                };
-                result.stickers
-            }
+            StickerSource::Favorites => self.favorite_documents().await?,
             StickerSource::Set(id) => {
                 let set = self
                     .stickers
@@ -118,13 +119,17 @@ impl Telegram {
         if cache.documents.len().saturating_add(documents.len()) > 4096 {
             cache.documents.clear();
         }
+        if source == StickerSource::Favorites {
+            cache.favorites = favorite_ids(&documents);
+        }
         let mut seen = HashSet::new();
         let mut stickers = Vec::new();
         for raw in documents {
             let document = document_media(raw);
-            let Some(sticker) = sticker_view(&document) else {
+            let Some(mut sticker) = sticker_view(&document) else {
                 continue;
             };
+            sticker.favorite = cache.favorites.contains(&sticker.id);
             if !seen.insert(sticker.id) {
                 continue;
             }
@@ -138,6 +143,48 @@ impl Telegram {
             stickers.push(sticker);
         }
         Ok(stickers)
+    }
+
+    async fn favorite_documents(&self) -> Result<Vec<enums::Document>> {
+        let enums::messages::FavedStickers::Stickers(result) = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.client.invoke(&GetFavedStickers { hash: 0 }),
+        )
+        .await
+        .context("Telegram не прислал избранные стикеры вовремя")??
+        else {
+            bail!("Telegram не прислал избранные стикеры");
+        };
+        Ok(result.stickers)
+    }
+
+    pub async fn set_sticker_favorite(&self, id: i64, favorite: bool) -> Result<()> {
+        let cached = self.cached_sticker(id)?;
+        with_refreshed_sticker(
+            cached.document,
+            |document| self.change_sticker_favorite(document, favorite),
+            || self.refresh_sticker(id, cached.origin),
+        )
+        .await
+    }
+
+    async fn change_sticker_favorite(&self, document: Document, favorite: bool) -> Result<()> {
+        let _serial = self.sticker_settings.lock().await;
+        let read = || async {
+            self.favorite_documents()
+                .await
+                .map(|documents| favorite_ids(&documents))
+        };
+        let write = async {
+            tokio::time::timeout(
+                Duration::from_secs(12),
+                self.client.invoke(&FaveSticker { id: document.to_raw_input_document(), unfave: !favorite }),
+            ).await.context("Telegram не подтвердил изменение избранного вовремя. Обновите набор перед повтором")??;
+            Ok(())
+        };
+        let ids = reconcile_favorite(document.id(), favorite, read, write).await?;
+        self.stickers.lock().unwrap().favorites = ids;
+        Ok(())
     }
 
     pub(super) fn remember_sticker_message(&self, message: &TelegramMessage) {
@@ -298,10 +345,45 @@ fn sticker_view(document: &Document) -> Option<Sticker> {
         _ => return None,
     };
     Some(Sticker {
+        favorite: false,
         id: document.id(),
         emoji: sticker.emoji().to_owned(),
         kind,
     })
+}
+
+async fn reconcile_favorite<R, F>(
+    id: i64,
+    desired: bool,
+    mut read: R,
+    write: impl Future<Output = Result<()>>,
+) -> Result<HashSet<i64>>
+where
+    R: FnMut() -> F,
+    F: Future<Output = Result<HashSet<i64>>>,
+{
+    let before = read().await?;
+    if before.contains(&id) == desired {
+        return Ok(before);
+    }
+    let result = write.await;
+    // Even a failed response may follow a committed write. Read before offering a retry.
+    let readback = read().await;
+    if let Ok(ids) = &readback
+        && ids.contains(&id) == desired
+    {
+        return readback;
+    }
+    result?;
+    readback?;
+    bail!("Telegram не подтвердил изменение избранного. Обновите набор перед повтором")
+}
+
+fn favorite_ids(documents: &[enums::Document]) -> HashSet<i64> {
+    documents
+        .iter()
+        .filter_map(|raw| sticker_view(&document_media(raw.clone())).map(|sticker| sticker.id))
+        .collect()
 }
 
 fn document_media(document: enums::Document) -> Document {
@@ -577,6 +659,79 @@ mod tests {
             assert!(attachment(&message).is_none());
             assert!(!can_forward(&message));
             assert!(super::super::message_view(&message, None, None, None, None).ephemeral);
+        });
+    }
+
+    #[test]
+    fn favorite_writes_reconcile_lost_responses_and_skip_already_confirmed_changes() {
+        use std::cell::Cell;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for desired in [false, true] {
+                let reads = Cell::new(0);
+                let writes = Cell::new(0);
+                let result = reconcile_favorite(
+                    17,
+                    desired,
+                    || {
+                        let changed = reads.replace(reads.get() + 1) > 0;
+                        let ids = if changed == desired {
+                            HashSet::from([17])
+                        } else {
+                            HashSet::new()
+                        };
+                        async move { Ok(ids) }
+                    },
+                    async {
+                        writes.set(writes.get() + 1);
+                        bail!("Synthetic lost write response")
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.contains(&17), desired);
+                assert_eq!((reads.get(), writes.get()), (2, 1));
+                let result = reconcile_favorite(
+                    17,
+                    desired,
+                    || {
+                        let ids = result.clone();
+                        async move { Ok(ids) }
+                    },
+                    async { panic!("An already confirmed favorite must not be written again") },
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.contains(&17), desired);
+            }
+            let result =
+                reconcile_favorite(17, true, || async { Ok(HashSet::new()) }, async { Ok(()) })
+                    .await;
+            assert!(
+                result.is_err(),
+                "A successful RPC without the requested state is not confirmation"
+            );
+            let reads = Cell::new(0);
+            let result = reconcile_favorite(
+                17,
+                true,
+                || {
+                    let first = reads.replace(reads.get() + 1) == 0;
+                    async move {
+                        if first {
+                            Ok(HashSet::new())
+                        } else {
+                            bail!("Synthetic readback failure")
+                        }
+                    }
+                },
+                async { Ok(()) },
+            )
+            .await;
+            assert!(result.is_err());
         });
     }
 

@@ -1779,6 +1779,7 @@ pub enum StickerKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sticker {
+    pub favorite: bool,
     pub id: i64,
     pub emoji: String,
     pub kind: StickerKind,
