@@ -10,6 +10,7 @@ mod forum_topics;
 mod group_permissions;
 mod invite_members;
 mod member_restrictions;
+mod stickers;
 pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
 
@@ -120,6 +121,7 @@ pub struct Telegram {
     changes: watch::Sender<UpdateStatus>,
     history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
+    stickers: StdMutex<stickers::StickerCache>,
     profile: RwLock<Option<Arc<Peer>>>,
     profile_edit: Mutex<()>,
     contacts_cache: Mutex<Option<ContactSnapshot>>,
@@ -211,6 +213,7 @@ impl Telegram {
                 changes,
                 history_changes: StdMutex::default(),
                 image_downloads: Semaphore::new(4),
+                stickers: StdMutex::new(stickers::StickerCache::default()),
                 profile: RwLock::new(None),
                 profile_edit: Mutex::new(()),
                 contacts_cache: Mutex::new(None),
@@ -2176,6 +2179,7 @@ impl Telegram {
         self_id: Option<PeerId>,
         profile: Option<&Peer>,
     ) -> Message {
+        self.remember_sticker_message(message);
         let chat_author = message_chat_author(message);
         let author = self.message_author(message, profile);
         message_view(message, self_id, profile, chat_author, author)
@@ -2879,6 +2883,7 @@ impl Telegram {
 
     async fn fetch_chat_image(&self, image: ChatImage) -> Result<Vec<u8>> {
         match image {
+            ChatImage::Sticker(id) => self.sticker_image(id).await,
             ChatImage::Avatar(avatar) => {
                 let id = PeerId::from_bot_api_dialog_id(avatar.peer).context("Чат не найден")?;
                 let cached = self.peers.read().await.get(&avatar.peer).copied();
@@ -3140,6 +3145,7 @@ fn attachment_id(media: &Media) -> Option<AttachmentThumbnail> {
     match media {
         Media::Photo(photo) => Some(AttachmentThumbnail::Photo(photo.id())),
         Media::Document(document) => Some(AttachmentThumbnail::Document(document.id())),
+        Media::Sticker(sticker) => Some(AttachmentThumbnail::Document(sticker.document.id())),
         _ => None,
     }
 }
@@ -3896,6 +3902,7 @@ fn message_view(
     let topic = forum_topics::message_topic(&message.raw);
     let outgoing = message.outgoing();
     let attachment = attachment(message);
+    let sticker = stickers::message_sticker(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
     let playback = attachment
         .as_ref()
@@ -3966,7 +3973,7 @@ fn message_view(
                 })
                 || (outgoing && !message.post() && message.sender_id().is_none())),
         timestamp: message.date().as_second(),
-        text: if attachment.is_some() || poll.is_some() {
+        text: if attachment.is_some() || poll.is_some() || sticker.is_some() {
             message.text().to_owned()
         } else {
             message_text(message)
@@ -3983,6 +3990,7 @@ fn message_view(
         audio,
         thumbnail,
         poll,
+        sticker,
         reply_to,
         reply_preview,
         can_reply: matches!(message.raw, enums::Message::Message(_)),
@@ -3998,6 +4006,7 @@ fn message_view(
             || match message.media() {
                 Some(Media::Photo(photo)) => photo.raw.ttl_seconds.is_some(),
                 Some(Media::Document(document)) => document.raw.ttl_seconds.is_some(),
+                Some(Media::Sticker(sticker)) => sticker.document.raw.ttl_seconds.is_some(),
                 _ => false,
             },
     }
@@ -4188,6 +4197,7 @@ fn can_forward(message: &TelegramMessage) -> bool {
         && match message.media() {
             Some(Media::Photo(photo)) => photo.raw.ttl_seconds.is_none(),
             Some(Media::Document(document)) => document.raw.ttl_seconds.is_none(),
+            Some(Media::Sticker(sticker)) => sticker.document.raw.ttl_seconds.is_none(),
             _ => true,
         }
 }
@@ -4358,6 +4368,8 @@ fn message_text(message: &TelegramMessage) -> String {
         message.text().to_owned()
     } else if message.action().is_some() {
         "Событие в чате".to_owned()
+    } else if let Some(sticker) = stickers::message_sticker(message) {
+        sticker.label()
     } else if let Some(Media::Poll(raw)) = message.media() {
         let kind = if raw.raw.quiz {
             "Викторина"
@@ -4518,6 +4530,16 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
     let name = match &media {
         Media::Photo(photo) if photo.raw.ttl_seconds.is_none() => {
             format!("photo-{}.jpg", message.id())
+        }
+        Media::Sticker(sticker) if sticker.document.raw.ttl_seconds.is_none() => {
+            let extension = match sticker.document.mime_type() {
+                Some("image/webp") => "webp",
+                Some("application/x-tgsticker") => "tgs",
+                Some("video/webm") => "webm",
+                _ => "bin",
+            };
+            let fallback = format!("sticker-{}.{extension}", message.id());
+            attachment_name(sticker.document.name().unwrap_or(&fallback), &fallback)
         }
         Media::Document(document) if document.raw.ttl_seconds.is_none() => {
             let fallback = format!("file-{}", message.id());

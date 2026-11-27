@@ -1758,6 +1758,48 @@ impl ChatFolder {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StickerSource {
+    Recent,
+    Favorites,
+    Set(i64),
+}
+
+#[derive(Clone, Debug)]
+pub struct StickerCollection {
+    pub source: StickerSource,
+    pub title: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickerKind {
+    Static,
+    Animated,
+    Video,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sticker {
+    pub id: i64,
+    pub emoji: String,
+    pub kind: StickerKind,
+}
+
+impl Sticker {
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            StickerKind::Static => "Стикер",
+            StickerKind::Animated => "Анимированный стикер",
+            StickerKind::Video => "Видеостикер",
+        };
+        if self.emoji.is_empty() {
+            kind.into()
+        } else {
+            format!("{} {kind}", self.emoji)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Avatar {
     pub peer: i64,
     pub photo: i64,
@@ -1772,6 +1814,7 @@ pub enum AttachmentThumbnail {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChatImage {
+    Sticker(i64),
     Avatar(Avatar),
     Attachment {
         chat: i64,
@@ -2032,6 +2075,7 @@ pub struct Message {
     pub audio: Option<AudioInfo>,
     pub thumbnail: Option<AttachmentThumbnail>,
     pub poll: Option<Poll>,
+    pub sticker: Option<Sticker>,
     pub reply_to: Option<i32>,
     pub reply_preview: Option<ReplyPreview>,
     pub can_reply: bool,
@@ -2278,6 +2322,9 @@ impl Message {
     }
 
     pub fn preview_text(&self) -> Cow<'_, str> {
+        if let Some(sticker) = &self.sticker {
+            return Cow::Owned(sticker.label());
+        }
         if let Some(poll) = &self.poll {
             let kind = if poll.quiz {
                 "Викторина"
@@ -3139,6 +3186,7 @@ mod tests {
                 audio: None,
                 thumbnail: None,
                 poll: None,
+                sticker: None,
                 reply_to: None,
                 reply_preview: None,
                 can_reply: true,

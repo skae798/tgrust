@@ -36,6 +36,7 @@ mod qr_login;
 mod read_state;
 mod search;
 mod session_runner;
+mod stickers;
 mod storage;
 mod telegram;
 mod ui;
