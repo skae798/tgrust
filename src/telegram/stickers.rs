@@ -1,3 +1,5 @@
+mod packs;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Cursor;
@@ -38,10 +40,12 @@ impl Telegram {
             StickerCollection {
                 source: StickerSource::Recent,
                 title: "Недавние".into(),
+                installed: None,
             },
             StickerCollection {
                 source: StickerSource::Favorites,
                 title: "Избранные".into(),
+                installed: None,
             },
         ];
         let enums::messages::AllStickers::Stickers(result) =
@@ -66,6 +70,7 @@ impl Telegram {
             collections.push(StickerCollection {
                 source: StickerSource::Set(set.id),
                 title: set.title,
+                installed: Some(true),
             });
         }
         Ok(collections)
@@ -182,7 +187,7 @@ impl Telegram {
             ).await.context("Telegram не подтвердил изменение избранного вовремя. Обновите набор перед повтором")??;
             Ok(())
         };
-        let ids = reconcile_favorite(document.id(), favorite, read, write).await?;
+        let ids = reconcile_sticker_membership(document.id(), favorite, read, write).await?;
         self.stickers.lock().unwrap().favorites = ids;
         Ok(())
     }
@@ -352,7 +357,7 @@ fn sticker_view(document: &Document) -> Option<Sticker> {
     })
 }
 
-async fn reconcile_favorite<R, F>(
+async fn reconcile_sticker_membership<R, F>(
     id: i64,
     desired: bool,
     mut read: R,
@@ -376,7 +381,7 @@ where
     }
     result?;
     readback?;
-    bail!("Telegram не подтвердил изменение избранного. Обновите набор перед повтором")
+    bail!("Telegram не подтвердил изменение списка стикеров. Обновите набор перед повтором")
 }
 
 fn favorite_ids(documents: &[enums::Document]) -> HashSet<i64> {
@@ -673,7 +678,7 @@ mod tests {
             for desired in [false, true] {
                 let reads = Cell::new(0);
                 let writes = Cell::new(0);
-                let result = reconcile_favorite(
+                let result = reconcile_sticker_membership(
                     17,
                     desired,
                     || {
@@ -694,7 +699,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(result.contains(&17), desired);
                 assert_eq!((reads.get(), writes.get()), (2, 1));
-                let result = reconcile_favorite(
+                let result = reconcile_sticker_membership(
                     17,
                     desired,
                     || {
@@ -708,14 +713,16 @@ mod tests {
                 assert_eq!(result.contains(&17), desired);
             }
             let result =
-                reconcile_favorite(17, true, || async { Ok(HashSet::new()) }, async { Ok(()) })
-                    .await;
+                reconcile_sticker_membership(17, true, || async { Ok(HashSet::new()) }, async {
+                    Ok(())
+                })
+                .await;
             assert!(
                 result.is_err(),
                 "A successful RPC without the requested state is not confirmation"
             );
             let reads = Cell::new(0);
-            let result = reconcile_favorite(
+            let result = reconcile_sticker_membership(
                 17,
                 true,
                 || {

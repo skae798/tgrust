@@ -1768,6 +1768,65 @@ pub enum StickerSource {
 pub struct StickerCollection {
     pub source: StickerSource,
     pub title: String,
+    pub installed: Option<bool>,
+}
+
+pub struct StickerPackChange {
+    pub collection: StickerCollection,
+    pub archived: Option<usize>,
+}
+
+pub fn sticker_pack_name(input: &str) -> anyhow::Result<String> {
+    let input = input.trim();
+    let name =
+        if input.contains("://") || input.starts_with("t.me/") || input.starts_with("telegram.me/")
+        {
+            let link = if input.contains("://") {
+                input.to_owned()
+            } else {
+                format!("https://{input}")
+            };
+            let url = url::Url::parse(&link)?;
+            anyhow::ensure!(
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port().is_none()
+                    && url.fragment().is_none(),
+                "Введите имя набора или ссылку Telegram"
+            );
+            if url.scheme() == "tg" && url.host_str() == Some("addstickers") {
+                let pairs: Vec<_> = url.query_pairs().collect();
+                anyhow::ensure!(
+                    url.path().is_empty() && pairs.len() == 1 && pairs[0].0 == "set",
+                    "Некорректная ссылка на набор"
+                );
+                pairs[0].1.to_string()
+            } else {
+                anyhow::ensure!(
+                    url.scheme() == "https"
+                        && matches!(url.host_str(), Some("t.me" | "telegram.me"))
+                        && url.query().is_none(),
+                    "Введите ссылку t.me/addstickers/имя"
+                );
+                let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+                anyhow::ensure!(
+                    parts.len() == 2 && parts[0] == "addstickers",
+                    "Введите ссылку t.me/addstickers/имя"
+                );
+                parts[1].to_owned()
+            }
+        } else {
+            input.to_owned()
+        };
+    anyhow::ensure!(
+        (1..=64).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_'),
+        "Имя набора должно содержать до 64 латинских букв, цифр и подчёркиваний и начинаться с буквы"
+    );
+    Ok(name)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2580,6 +2639,37 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn sticker_pack_links_accept_only_telegram_sets_and_valid_short_names() {
+        for input in [
+            "  Cat_Set  ",
+            "https://t.me/addstickers/Cat_Set",
+            "t.me/addstickers/Cat_Set/",
+            "https://telegram.me/addstickers/Cat_Set",
+            "tg://addstickers?set=Cat_Set",
+        ] {
+            assert_eq!(sticker_pack_name(input).unwrap(), "Cat_Set");
+        }
+        for input in [
+            "",
+            "1cat",
+            "Кот",
+            "cat/set",
+            "https://example.org/addstickers/Cat_Set",
+            "https://t.me.evil.test/addstickers/Cat_Set",
+            "https://user@t.me/addstickers/Cat_Set",
+            "https://t.me/addstickers/cat?other=1",
+            "https://t.me/addstickers/cat/more",
+            "tg://addstickers?set=cat&set=dog",
+            "tg://addstickers?other=cat",
+            "tg://addemoji?set=cat",
+        ] {
+            assert!(sticker_pack_name(input).is_err(), "{input}");
+        }
+        assert!(sticker_pack_name(&"a".repeat(64)).is_ok());
+        assert!(sticker_pack_name(&"a".repeat(65)).is_err());
     }
 
     #[test]

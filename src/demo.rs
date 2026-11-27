@@ -1577,9 +1577,123 @@ pub fn sticker_message(id: i32, sticker: crate::model::Sticker) -> Message {
     message
 }
 
+pub struct StickerPacks {
+    names: Vec<String>,
+    installed: HashSet<i64>,
+}
+
+impl Default for StickerPacks {
+    fn default() -> Self {
+        Self {
+            names: vec!["SpaceCat".into()],
+            installed: HashSet::from([1]),
+        }
+    }
+}
+
+impl StickerPacks {
+    fn collection(&self, id: i64) -> anyhow::Result<crate::model::StickerCollection> {
+        use crate::model::{StickerCollection, StickerSource};
+        let index = usize::try_from(
+            id.checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("Набор недоступен"))?,
+        )?;
+        let name = self
+            .names
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("Набор недоступен"))?;
+        Ok(StickerCollection {
+            source: StickerSource::Set(id),
+            title: if id == 1 {
+                "Демо — космический кот".into()
+            } else {
+                format!("Демо · {name}")
+            },
+            installed: Some(self.installed.contains(&id)),
+        })
+    }
+
+    pub fn collections(&self) -> Vec<crate::model::StickerCollection> {
+        use crate::model::{StickerCollection, StickerSource};
+        let mut collections = vec![
+            StickerCollection {
+                source: StickerSource::Recent,
+                title: "Недавние".into(),
+                installed: None,
+            },
+            StickerCollection {
+                source: StickerSource::Favorites,
+                title: "Избранные".into(),
+                installed: None,
+            },
+        ];
+        collections.extend(
+            (1..=self.names.len() as i64)
+                .filter(|id| self.installed.contains(id))
+                .filter_map(|id| self.collection(id).ok()),
+        );
+        collections
+    }
+
+    pub fn open(&mut self, input: &str) -> anyhow::Result<crate::model::StickerCollection> {
+        let name = crate::model::sticker_pack_name(input)?;
+        let id = self
+            .names
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(&name))
+            .map_or_else(
+                || {
+                    self.names.push(name);
+                    self.names.len() as i64
+                },
+                |index| index as i64 + 1,
+            );
+        self.collection(id)
+    }
+
+    pub fn change(
+        &mut self,
+        id: i64,
+        installed: bool,
+    ) -> anyhow::Result<crate::model::StickerPackChange> {
+        self.collection(id)?;
+        if installed {
+            self.installed.insert(id);
+        } else {
+            self.installed.remove(&id);
+        }
+        Ok(crate::model::StickerPackChange {
+            collection: self.collection(id)?,
+            archived: Some(0),
+        })
+    }
+}
+
 #[cfg(test)]
-mod join_request_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn sticker_packs_keep_preview_identity_and_installation_separate_per_account() {
+        use crate::model::StickerSource;
+        let mut first = StickerPacks::default();
+        let second = StickerPacks::default();
+        let preview = first.open("https://t.me/addstickers/SpaceDogs").unwrap();
+        let StickerSource::Set(id) = preview.source else {
+            panic!()
+        };
+        assert_eq!(preview.installed, Some(false));
+        assert_eq!(first.collections().len(), 3);
+        first.change(id, true).unwrap();
+        assert_eq!(first.collections().len(), 4);
+        assert_eq!(second.collections().len(), 3);
+        assert_eq!(first.open("spacedogs").unwrap().source, preview.source);
+        first.change(id, false).unwrap();
+        assert_eq!(first.collections().len(), 3);
+        assert_eq!(first.open("SpaceDogs").unwrap().source, preview.source);
+        assert!(first.change(999, true).is_err());
+        assert!(first.change(i64::MIN, true).is_err());
+    }
 
     #[test]
     fn join_request_pages_and_decision_retries_stay_in_their_chat() {

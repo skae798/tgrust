@@ -109,6 +109,7 @@ struct Ui {
     poll_dialog: glib::WeakRef<adw::Dialog>,
     stickers_dialog: glib::WeakRef<adw::Dialog>,
     demo_favorite_stickers: Rc<RefCell<HashSet<i64>>>,
+    demo_sticker_packs: Rc<RefCell<demo::StickerPacks>>,
     own_name: RefCell<Option<String>>,
     own_avatar: Cell<Option<Option<Avatar>>>,
     account_label: gtk::Label,
@@ -646,6 +647,7 @@ fn build_window(
         poll_dialog: glib::WeakRef::new(),
         stickers_dialog: glib::WeakRef::new(),
         demo_favorite_stickers: Rc::default(),
+        demo_sticker_packs: Rc::default(),
         own_name: RefCell::new(None),
         own_avatar: Cell::new(None),
         account_label: menu_label,
@@ -5856,6 +5858,7 @@ impl Ui {
                 runtime: self.runtime.clone(),
                 client: self.client.borrow().clone(),
                 demo_favorites: self.demo_favorite_stickers.clone(),
+                demo_packs: self.demo_sticker_packs.clone(),
                 send: Box::new(move |sticker, random_id| {
                     let weak = weak.clone();
                     let reply = reply.clone();
