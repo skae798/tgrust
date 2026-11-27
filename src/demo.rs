@@ -1176,6 +1176,7 @@ pub fn history(chat: i64) -> Vec<Message> {
             topic: Some(topic),
             text,
             poll: None,
+            sticker: None,
             self_authored: false,
             outgoing: false,
             can_edit: false,
@@ -1350,6 +1351,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 ((chat == 1 && index == 3) || chat == 3).then_some(AttachmentThumbnail::Photo(chat))
             },
             poll: None,
+            sticker: None,
             reply_to: (chat == 1 && index == 1).then_some(81),
             reply_preview: None,
             can_reply: true,
@@ -1391,6 +1393,16 @@ pub fn history(chat: i64) -> Vec<Message> {
             message
         });
         messages.splice(..0, older);
+        let mut sticker = sticker_message(
+            85,
+            crate::model::Sticker {
+                id: 1,
+                emoji: "🐱".into(),
+                kind: crate::model::StickerKind::Static,
+            },
+        );
+        sticker.timestamp = today - 10;
+        messages.push(sticker);
     }
     messages
 }
@@ -1413,6 +1425,7 @@ pub fn poll_message(id: i32, draft: PollDraft) -> Message {
         audio: None,
         thumbnail: None,
         poll: Some(draft.into_poll(i64::from(id))),
+        sticker: None,
         reply_to: None,
         reply_preview: None,
         can_reply: true,
@@ -1552,6 +1565,15 @@ pub fn privacy_settings()
         )
     })
     .collect()
+}
+
+pub fn sticker_message(id: i32, sticker: crate::model::Sticker) -> Message {
+    let mut message = poll_message(id, PollDraft::default());
+    message.poll = None;
+    message.attachment =
+        (sticker.kind == crate::model::StickerKind::Static).then(|| format!("sticker-{id}.webp"));
+    message.sticker = Some(sticker);
+    message
 }
 
 #[cfg(test)]

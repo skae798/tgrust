@@ -24,6 +24,7 @@ The prebuilt client checks for updates automatically and opens the new build on 
 - **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers.
 - **Chats** — create groups and channels, enable and manage supergroup topics, folders, archive, GNOME notifications, member and admin management, group and individual restrictions, slow mode, invitations, public addresses, and recent actions.
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.
+- **Stickers** — recent, favorite, and installed packs; send to chats or topics, including replies. WebP images render in full; TGS and video stickers use a server thumbnail without animation.
 
 ## Documentation
 
