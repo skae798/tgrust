@@ -1396,6 +1396,7 @@ pub fn history(chat: i64) -> Vec<Message> {
         let mut sticker = sticker_message(
             85,
             crate::model::Sticker {
+                favorite: false,
                 id: 1,
                 emoji: "🐱".into(),
                 kind: crate::model::StickerKind::Static,

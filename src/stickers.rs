@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -18,6 +19,7 @@ type SendSticker = Pin<Box<dyn Future<Output = Result<()>>>>;
 pub struct ContextData {
     pub runtime: Handle,
     pub client: Option<Arc<Telegram>>,
+    pub demo_favorites: Rc<RefCell<HashSet<i64>>>,
     pub send: Box<dyn Fn(Sticker, i64) -> SendSticker>,
 }
 
@@ -35,6 +37,8 @@ struct Picker {
     generation: Cell<u64>,
     closed: Cell<bool>,
     sending: Cell<bool>,
+    editing: Cell<bool>,
+    favorite_focus: Cell<Option<i64>>,
     attempt: Cell<Option<(i64, i64)>>,
 }
 
@@ -102,6 +106,8 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
         generation: Cell::new(0),
         closed: Cell::new(false),
         sending: Cell::new(false),
+        editing: Cell::new(false),
+        favorite_focus: Cell::new(None),
         attempt: Cell::new(None),
     });
     state.source.connect_selected_notify(glib::clone!(
@@ -216,7 +222,7 @@ impl Picker {
     }
 
     fn load(self: &Rc<Self>) {
-        if self.closed.get() || self.sending.get() {
+        if self.closed.get() || self.sending.get() || self.editing.get() {
             return;
         }
         let Some(source) = self
@@ -242,11 +248,22 @@ impl Picker {
                 },
             );
         } else {
-            self.render(demo_stickers(source));
+            let favorites = self.context.demo_favorites.borrow();
+            let stickers = demo_stickers(StickerSource::Recent)
+                .into_iter()
+                .filter_map(|mut sticker| {
+                    sticker.favorite = favorites.contains(&sticker.id);
+                    (source != StickerSource::Favorites || sticker.favorite).then_some(sticker)
+                })
+                .collect();
+            drop(favorites);
+            self.render(stickers);
         }
     }
 
     fn render(self: &Rc<Self>, stickers: Vec<Sticker>) {
+        let focus = self.favorite_focus.take();
+        let mut restored = false;
         self.status.set_text(if stickers.is_empty() {
             "Здесь пока нет стикеров"
         } else {
@@ -295,12 +312,54 @@ impl Picker {
                     }
                 }
             ));
+            let sent_sticker = sticker.clone();
             button.connect_clicked(glib::clone!(
                 #[weak(rename_to = state)]
                 self,
-                move |_| state.send(sticker.clone())
+                move |_| state.send(sent_sticker.clone())
             ));
-            self.flow.insert(&button, -1);
+            let favorite = gtk::Button::builder()
+                .icon_name(if sticker.favorite {
+                    "starred-symbolic"
+                } else {
+                    "non-starred-symbolic"
+                })
+                .tooltip_text(if sticker.favorite {
+                    "Убрать из избранных стикеров"
+                } else {
+                    "В избранные стикеры"
+                })
+                .halign(gtk::Align::Center)
+                .build();
+            favorite.add_css_class("flat");
+            favorite.update_property(&[gtk::accessible::Property::Label(if sticker.favorite {
+                "Убрать из избранных стикеров"
+            } else {
+                "В избранные стикеры"
+            })]);
+            if focus == Some(sticker.id) {
+                restored = true;
+                let claimed = Cell::new(false);
+                favorite.connect_map(move |button| {
+                    if !claimed.replace(true) {
+                        button.grab_focus();
+                    }
+                });
+            }
+
+            favorite.set_widget_name(&format!("favorite-{}", sticker.id));
+            favorite.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |_| state.change_favorite(sticker.clone())
+            ));
+            let item = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            item.append(&button);
+            item.append(&favorite);
+            self.flow.insert(&item, -1);
+        }
+        if focus.is_some() && !restored {
+            self.source.grab_focus();
         }
     }
 
@@ -333,8 +392,63 @@ impl Picker {
         ));
     }
 
+    fn change_favorite(self: &Rc<Self>, sticker: Sticker) {
+        if self.closed.get() || self.sending.get() || self.editing.replace(true) {
+            return;
+        }
+        self.favorite_focus.set(Some(sticker.id));
+        let desired = !sticker.favorite;
+        if let Some(client) = self.context.client.clone() {
+            self.flow.set_sensitive(false);
+            self.source.set_sensitive(false);
+            self.status.set_text("Обновление избранного…");
+            let task = self.context.runtime.spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(35),
+                    client.set_sticker_favorite(sticker.id, desired),
+                )
+                .await
+                .context("Результат неизвестен. Обновите набор перед повтором")?
+            });
+            // Do not cancel a write when the picker closes; its readback must finish.
+            glib::MainContext::default().spawn_local(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                async move {
+                    let result = task
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result);
+                    state.editing.set(false);
+                    if state.closed.get() {
+                        return;
+                    }
+                    state.flow.set_sensitive(true);
+                    state.source.set_sensitive(true);
+                    match result {
+                        Ok(()) => state.load(),
+                        Err(error) => {
+                            state
+                                .status
+                                .set_text(&format!("Не удалось изменить избранное. {error}"));
+                            state.retry.set_visible(true);
+                        }
+                    }
+                }
+            ));
+        } else {
+            if desired {
+                self.context.demo_favorites.borrow_mut().insert(sticker.id);
+            } else {
+                self.context.demo_favorites.borrow_mut().remove(&sticker.id);
+            }
+            self.editing.set(false);
+            self.load();
+        }
+    }
+
     fn send(self: &Rc<Self>, sticker: Sticker) {
-        if self.closed.get() || self.sending.replace(true) {
+        if self.closed.get() || self.editing.get() || self.sending.replace(true) {
             return;
         }
         self.source.set_sensitive(false);
@@ -408,6 +522,7 @@ pub fn demo_stickers(source: StickerSource) -> Vec<Sticker> {
     ]
     .into_iter()
     .map(|(id, emoji, kind)| Sticker {
+        favorite: false,
         id,
         emoji: emoji.into(),
         kind,
@@ -463,6 +578,7 @@ mod tests {
                 ContextData {
                     runtime: runtime.handle().clone(),
                     client: None,
+                    demo_favorites: Rc::default(),
                     send: Box::new(move |sticker, random| {
                         sent.borrow_mut().push((sticker.id, random));
                         Box::pin(async {
@@ -479,6 +595,8 @@ mod tests {
                 .child_at_index(0)
                 .unwrap()
                 .child()
+                .unwrap()
+                .first_child()
                 .unwrap()
                 .downcast::<gtk::Button>()
                 .unwrap();
@@ -500,7 +618,54 @@ mod tests {
             assert!(state.status.text().contains("пока нет"));
             state.source.set_selected(2);
             assert_eq!(state.flow.observe_children().n_items(), 3);
+            let favorite_button = || {
+                state
+                    .flow
+                    .child_at_index(0)
+                    .unwrap()
+                    .child()
+                    .unwrap()
+                    .last_child()
+                    .unwrap()
+                    .downcast::<gtk::Button>()
+                    .unwrap()
+            };
+            let favorite = favorite_button();
+            settle(|| favorite.is_mapped());
+            assert!(favorite.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&favorite));
+            settle(|| state.context.demo_favorites.borrow().contains(&1));
+            assert_eq!(
+                attempts.borrow().len(),
+                3,
+                "Favoriting must not send a sticker"
+            );
+            state.source.set_selected(1);
+            assert_eq!(state.flow.observe_children().n_items(), 1);
+            favorite_button().emit_clicked();
+            assert!(!state.context.demo_favorites.borrow().contains(&1));
+            assert_eq!(state.flow.observe_children().n_items(), 0);
+            assert!(
+                gtk::prelude::RootExt::focus(&window)
+                    .is_some_and(|focus| focus == state.source || focus.is_ancestor(&state.source))
+            );
+            state.source.set_selected(0);
+            favorite_button().emit_clicked();
+            let saved_favorites = state.context.demo_favorites.clone();
             dialog.close();
+            settle(|| state.closed.get());
+            let (reopened, state) = build(
+                &window,
+                ContextData {
+                    runtime: runtime.handle().clone(),
+                    client: None,
+                    demo_favorites: saved_favorites,
+                    send: Box::new(|_, _| Box::pin(async { Ok(()) })),
+                },
+            );
+            state.source.set_selected(1);
+            assert_eq!(state.flow.observe_children().n_items(), 1);
+            reopened.close();
             settle(|| state.closed.get());
             window.close();
         });
