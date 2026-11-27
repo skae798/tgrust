@@ -1,3 +1,5 @@
+mod packs;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::future::Future;
@@ -20,6 +22,7 @@ pub struct ContextData {
     pub runtime: Handle,
     pub client: Option<Arc<Telegram>>,
     pub demo_favorites: Rc<RefCell<HashSet<i64>>>,
+    pub demo_packs: Rc<RefCell<crate::demo::StickerPacks>>,
     pub send: Box<dyn Fn(Sticker, i64) -> SendSticker>,
 }
 
@@ -29,6 +32,10 @@ struct Picker {
     collections: RefCell<Vec<StickerCollection>>,
     names: gtk::StringList,
     source: gtk::DropDown,
+    open_pack: gtk::Button,
+    pack_action: gtk::Button,
+    notice: RefCell<Option<String>>,
+    pending_pack: RefCell<Option<String>>,
     flow: gtk::FlowBox,
     status: gtk::Label,
     retry: gtk::Button,
@@ -63,7 +70,12 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
     let source = gtk::DropDown::new(Some(names.clone()), None::<gtk::Expression>);
     source.set_enable_search(true);
     source.update_property(&[gtk::accessible::Property::Label("Набор стикеров")]);
+    let open_pack = gtk::Button::with_label("Открыть набор по ссылке");
+    body.append(&open_pack);
     body.append(&source);
+    let pack_action = gtk::Button::with_label("Добавить набор");
+    pack_action.set_visible(false);
+    body.append(&pack_action);
     let status = gtk::Label::builder()
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
@@ -98,6 +110,10 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
         collections: RefCell::new(Vec::new()),
         names,
         source,
+        open_pack,
+        pack_action,
+        notice: RefCell::new(None),
+        pending_pack: RefCell::new(None),
         flow,
         status,
         retry,
@@ -110,6 +126,16 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
         favorite_focus: Cell::new(None),
         attempt: Cell::new(None),
     });
+    state.open_pack.connect_clicked(glib::clone!(
+        #[weak]
+        state,
+        move |_| state.ask_pack()
+    ));
+    state.pack_action.connect_clicked(glib::clone!(
+        #[weak]
+        state,
+        move |_| state.ask_pack_change()
+    ));
     state.source.connect_selected_notify(glib::clone!(
         #[weak]
         state,
@@ -119,7 +145,13 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
         #[weak]
         state,
         move |_| {
-            if state.collections.borrow().is_empty() {
+            if state.sending.get() || state.editing.get() {
+                return;
+            }
+            let pending = state.pending_pack.borrow().clone();
+            if let Some(name) = pending {
+                state.open_named_pack(&name);
+            } else if state.collections.borrow().is_empty() {
                 state.load_collections();
             } else {
                 state.load();
@@ -198,7 +230,8 @@ impl Picker {
                 },
             );
         } else {
-            self.set_collections(demo_collections());
+            let collections = self.context.demo_packs.borrow().collections();
+            self.set_collections(collections);
         }
     }
 
@@ -233,6 +266,18 @@ impl Picker {
         else {
             return;
         };
+        let installed = self
+            .collections
+            .borrow()
+            .get(self.source.selected() as usize)
+            .and_then(|item| item.installed);
+        self.pack_action.set_visible(installed.is_some());
+        self.pack_action.set_label(if installed == Some(true) {
+            "Убрать набор"
+        } else {
+            "Добавить набор"
+        });
+        self.pending_pack.take();
         self.cancel_loading();
         self.status.set_text("Загрузка стикеров…");
         self.retry.set_visible(false);
@@ -264,11 +309,16 @@ impl Picker {
     fn render(self: &Rc<Self>, stickers: Vec<Sticker>) {
         let focus = self.favorite_focus.take();
         let mut restored = false;
-        self.status.set_text(if stickers.is_empty() {
-            "Здесь пока нет стикеров"
-        } else {
-            "Выберите стикер для отправки"
-        });
+        self.status.set_text(
+            self.notice
+                .take()
+                .as_deref()
+                .unwrap_or(if stickers.is_empty() {
+                    "Здесь пока нет стикеров"
+                } else {
+                    "Выберите стикер для отправки"
+                }),
+        );
         for sticker in stickers {
             let image = gtk::Stack::new();
             image.set_size_request(80, 80);
@@ -392,6 +442,14 @@ impl Picker {
         ));
     }
 
+    fn controls_sensitive(&self, sensitive: bool) {
+        self.source.set_sensitive(sensitive);
+        self.flow.set_sensitive(sensitive);
+        self.open_pack.set_sensitive(sensitive);
+        self.pack_action.set_sensitive(sensitive);
+        self.retry.set_sensitive(sensitive);
+    }
+
     fn change_favorite(self: &Rc<Self>, sticker: Sticker) {
         if self.closed.get() || self.sending.get() || self.editing.replace(true) {
             return;
@@ -399,8 +457,7 @@ impl Picker {
         self.favorite_focus.set(Some(sticker.id));
         let desired = !sticker.favorite;
         if let Some(client) = self.context.client.clone() {
-            self.flow.set_sensitive(false);
-            self.source.set_sensitive(false);
+            self.controls_sensitive(false);
             self.status.set_text("Обновление избранного…");
             let task = self.context.runtime.spawn(async move {
                 tokio::time::timeout(
@@ -451,8 +508,7 @@ impl Picker {
         if self.closed.get() || self.editing.get() || self.sending.replace(true) {
             return;
         }
-        self.source.set_sensitive(false);
-        self.flow.set_sensitive(false);
+        self.controls_sensitive(false);
         self.retry.set_visible(false);
         self.status.set_text("Отправка стикера…");
         if let Some(dialog) = self.dialog.upgrade() {
@@ -494,23 +550,6 @@ impl Picker {
     }
 }
 
-pub fn demo_collections() -> Vec<StickerCollection> {
-    vec![
-        StickerCollection {
-            source: StickerSource::Recent,
-            title: "Недавние".into(),
-        },
-        StickerCollection {
-            source: StickerSource::Favorites,
-            title: "Избранные".into(),
-        },
-        StickerCollection {
-            source: StickerSource::Set(1),
-            title: "Демо — космический кот".into(),
-        },
-    ]
-}
-
 pub fn demo_stickers(source: StickerSource) -> Vec<Sticker> {
     if source == StickerSource::Favorites {
         return Vec::new();
@@ -541,6 +580,7 @@ pub fn demo_texture() -> gtk::gdk::Texture {
 mod tests {
     use super::*;
 
+    #[track_caller]
     fn settle(mut ready: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !ready() && std::time::Instant::now() < deadline {
@@ -548,6 +588,209 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(ready(), "Sticker UI did not settle");
+    }
+
+    fn find_button(root: &impl IsA<gtk::Widget>, text: &str) -> Option<gtk::Button> {
+        if let Some(button) = root.as_ref().downcast_ref::<gtk::Button>()
+            && button.label().as_deref() == Some(text)
+        {
+            return Some(button.clone());
+        }
+        let mut child = root.as_ref().first_child();
+        while let Some(widget) = child {
+            if let Some(button) = find_button(&widget, text) {
+                return Some(button);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn pack_lookup_installs_and_confirms_removal_without_sending_messages() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.StickerPackTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(720)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let packs = Rc::new(RefCell::new(crate::demo::StickerPacks::default()));
+            let (dialog, state) = build(
+                &window,
+                ContextData {
+                    runtime: runtime.handle().clone(),
+                    client: None,
+                    demo_favorites: Rc::default(),
+                    demo_packs: packs.clone(),
+                    send: Box::new(|_, _| {
+                        Box::pin(async { panic!("Pack actions must not send messages") })
+                    }),
+                },
+            );
+            state.ask_pack();
+            settle(|| {
+                window
+                    .visible_dialog()
+                    .is_some_and(|dialog| dialog.is::<adw::AlertDialog>())
+            });
+            let prompt = window
+                .visible_dialog()
+                .unwrap()
+                .downcast::<adw::AlertDialog>()
+                .unwrap();
+            let input = prompt
+                .extra_child()
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Entry>()
+                .unwrap();
+            input.set_text("https://example.org/addstickers/SpaceDogs");
+            assert!(!prompt.is_response_enabled("open"));
+            input.set_text("https://t.me/addstickers/SpaceDogs");
+            assert!(prompt.is_response_enabled("open"));
+            settle(|| {
+                input.is_mapped()
+                    && prompt
+                        .default_widget()
+                        .is_some_and(|button| button.is_mapped())
+            });
+            input.emit_by_name::<()>("activate", &[]);
+            settle(|| {
+                state
+                    .collections
+                    .borrow()
+                    .iter()
+                    .any(|item| item.source == StickerSource::Set(2))
+            });
+            assert_eq!(state.pack_action.label().as_deref(), Some("Добавить набор"));
+            state.pack_action.emit_clicked();
+            assert_eq!(state.pack_action.label().as_deref(), Some("Убрать набор"));
+            assert!(
+                packs
+                    .borrow()
+                    .collections()
+                    .iter()
+                    .any(|item| item.source == StickerSource::Set(2))
+            );
+            state.pack_action.emit_clicked();
+            settle(|| {
+                window
+                    .visible_dialog()
+                    .is_some_and(|dialog| dialog.is::<adw::AlertDialog>())
+            });
+            let prompt = window
+                .visible_dialog()
+                .unwrap()
+                .downcast::<adw::AlertDialog>()
+                .unwrap();
+            let cancel = prompt
+                .default_widget()
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            assert_eq!(cancel.label().as_deref(), Some("Отмена"));
+            settle(|| cancel.is_mapped());
+            assert!(cancel.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&cancel));
+            settle(|| window.visible_dialog().as_ref() == Some(&dialog));
+            assert!(
+                packs
+                    .borrow()
+                    .collections()
+                    .iter()
+                    .any(|item| item.source == StickerSource::Set(2))
+            );
+            state.pack_action.emit_clicked();
+            settle(|| {
+                window
+                    .visible_dialog()
+                    .is_some_and(|dialog| dialog.is::<adw::AlertDialog>())
+            });
+            let prompt = window
+                .visible_dialog()
+                .unwrap()
+                .downcast::<adw::AlertDialog>()
+                .unwrap();
+            let remove = find_button(&prompt, "Убрать").unwrap();
+            settle(|| remove.is_mapped());
+            assert!(remove.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&remove));
+            settle(|| state.pack_action.label().as_deref() == Some("Добавить набор"));
+            assert!(
+                !packs
+                    .borrow()
+                    .collections()
+                    .iter()
+                    .any(|item| item.source == StickerSource::Set(2))
+            );
+            assert_eq!(
+                state.flow.observe_children().n_items(),
+                3,
+                "The uninstalled pack remains available as a preview"
+            );
+            dialog.close();
+            settle(|| state.closed.get());
+            let (dialog, state) = build(
+                &window,
+                ContextData {
+                    runtime: runtime.handle().clone(),
+                    client: None,
+                    demo_favorites: Rc::default(),
+                    demo_packs: packs,
+                    send: Box::new(|_, _| Box::pin(async { Ok(()) })),
+                },
+            );
+            assert_eq!(state.names.n_items(), 3);
+            state.open_named_pack("SpaceDogs");
+            assert_eq!(
+                state.collections.borrow().last().unwrap().installed,
+                Some(false)
+            );
+            let last = state
+                .flow
+                .child_at_index(2)
+                .unwrap()
+                .child()
+                .unwrap()
+                .last_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            let scroll = last
+                .ancestor(gtk::ScrolledWindow::static_type())
+                .and_downcast::<gtk::ScrolledWindow>()
+                .unwrap();
+            assert!(last.grab_focus());
+            settle(|| {
+                last.compute_bounds(&scroll).is_some_and(|bounds| {
+                    bounds.y() >= -1.0
+                        && bounds.y() + bounds.height() <= scroll.height() as f32 + 1.0
+                })
+            });
+            let mut collection = state.collections.borrow().last().unwrap().clone();
+            collection.installed = Some(true);
+            state.finish_pack_change(Ok(crate::model::StickerPackChange {
+                collection,
+                archived: Some(2),
+            }));
+            assert!(state.status.text().contains("архивировал 2"));
+            dialog.close();
+            settle(|| state.closed.get());
+            window.close();
+        });
     }
 
     #[test]
@@ -579,6 +822,7 @@ mod tests {
                     runtime: runtime.handle().clone(),
                     client: None,
                     demo_favorites: Rc::default(),
+                    demo_packs: Rc::default(),
                     send: Box::new(move |sticker, random| {
                         sent.borrow_mut().push((sticker.id, random));
                         Box::pin(async {
@@ -660,6 +904,7 @@ mod tests {
                     runtime: runtime.handle().clone(),
                     client: None,
                     demo_favorites: saved_favorites,
+                    demo_packs: Rc::default(),
                     send: Box::new(|_, _| Box::pin(async { Ok(()) })),
                 },
             );
