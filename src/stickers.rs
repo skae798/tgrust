@@ -480,8 +480,7 @@ impl Picker {
                     if state.closed.get() {
                         return;
                     }
-                    state.flow.set_sensitive(true);
-                    state.source.set_sensitive(true);
+                    state.controls_sensitive(true);
                     match result {
                         Ok(()) => state.load(),
                         Err(error) => {
@@ -540,8 +539,7 @@ impl Picker {
                             state
                                 .status
                                 .set_text(&format!("Не удалось отправить стикер. {error}"));
-                            state.source.set_sensitive(true);
-                            state.flow.set_sensitive(true);
+                            state.controls_sensitive(true);
                         }
                     }
                 }
@@ -580,14 +578,18 @@ pub fn demo_texture() -> gtk::gdk::Texture {
 mod tests {
     use super::*;
 
-    #[track_caller]
-    fn settle(mut ready: impl FnMut() -> bool) {
+    fn wait_for(mut ready: impl FnMut() -> bool) -> bool {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while !ready() && std::time::Instant::now() < deadline {
             glib::MainContext::default().iteration(false);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(ready(), "Sticker UI did not settle");
+        ready()
+    }
+
+    #[track_caller]
+    fn settle(ready: impl FnMut() -> bool) {
+        assert!(wait_for(ready), "Sticker UI did not settle");
     }
 
     fn find_button(root: &impl IsA<gtk::Widget>, text: &str) -> Option<gtk::Button> {
@@ -773,13 +775,28 @@ mod tests {
                 .ancestor(gtk::ScrolledWindow::static_type())
                 .and_downcast::<gtk::ScrolledWindow>()
                 .unwrap();
-            assert!(last.grab_focus());
             settle(|| {
-                last.compute_bounds(&scroll).is_some_and(|bounds| {
-                    bounds.y() >= -1.0
-                        && bounds.y() + bounds.height() <= scroll.height() as f32 + 1.0
-                })
+                last.is_mapped()
+                    && scroll.height() > 0
+                    && last
+                        .compute_bounds(&scroll)
+                        .is_some_and(|bounds| bounds.height() > 0.0)
             });
+            assert!(last.grab_focus());
+            assert!(
+                wait_for(|| {
+                    last.compute_bounds(&scroll).is_some_and(|bounds| {
+                        bounds.y() >= -1.0
+                            && bounds.y() + bounds.height() <= scroll.height() as f32 + 1.0
+                    })
+                }),
+                "Focused sticker button is clipped: bounds {:?}, viewport {}, scroll {} / {} (page {})",
+                last.compute_bounds(&scroll),
+                scroll.height(),
+                scroll.vadjustment().value(),
+                scroll.vadjustment().upper(),
+                scroll.vadjustment().page_size()
+            );
             let mut collection = state.collections.borrow().last().unwrap().clone();
             collection.installed = Some(true);
             state.finish_pack_change(Ok(crate::model::StickerPackChange {
@@ -851,6 +868,8 @@ mod tests {
             assert!(state.status.text().contains("Вымышленная потеря ответа"));
             assert!(dialog.can_close());
             assert!(state.flow.is_sensitive());
+            assert!(state.open_pack.is_sensitive());
+            assert!(state.pack_action.is_sensitive());
             state.send(choices[0].clone());
             settle(|| !state.sending.get());
             assert_eq!(attempts.borrow()[0], attempts.borrow()[1]);
