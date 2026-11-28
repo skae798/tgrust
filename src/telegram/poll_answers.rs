@@ -4,9 +4,9 @@ use anyhow::{Context, Result, bail, ensure};
 use grammers_client::tl::functions::help::GetAppConfig;
 use grammers_client::tl::functions::messages::{AddPollAnswer, DeletePollAnswer};
 
+use super::poll_timing::poll_view_at;
 use super::{
-    Media, PeerId, PeerRef, Telegram, can_write_chat, enums, poll_definition, poll_results,
-    poll_update, types,
+    Media, PeerId, PeerRef, Telegram, can_write_chat, enums, poll_results, poll_update, types,
 };
 use crate::model::{
     MAX_POLL_CHOICES, POLL_ANSWER_DELETE_PERIOD, PollAnswerAddition, PollAnswerChange, PollUpdate,
@@ -30,7 +30,7 @@ impl Telegram {
         let Some(Media::Poll(raw)) = message.media() else {
             bail!("Опрос больше недоступен")
         };
-        let poll = poll_definition(&raw.raw);
+        let poll = poll_view_at(&raw, &message);
         ensure!(poll.id == expected, "Опрос больше недоступен");
         ensure!(
             message.forward_header().is_none()
@@ -165,7 +165,7 @@ impl Telegram {
                 Some(Media::Poll(raw)) if raw.raw.id == expected => Some(poll_results(
                     expected,
                     Some((chat, id)),
-                    Some(poll_definition(&raw.raw)),
+                    Some(poll_view_at(&raw, &message)),
                     &raw.raw_results,
                 )),
                 _ => None,

@@ -5,14 +5,15 @@ use crate::model::{
     ADMIN_LOG_PAGE_SIZE, AdminLogActor, AdminLogEntry, AdminLogFilter, AdminLogPage, AdminLogQuery,
     AdminPolicy, AdminRight, AdminRights, AdminState, AttachmentThumbnail, AudioInfo, Avatar,
     BotCommand, Chat, ChatFolder, ChatImage, ChatKind, ChatMember, Contact, CreatedChat,
-    FORUM_PAGE_SIZE, ForumCursor, ForumPage, ForumPermissions, ForumTopic, ForumTopicChange,
-    ForumWrite, ForumWriteResult, GENERAL_TOPIC, GroupPermission, GroupPermissionSettings,
-    GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor, InviteDraft, InviteLink,
-    InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest, JoinRequestCursor,
-    JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter, MemberModeration, MemberPage,
-    MemberRestriction, MemberRestrictionEdit, MemberRestrictionSettings, MemberRole, Message,
-    NewChatDraft, NewChatKind, NewChatResult, PeerProfile, PlayableMedia, PlaybackProgress,
-    PlaybackSource, PollDraft, TextLink, forum_topic_title, restriction_now,
+    FORUM_PAGE_SIZE, ForumCursor, ForumMode, ForumPage, ForumPermissions, ForumTopic,
+    ForumTopicChange, ForumWrite, ForumWriteResult, GENERAL_TOPIC, GroupPermission,
+    GroupPermissionSettings, GroupPermissions, INVITE_PAGE_SIZE, InviteAction, InviteCursor,
+    InviteDraft, InviteLink, InvitePage, JOIN_REQUEST_PAGE_SIZE, JoinDecisionOutcome, JoinRequest,
+    JoinRequestCursor, JoinRequestPage, MEMBER_PAGE_SIZE, MemberChange, MemberFilter,
+    MemberModeration, MemberPage, MemberRestriction, MemberRestrictionEdit,
+    MemberRestrictionSettings, MemberRole, Message, NewChatDraft, NewChatKind, NewChatResult,
+    PeerProfile, PlayableMedia, PlaybackProgress, PlaybackSource, PollDraft, TextLink,
+    forum_topic_title, restriction_now,
 };
 
 pub const OWN_NAME: &str = "Алексей";
@@ -23,9 +24,11 @@ pub const OWN_AVATAR: Avatar = Avatar {
 };
 pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
+pub const SAMPLE_QUIZ_ID: i32 = 1;
 pub const SLOW_MODE_GROUP: i64 = 8;
 pub const MODERATION_GROUP: i64 = 9;
 pub const FORUM_CHAT: i64 = 14;
+const PUBLIC_POLL_ID: i32 = 73;
 pub const SLOW_MODE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
@@ -38,7 +41,13 @@ pub fn chats() -> Vec<Chat> {
         (2, "Избранное", "Проверить сборку на ноутбуке", 0, false),
         (3, "Новости проекта", "Опубликован план на неделю", 0, true),
         (5, "Демомедиа", "Видео и аудио", 0, false),
-        (6, "Демоопросы", "Опрос · Когда провести встречу?", 0, false),
+        (
+            6,
+            "Демоопросы",
+            "Опрос · Когда открыть обсуждение проекта?",
+            0,
+            false,
+        ),
         (7, "Бот проекта", "Доступные команды проекта", 0, false),
         (
             SLOW_MODE_GROUP,
@@ -152,6 +161,7 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             can_read_admin_log: false,
             addresses: None,
             group_permissions: None,
+            forum_mode: None,
             bot_commands: Vec::new(),
         });
     }
@@ -235,6 +245,11 @@ pub fn peer_profile(id: i64) -> Option<PeerProfile> {
             }),
             _ => None,
         },
+        forum_mode: (id == FORUM_CHAT).then_some(ForumMode {
+            enabled: true,
+            linked_discussion: false,
+            hidden_history: false,
+        }),
         bot_commands: if id == 7 {
             [("/start", "Запустить бота"), ("/help", "Показать справку")]
                 .into_iter()
@@ -310,7 +325,13 @@ pub fn created_profile(id: i64, draft: &NewChatDraft) -> PeerProfile {
         }),
         group_permissions: (!broadcast).then(|| GroupPermissionSettings {
             slow_mode: (draft.kind == NewChatKind::Supergroup).then_some(0),
+            forum: draft.forum,
             ..group_permissions(GroupPermissions::all(), !draft.username.is_empty())
+        }),
+        forum_mode: (draft.kind == NewChatKind::Supergroup).then_some(ForumMode {
+            enabled: draft.forum,
+            linked_discussion: false,
+            hidden_history: false,
         }),
         bot_commands: Vec::new(),
     }
@@ -1032,16 +1053,29 @@ const FORUM_PERMISSIONS: ForumPermissions = ForumPermissions {
 
 #[derive(Default)]
 pub struct ForumTopics {
+    seeded: bool,
     edits: HashMap<i32, Option<ForumTopic>>,
     created: HashMap<i64, i32>,
 }
 
 impl ForumTopics {
+    pub fn for_chat(chat: i64) -> Self {
+        Self {
+            seeded: chat == FORUM_CHAT,
+            ..Self::default()
+        }
+    }
+
     pub fn topic(&self, id: i32) -> Option<ForumTopic> {
-        self.edits
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| forum_topic(id))
+        self.edits.get(&id).cloned().unwrap_or_else(|| {
+            if self.seeded || id == GENERAL_TOPIC {
+                let mut topic = forum_topic(id)?;
+                topic.pinned &= self.seeded;
+                Some(topic)
+            } else {
+                None
+            }
+        })
     }
 
     pub fn page(&self, cursor: ForumCursor) -> ForumPage {
@@ -1150,10 +1184,12 @@ pub fn history(chat: i64) -> Vec<Message> {
             topic: Some(topic),
             text,
             poll: None,
+            sticker: None,
             self_authored: false,
             outgoing: false,
             can_edit: false,
             can_delete: false,
+            can_close_poll: false,
             sender: "Анна".into(),
             sender_avatar: None,
             ..template.clone()
@@ -1178,25 +1214,16 @@ pub fn history(chat: i64) -> Vec<Message> {
         let mut meeting = poll_message(
             2,
             PollDraft {
+                deadline: None,
+                hide_results_until_close: false,
                 question: "Когда провести встречу?".into(),
                 open_answers: false,
                 choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
                 multiple: true,
-                public: false,
-            },
-        );
-        let mut quiz = poll_message(
-            1,
-            PollDraft {
-                question: "Какой день идёт после вторника?".into(),
-                choices: vec!["Среда".into(), "Воскресенье".into()],
                 ..PollDraft::default()
             },
         );
-        if let Some(poll) = &mut quiz.poll {
-            poll.quiz = true;
-            poll.revoting_disabled = true;
-        }
+        let mut quiz = poll_message(SAMPLE_QUIZ_ID, sample_quiz());
         for message in [&mut meeting, &mut quiz] {
             message.sender = "Анна".into();
             message.sender_avatar = Some(Avatar {
@@ -1207,8 +1234,31 @@ pub fn history(chat: i64) -> Vec<Message> {
             message.self_authored = false;
             message.outgoing = false;
             message.can_delete = false;
+            message.can_close_poll = false;
         }
-        return vec![quiz, meeting];
+        let mut poll = PollDraft {
+            question: "Когда открыть обсуждение проекта?".into(),
+            choices: vec![
+                "В четверг".into(),
+                "В пятницу".into(),
+                "После выходных".into(),
+            ],
+            multiple: true,
+            ..PollDraft::default()
+        }
+        .into_poll(i64::from(PUBLIC_POLL_ID));
+        poll.public = true;
+        poll.creator = false;
+        poll.total = Some(60);
+        for (choice, count) in poll.choices.iter_mut().zip([40, 30, 0]) {
+            choice.votes = Some(count);
+        }
+        let public = Message {
+            id: PUBLIC_POLL_ID,
+            poll: Some(poll),
+            ..meeting.clone()
+        };
+        return vec![quiz, meeting, public];
     }
     let today = now();
     let samples = match chat {
@@ -1325,11 +1375,13 @@ pub fn history(chat: i64) -> Vec<Message> {
                 ((chat == 1 && index == 3) || chat == 3).then_some(AttachmentThumbnail::Photo(chat))
             },
             poll: None,
+            sticker: None,
             reply_to: (chat == 1 && index == 1).then_some(81),
             reply_preview: None,
             can_reply: true,
             can_edit: outgoing && attachment.is_none(),
             can_delete: outgoing || chat == 2,
+            can_close_poll: false,
             can_forward: true,
             forwarded: false,
             pinned: false,
@@ -1339,6 +1391,32 @@ pub fn history(chat: i64) -> Vec<Message> {
             album: None,
         })
         .collect();
+    if chat == MODERATION_GROUP
+        && let Some(sample) = messages.first()
+    {
+        let mut poll = PollDraft {
+            question: "Как назвать раздел для правил?".into(),
+            choices: vec!["Правила группы".into(), "Памятка участника".into()],
+            ..PollDraft::default()
+        }
+        .into_poll(46);
+        poll.creator = false;
+        poll.hide_results_until_close = true;
+        poll.closes_at = Some(now() + 90);
+        poll.total = Some(2);
+        for choice in &mut poll.choices {
+            choice.votes = Some(1);
+        }
+        messages.insert(
+            0,
+            Message {
+                id: 46,
+                poll: Some(poll),
+                text: String::new(),
+                ..sample.clone()
+            },
+        );
+    }
     if chat == 1 {
         let sample = messages[0].clone();
         let day = 24 * 60 * 60;
@@ -1366,18 +1444,88 @@ pub fn history(chat: i64) -> Vec<Message> {
             message
         });
         messages.splice(..0, older);
+        let mut sticker = sticker_message(
+            85,
+            crate::model::Sticker {
+                favorite: false,
+                id: 1,
+                emoji: "🐱".into(),
+                kind: crate::model::StickerKind::Static,
+            },
+        );
+        sticker.timestamp = today - 10;
+        messages.push(sticker);
+        let mut video = sticker_message(
+            86,
+            crate::model::Sticker {
+                favorite: false,
+                id: 3,
+                emoji: "✨".into(),
+                kind: crate::model::StickerKind::Video,
+            },
+        );
+        video.timestamp = today - 5;
+        messages.push(video);
+        let mut animated = sticker_message(
+            87,
+            crate::model::Sticker {
+                favorite: false,
+                id: 2,
+                emoji: "🚀".into(),
+                kind: crate::model::StickerKind::Animated,
+            },
+        );
+        animated.timestamp = today - 2;
+        messages.push(animated);
+    }
+    if chat == 3 {
+        let mut post = poll_message(
+            42,
+            PollDraft {
+                question: "Какой выпуск подготовить первым?".into(),
+                choices: vec!["Итоги недели".into(), "Ответы на вопросы".into()],
+                ..PollDraft::default()
+            },
+        );
+        post.sender = "Новости проекта".into();
+        post.sender_avatar = Some(Avatar {
+            peer: 3,
+            photo: 3,
+            dc: 0,
+        });
+        post.self_authored = false;
+        post.outgoing = false;
+        post.can_delete = false;
+        messages.insert(0, post);
     }
     messages
 }
 
+pub fn sample_quiz() -> PollDraft {
+    PollDraft {
+        question: "Какой день идёт после вторника?".into(),
+        choices: vec!["Среда".into(), "Воскресенье".into()],
+        quiz: Some(crate::model::PollQuizDraft {
+            correct: vec![0],
+            solution: "Первый вариант правильный.".into(),
+        }),
+        ..PollDraft::default()
+    }
+}
+
 pub fn poll_message(id: i32, draft: PollDraft) -> Message {
+    let timestamp = now();
+    let (deadline, hidden) = (draft.deadline, draft.hide_results_until_close);
+    let mut poll = draft.into_poll(i64::from(id));
+    poll.closes_at = deadline.map(|deadline| deadline.closes_at(timestamp));
+    poll.hide_results_until_close = hidden;
     Message {
         id,
         topic: None,
         sender: OWN_NAME.into(),
         sender_avatar: Some(OWN_AVATAR),
         self_authored: true,
-        timestamp: now(),
+        timestamp,
         text: String::new(),
         styles: Vec::new(),
         links: Vec::new(),
@@ -1387,12 +1535,14 @@ pub fn poll_message(id: i32, draft: PollDraft) -> Message {
         playback: None,
         audio: None,
         thumbnail: None,
-        poll: Some(draft.into_poll(i64::from(id))),
+        poll: Some(poll),
+        sticker: None,
         reply_to: None,
         reply_preview: None,
         can_reply: true,
         can_edit: false,
         can_delete: true,
+        can_close_poll: true,
         can_forward: true,
         forwarded: false,
         pinned: false,
@@ -1423,9 +1573,7 @@ pub fn preview_pixels() -> Vec<u8> {
 }
 
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    crate::model::unix_now()
 }
 
 pub async fn playback_preview(
@@ -1438,6 +1586,37 @@ pub async fn playback_preview(
         PlayableMedia::Voice => include_bytes!("../data/demo-voice.ogg"),
         PlayableMedia::Video { .. } => include_bytes!("../data/demo-video.webm"),
     };
+    playback_bytes(media, progress, whole, bytes).await
+}
+
+pub fn sticker_video_media() -> PlayableMedia {
+    PlayableMedia::Video {
+        width: 512,
+        height: 512,
+        duration: Some(2),
+        size: include_bytes!("../data/demo-sticker-video.webm").len() as u64,
+    }
+}
+
+pub async fn sticker_video_preview(
+    progress: tokio::sync::watch::Sender<PlaybackProgress>,
+    whole: bool,
+) -> anyhow::Result<PlaybackSource> {
+    playback_bytes(
+        sticker_video_media(),
+        progress,
+        whole,
+        include_bytes!("../data/demo-sticker-video.webm"),
+    )
+    .await
+}
+
+async fn playback_bytes(
+    media: PlayableMedia,
+    progress: tokio::sync::watch::Sender<PlaybackProgress>,
+    whole: bool,
+    bytes: &'static [u8],
+) -> anyhow::Result<PlaybackSource> {
     if !whole && media != PlayableMedia::Voice {
         let stream = crate::media_stream::StreamSource::new(bytes.len() as u64, move |index| {
             Box::pin(async move {
@@ -1529,9 +1708,136 @@ pub fn privacy_settings()
     .collect()
 }
 
+pub fn sticker_message(id: i32, sticker: crate::model::Sticker) -> Message {
+    let mut message = poll_message(id, PollDraft::default());
+    message.poll = None;
+    message.attachment = match sticker.kind {
+        crate::model::StickerKind::Static => Some(format!("sticker-{id}.webp")),
+        crate::model::StickerKind::Video => Some(format!("sticker-{id}.webm")),
+        crate::model::StickerKind::Animated => Some(format!("sticker-{id}.tgs")),
+    };
+    message.playback = (sticker.kind == crate::model::StickerKind::Video).then(sticker_video_media);
+    message.sticker = Some(sticker);
+    message
+}
+
+pub struct StickerPacks {
+    names: Vec<String>,
+    installed: HashSet<i64>,
+}
+
+impl Default for StickerPacks {
+    fn default() -> Self {
+        Self {
+            names: vec!["SpaceCat".into()],
+            installed: HashSet::from([1]),
+        }
+    }
+}
+
+impl StickerPacks {
+    fn collection(&self, id: i64) -> anyhow::Result<crate::model::StickerCollection> {
+        use crate::model::{StickerCollection, StickerSource};
+        let index = usize::try_from(
+            id.checked_sub(1)
+                .ok_or_else(|| anyhow::anyhow!("Набор недоступен"))?,
+        )?;
+        let name = self
+            .names
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("Набор недоступен"))?;
+        Ok(StickerCollection {
+            source: StickerSource::Set(id),
+            title: if id == 1 {
+                "Демо — космический кот".into()
+            } else {
+                format!("Демо · {name}")
+            },
+            installed: Some(self.installed.contains(&id)),
+        })
+    }
+
+    pub fn collections(&self) -> Vec<crate::model::StickerCollection> {
+        use crate::model::{StickerCollection, StickerSource};
+        let mut collections = vec![
+            StickerCollection {
+                source: StickerSource::Recent,
+                title: "Недавние".into(),
+                installed: None,
+            },
+            StickerCollection {
+                source: StickerSource::Favorites,
+                title: "Избранные".into(),
+                installed: None,
+            },
+        ];
+        collections.extend(
+            (1..=self.names.len() as i64)
+                .filter(|id| self.installed.contains(id))
+                .filter_map(|id| self.collection(id).ok()),
+        );
+        collections
+    }
+
+    pub fn open(&mut self, input: &str) -> anyhow::Result<crate::model::StickerCollection> {
+        let name = crate::model::sticker_pack_name(input)?;
+        let id = self
+            .names
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(&name))
+            .map_or_else(
+                || {
+                    self.names.push(name);
+                    self.names.len() as i64
+                },
+                |index| index as i64 + 1,
+            );
+        self.collection(id)
+    }
+
+    pub fn change(
+        &mut self,
+        id: i64,
+        installed: bool,
+    ) -> anyhow::Result<crate::model::StickerPackChange> {
+        self.collection(id)?;
+        if installed {
+            self.installed.insert(id);
+        } else {
+            self.installed.remove(&id);
+        }
+        Ok(crate::model::StickerPackChange {
+            collection: self.collection(id)?,
+            archived: Some(0),
+        })
+    }
+}
+
 #[cfg(test)]
-mod join_request_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn sticker_packs_keep_preview_identity_and_installation_separate_per_account() {
+        use crate::model::StickerSource;
+        let mut first = StickerPacks::default();
+        let second = StickerPacks::default();
+        let preview = first.open("https://t.me/addstickers/SpaceDogs").unwrap();
+        let StickerSource::Set(id) = preview.source else {
+            panic!()
+        };
+        assert_eq!(preview.installed, Some(false));
+        assert_eq!(first.collections().len(), 3);
+        first.change(id, true).unwrap();
+        assert_eq!(first.collections().len(), 4);
+        assert_eq!(second.collections().len(), 3);
+        assert_eq!(first.open("spacedogs").unwrap().source, preview.source);
+        first.change(id, false).unwrap();
+        assert_eq!(first.collections().len(), 3);
+        assert_eq!(first.open("SpaceDogs").unwrap().source, preview.source);
+        assert!(first.change(999, true).is_err());
+        assert!(first.change(i64::MIN, true).is_err());
+    }
 
     #[test]
     fn join_request_pages_and_decision_retries_stay_in_their_chat() {
@@ -1547,5 +1853,113 @@ mod join_request_tests {
         assert_eq!(queue.page(1, None).total, 29);
         assert_eq!(queue.page(3, None).total, 30);
         assert_eq!(queue.page(3, None).requests[0].cursor.user, user);
+    }
+}
+
+pub fn poll_voter_page(
+    poll: &crate::model::Poll,
+    option: Option<&[u8]>,
+    offset: Option<&str>,
+) -> crate::model::PollVoterPage {
+    use crate::model::{POLL_VOTERS_PAGE_SIZE, PollVoter, PollVoterPage};
+
+    let mut votes = Vec::new();
+    if poll.has_vote() {
+        votes.push((1, OWN_NAME.to_owned(), Some(OWN_AVATAR), {
+            poll.choices
+                .iter()
+                .filter(|choice| choice.chosen)
+                .map(|choice| choice.option.as_slice())
+                .collect::<Vec<_>>()
+        }));
+    }
+    if poll.id == i64::from(PUBLIC_POLL_ID) {
+        for index in 1..=60 {
+            let mut answers = Vec::new();
+            if index <= 40 {
+                answers.push(&[0][..]);
+            }
+            if index > 40 || index <= 10 {
+                answers.push(&[1][..]);
+            }
+            votes.push((
+                10_000 + index,
+                format!("Участник {index:02}"),
+                None,
+                answers,
+            ));
+        }
+    }
+    votes.retain(|(_, _, _, options)| option.is_none_or(|option| options.contains(&option)));
+    let total = votes.len();
+    let start = offset
+        .and_then(|offset| offset.parse::<usize>().ok())
+        .unwrap_or_default();
+    let voters: Vec<_> = votes
+        .into_iter()
+        .skip(start)
+        .take(POLL_VOTERS_PAGE_SIZE as usize)
+        .map(|(peer, name, avatar, options)| PollVoter {
+            peer,
+            name,
+            avatar,
+            answers: poll
+                .choices
+                .iter()
+                .filter(|choice| options.contains(&choice.option.as_slice()))
+                .map(|choice| choice.label.clone())
+                .collect(),
+        })
+        .collect();
+    let next = start.saturating_add(voters.len());
+    PollVoterPage {
+        voters,
+        total: total as i32,
+        next: (next < total).then(|| next.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod poll_voter_tests {
+    use super::*;
+
+    #[test]
+    fn demo_voters_paginate_each_option_independently() {
+        let message = history(6)
+            .into_iter()
+            .find(|message| message.id == PUBLIC_POLL_ID)
+            .expect("public demo poll");
+        let mut poll = message.poll.expect("public demo poll");
+        assert!(!poll.can_list_voters());
+        poll.choices[0].chosen = true;
+        assert!(poll.can_list_voters());
+
+        let first = poll_voter_page(&poll, None, None);
+        let second = poll_voter_page(&poll, None, first.next.as_deref());
+        let last = poll_voter_page(&poll, None, second.next.as_deref());
+        assert_eq!(
+            (first.voters.len(), second.voters.len(), last.voters.len()),
+            (24, 24, 13)
+        );
+        assert_eq!(first.total, 61);
+        assert_eq!(first.next.as_deref(), Some("24"));
+        assert!(last.next.is_none());
+        assert!(
+            first
+                .voters
+                .iter()
+                .all(|voter| second.voters.iter().all(|other| voter.peer != other.peer))
+        );
+
+        let friday = poll_voter_page(&poll, Some(&[1]), None);
+        assert_eq!(friday.total, 30);
+        assert!(
+            friday
+                .voters
+                .iter()
+                .all(|voter| voter.answers.iter().any(|answer| answer == "В пятницу"))
+        );
+        let empty = poll_voter_page(&poll, Some(&[2]), None);
+        assert!(empty.voters.is_empty() && empty.next.is_none());
     }
 }

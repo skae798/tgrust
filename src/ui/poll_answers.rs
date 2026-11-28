@@ -141,6 +141,14 @@ impl Ui {
                 ui.submit_answer_change(target, id, expected, change).await
             }
         });
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.poll_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
         self.poll_dialog.set(Some(&dialog));
         dialog.present(Some(&window));
     }
@@ -449,4 +457,224 @@ where
         }
     ));
     dialog
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::PollDraft;
+    use crate::ui::{Account, Accounts, build_window, editor_text};
+    use std::time::Instant;
+
+    #[track_caller]
+    fn settle(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !ready() && Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready(), "Answer editor did not settle");
+    }
+
+    fn find<W: IsA<gtk::Widget> + Clone>(
+        root: &impl IsA<gtk::Widget>,
+        predicate: &impl Fn(&W) -> bool,
+    ) -> Option<W> {
+        if let Ok(widget) = root.as_ref().clone().downcast::<W>()
+            && predicate(&widget)
+        {
+            return Some(widget);
+        }
+        let mut child = root.as_ref().first_child();
+        while let Some(widget) = child {
+            if let Some(found) = find(&widget, predicate) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    fn confirm(dialog: &adw::Dialog, action: &str) -> gtk::Button {
+        let button = find(dialog, &|button: &gtk::Button| {
+            button.label().as_deref() == Some(action)
+        })
+        .unwrap();
+        settle(|| button.is_mapped());
+        assert!(button.grab_focus());
+        assert!(gtk::prelude::WidgetExt::activate(&button));
+        button
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn answer_editor_adds_deletes_and_rejects_stale_or_expired_operations() {
+        gtk::test_synced(|| {
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.PollAnswersTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            settle(|| (340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            let target = ui.conversation().unwrap();
+            ui.input.buffer().set_text("Черновик первого чата");
+            ui.add_demo_messages(
+                target,
+                vec![crate::demo::poll_message(
+                    903,
+                    PollDraft {
+                        question: "Когда встретимся?".into(),
+                        choices: vec!["Утром".into(), "Днём".into()],
+                        public: true,
+                        open_answers: true,
+                        ..PollDraft::default()
+                    },
+                )],
+            );
+            let expected = ui.messages.borrow()[&903].poll.as_ref().unwrap().id;
+            let count = || {
+                ui.messages.borrow()[&903]
+                    .poll
+                    .as_ref()
+                    .unwrap()
+                    .choices
+                    .len()
+            };
+            let open = |delete| {
+                ui.open_answer_editor(target, 903, expected, delete);
+                let dialog = window.visible_dialog().unwrap();
+                settle(|| dialog.is_mapped());
+                dialog
+            };
+            let entry = |dialog: &adw::Dialog| {
+                find(dialog, &|row: &adw::EntryRow| {
+                    row.title() == "Новый вариант"
+                })
+                .unwrap()
+            };
+            let dialog = open(false);
+            let add = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Добавить")
+            })
+            .unwrap();
+            assert!(!add.is_sensitive());
+            entry(&dialog).set_text("  Вечером  ");
+            confirm(&dialog, "Добавить");
+            settle(|| count() == 3 && window.visible_dialog().is_none());
+            assert_eq!(
+                ui.messages.borrow()[&903].poll.as_ref().unwrap().choices[2].label,
+                "Вечером"
+            );
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик первого чата"
+            );
+            settle(|| gtk::prelude::RootExt::focus(&window) == Some(ui.input.clone().upcast()));
+            let dialog = open(false);
+            entry(&dialog).set_text("Вечером");
+            let add = confirm(&dialog, "Добавить");
+            settle(|| {
+                add.is_sensitive()
+                    && find(&dialog, &|label: &gtk::Label| {
+                        label.text().contains("Такой вариант уже есть")
+                    })
+                    .is_some()
+            });
+            assert_eq!(count(), 3);
+            entry(&dialog).set_text(&"я".repeat(101));
+            confirm(&dialog, "Добавить");
+            settle(|| {
+                add.is_sensitive()
+                    && find(&dialog, &|label: &gtk::Label| {
+                        label.text().contains("до 100 символов")
+                    })
+                    .is_some()
+            });
+            assert_eq!(count(), 3);
+            dialog.close();
+            settle(|| window.visible_dialog().is_none());
+            let dialog = open(true);
+            let delete = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Удалить")
+            })
+            .unwrap();
+            assert!(!delete.is_sensitive());
+            dialog.close();
+            settle(|| window.visible_dialog().is_none());
+            assert_eq!(count(), 3);
+            let dialog = open(false);
+            entry(&dialog).set_text("Ночью");
+            ui.show_chat(2, None);
+            ui.input.buffer().set_text("Черновик второго чата");
+            let add = confirm(&dialog, "Добавить");
+            settle(|| {
+                add.is_sensitive()
+                    && find(&dialog, &|label: &gtk::Label| {
+                        label.text().contains("Опрос больше недоступен")
+                    })
+                    .is_some()
+            });
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик второго чата"
+            );
+            dialog.close();
+            settle(|| window.visible_dialog().is_none());
+            ui.show_chat(1, None);
+            assert_eq!(count(), 3);
+            let option = ui.messages.borrow()[&903].poll.as_ref().unwrap().choices[2]
+                .option
+                .clone();
+            ui.vote(target.chat, 903, expected, vec![option]);
+            assert_eq!(
+                ui.messages.borrow()[&903].poll.as_ref().unwrap().total,
+                Some(1)
+            );
+            let dialog = open(true);
+            let selector = find(&dialog, &|row: &adw::ComboRow| {
+                row.title() == "Вариант ответа"
+            })
+            .unwrap();
+            selector.set_selected(1);
+            confirm(&dialog, "Удалить");
+            settle(|| count() == 2 && window.visible_dialog().is_none());
+            assert_eq!(
+                ui.messages.borrow()[&903].poll.as_ref().unwrap().total,
+                Some(0)
+            );
+            assert!(!ui.messages.borrow()[&903].poll.as_ref().unwrap().has_vote());
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик первого чата"
+            );
+            ui.open_answer_editor(target, 903, expected, true);
+            assert!(window.visible_dialog().is_none());
+            ui.messages
+                .borrow_mut()
+                .get_mut(&903)
+                .unwrap()
+                .poll
+                .as_mut()
+                .unwrap()
+                .closes_at = Some(crate::model::unix_now() - 1);
+            ui.open_answer_editor(target, 903, expected, false);
+            assert!(window.visible_dialog().is_none());
+            assert!(!ui.messages.borrow()[&903].poll.as_ref().unwrap().closed);
+            assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= window.width());
+            window.close();
+        });
+    }
 }

@@ -366,7 +366,35 @@ pub struct PeerProfile {
     pub can_read_admin_log: bool,
     pub addresses: Option<ChatAddresses>,
     pub group_permissions: Option<GroupPermissionSettings>,
+    pub forum_mode: Option<ForumMode>,
     pub bot_commands: Vec<BotCommand>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForumMode {
+    pub enabled: bool,
+    pub linked_discussion: bool,
+    pub hidden_history: bool,
+}
+
+impl ForumMode {
+    pub fn needs_change(self, confirmed: Self) -> anyhow::Result<bool> {
+        let enable = !confirmed.enabled;
+        if self.enabled == enable {
+            return Ok(false);
+        }
+        if enable {
+            anyhow::ensure!(
+                !self.linked_discussion,
+                "Темы недоступны в группе обсуждения, привязанной к каналу"
+            );
+            anyhow::ensure!(
+                !self.hidden_history || confirmed.hidden_history,
+                "Видимость истории изменилась. Откройте настройки тем снова"
+            );
+        }
+        Ok(true)
+    }
 }
 
 pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
@@ -1137,6 +1165,7 @@ pub enum NewChatKind {
 #[derive(Clone)]
 pub struct NewChatDraft {
     pub kind: NewChatKind,
+    pub forum: bool,
     pub info: ChatInfo,
     pub username: String,
     pub members: Vec<Contact>,
@@ -1164,6 +1193,10 @@ impl NewChatDraft {
             "Публичное имя доступно для супергрупп и каналов"
         );
         anyhow::ensure!(
+            !self.forum || self.kind == NewChatKind::Supergroup,
+            "Темы доступны в супергруппах"
+        );
+        anyhow::ensure!(
             self.kind != NewChatKind::Group || !self.members.is_empty(),
             "Выберите хотя бы одного участника"
         );
@@ -1188,7 +1221,7 @@ impl NewChatDraft {
             preview_sender: None,
             preview_image: None,
             group: self.kind != NewChatKind::Channel,
-            forum: false,
+            forum: self.forum,
             unread: 0,
             unread_mark: false,
             last_message_id: 0,
@@ -1725,6 +1758,121 @@ impl ChatFolder {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StickerSource {
+    Recent,
+    Favorites,
+    Set(i64),
+}
+
+pub fn sticker_emoji_query(input: &str) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(input.len() <= 512, "Слишком длинный запрос стикеров");
+    let query = input.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        query.encode_utf16().count() <= 64 && !query.chars().any(char::is_control),
+        "Введите короткую последовательность эмодзи без управляющих символов"
+    );
+    Ok(Some(query.into()))
+}
+
+#[derive(Clone, Debug)]
+pub struct StickerCollection {
+    pub source: StickerSource,
+    pub title: String,
+    pub installed: Option<bool>,
+}
+
+pub struct StickerPackChange {
+    pub collection: StickerCollection,
+    pub archived: Option<usize>,
+}
+
+pub fn sticker_pack_name(input: &str) -> anyhow::Result<String> {
+    let input = input.trim();
+    let name =
+        if input.contains("://") || input.starts_with("t.me/") || input.starts_with("telegram.me/")
+        {
+            let link = if input.contains("://") {
+                input.to_owned()
+            } else {
+                format!("https://{input}")
+            };
+            let url = url::Url::parse(&link)?;
+            anyhow::ensure!(
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port().is_none()
+                    && url.fragment().is_none(),
+                "Введите имя набора или ссылку Telegram"
+            );
+            if url.scheme() == "tg" && url.host_str() == Some("addstickers") {
+                let pairs: Vec<_> = url.query_pairs().collect();
+                anyhow::ensure!(
+                    url.path().is_empty() && pairs.len() == 1 && pairs[0].0 == "set",
+                    "Некорректная ссылка на набор"
+                );
+                pairs[0].1.to_string()
+            } else {
+                anyhow::ensure!(
+                    url.scheme() == "https"
+                        && matches!(url.host_str(), Some("t.me" | "telegram.me"))
+                        && url.query().is_none(),
+                    "Введите ссылку t.me/addstickers/имя"
+                );
+                let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+                anyhow::ensure!(
+                    parts.len() == 2 && parts[0] == "addstickers",
+                    "Введите ссылку t.me/addstickers/имя"
+                );
+                parts[1].to_owned()
+            }
+        } else {
+            input.to_owned()
+        };
+    anyhow::ensure!(
+        (1..=64).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_'),
+        "Имя набора должно содержать до 64 латинских букв, цифр и подчёркиваний и начинаться с буквы"
+    );
+    Ok(name)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickerKind {
+    Static,
+    Animated,
+    Video,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sticker {
+    pub favorite: bool,
+    pub id: i64,
+    pub emoji: String,
+    pub kind: StickerKind,
+}
+
+impl Sticker {
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            StickerKind::Static => "Стикер",
+            StickerKind::Animated => "Анимированный стикер",
+            StickerKind::Video => "Видеостикер",
+        };
+        if self.emoji.is_empty() {
+            kind.into()
+        } else {
+            format!("{} {kind}", self.emoji)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Avatar {
     pub peer: i64,
     pub photo: i64,
@@ -1739,6 +1887,7 @@ pub enum AttachmentThumbnail {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChatImage {
+    Sticker(i64),
     Avatar(Avatar),
     Attachment {
         chat: i64,
@@ -1972,6 +2121,19 @@ pub enum PlaybackSource {
     Stream(PlayableMedia, crate::media_stream::StreamSource),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct StickerAnimationTiming {
+    pub frames: usize,
+    pub fps: f64,
+    pub width: usize,
+    pub height: usize,
+}
+
+pub enum StickerAnimationSource {
+    Video(PlaybackSource),
+    Tgs(Vec<u8>),
+}
+
 impl PlaybackSource {
     pub fn media(&self) -> PlayableMedia {
         match self {
@@ -1999,11 +2161,13 @@ pub struct Message {
     pub audio: Option<AudioInfo>,
     pub thumbnail: Option<AttachmentThumbnail>,
     pub poll: Option<Poll>,
+    pub sticker: Option<Sticker>,
     pub reply_to: Option<i32>,
     pub reply_preview: Option<ReplyPreview>,
     pub can_reply: bool,
     pub can_edit: bool,
     pub can_delete: bool,
+    pub can_close_poll: bool,
     pub can_forward: bool,
     pub forwarded: bool,
     pub pinned: bool,
@@ -2019,6 +2183,7 @@ pub struct Poll {
     pub id: i64,
     pub question: String,
     pub creator: bool,
+    pub hide_results_until_close: bool,
     pub choices: Vec<PollChoice>,
     pub closed: bool,
     pub public: bool,
@@ -2027,6 +2192,7 @@ pub struct Poll {
     pub revoting_disabled: bool,
     pub total: Option<i32>,
     pub solution: Option<String>,
+    pub closes_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2046,12 +2212,29 @@ pub struct PollAnswerAddition {
 }
 
 impl Poll {
+    pub fn can_list_voters(&self) -> bool {
+        self.public
+            && (self.creator || self.closed || (!self.hide_results_until_close && self.has_vote()))
+            && self.total.is_some_and(|total| total > 0)
+    }
+
     pub fn has_vote(&self) -> bool {
         self.choices.iter().any(|choice| choice.chosen)
     }
 
     pub fn can_vote(&self) -> bool {
-        !self.closed && (!self.revoting_disabled || !self.has_vote()) && self.choices.len() >= 2
+        self.can_vote_at(unix_now())
+    }
+
+    pub fn can_vote_at(&self, now: i64) -> bool {
+        !self.closed
+            && self.closes_at.is_none_or(|deadline| deadline > now)
+            && (!self.revoting_disabled || !self.has_vote())
+            && self.choices.len() >= 2
+    }
+
+    pub fn results_visible(&self) -> bool {
+        !self.hide_results_until_close || self.creator || self.closed
     }
 
     pub fn accepts(&self, options: &[Vec<u8>]) -> bool {
@@ -2065,7 +2248,14 @@ impl Poll {
     }
 
     pub fn answers_open(&self) -> bool {
-        self.open_answers && !self.quiz && !self.closed
+        self.answers_open_at(unix_now())
+    }
+
+    fn answers_open_at(&self, now: i64) -> bool {
+        self.open_answers
+            && !self.quiz
+            && !self.closed
+            && self.closes_at.is_none_or(|deadline| deadline > now)
     }
 
     pub fn can_delete_answer(
@@ -2075,7 +2265,7 @@ impl Poll {
         now: i32,
         period: i32,
     ) -> bool {
-        self.answers_open()
+        self.answers_open_at(i64::from(now))
             && self.choices.len() > 2
             && choice.addition.is_some_and(|addition| {
                 addition.date > 0
@@ -2103,6 +2293,21 @@ pub fn normalized_poll_answer(text: &str) -> anyhow::Result<String> {
     Ok(text.to_owned())
 }
 
+pub const POLL_VOTERS_PAGE_SIZE: i32 = 24;
+
+pub struct PollVoter {
+    pub peer: i64,
+    pub name: String,
+    pub avatar: Option<Avatar>,
+    pub answers: Vec<String>,
+}
+
+pub struct PollVoterPage {
+    pub voters: Vec<PollVoter>,
+    pub total: i32,
+    pub next: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct PollUpdate {
     pub id: i64,
@@ -2124,11 +2329,19 @@ pub struct PollVoteCount {
 
 impl PollUpdate {
     pub fn apply(&self, chat: i64, message: i32, poll: &mut Poll) -> bool {
-        if poll.id != self.id || self.target.is_some_and(|target| target != (chat, message)) {
+        if poll.id != self.id
+            || self.target.is_some_and(|target| target != (chat, message))
+            || (poll.closed
+                && self
+                    .definition
+                    .as_ref()
+                    .is_some_and(|incoming| !incoming.closed))
+        {
             return false;
         }
         let mut next = self.definition.clone().unwrap_or_else(|| poll.clone());
         next.closed |= poll.closed;
+        next.closes_at = next.closes_at.or(poll.closes_at);
         for choice in &mut next.choices {
             if let Some(old) = poll.choices.iter().find(|old| old.option == choice.option) {
                 choice.chosen = old.chosen;
@@ -2157,21 +2370,82 @@ impl PollUpdate {
 }
 
 pub const MAX_POLL_CHOICES: usize = 12;
+pub const POLL_MIN_SECONDS: i32 = 60;
+pub const POLL_DEFAULT_MAX_SECONDS: i32 = 2_628_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollDeadline {
+    After(i32),
+    At(i64),
+}
+
+impl PollDeadline {
+    pub fn closes_at(self, now: i64) -> i64 {
+        match self {
+            Self::After(seconds) => now.saturating_add(i64::from(seconds)),
+            Self::At(time) => time,
+        }
+    }
+}
+
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
 
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PollDraft {
+    pub deadline: Option<PollDeadline>,
+    pub hide_results_until_close: bool,
     pub question: String,
     pub open_answers: bool,
     pub choices: Vec<String>,
     pub multiple: bool,
     pub public: bool,
+    pub quiz: Option<PollQuizDraft>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollQuizDraft {
+    pub correct: Vec<usize>,
+    pub solution: String,
 }
 
 impl PollDraft {
+    pub fn close_fields(&self, now: i64, max: i32) -> anyhow::Result<(Option<i32>, Option<i32>)> {
+        let Some(deadline) = self.deadline else {
+            anyhow::ensure!(
+                !self.hide_results_until_close,
+                "Для скрытия результатов задайте срок опроса"
+            );
+            return Ok((None, None));
+        };
+        let seconds = deadline.closes_at(now).saturating_sub(now);
+        anyhow::ensure!(
+            seconds >= i64::from(POLL_MIN_SECONDS),
+            "До завершения должна оставаться хотя бы минута"
+        );
+        anyhow::ensure!(
+            seconds <= i64::from(max),
+            "Срок опроса превышает лимит Telegram ({max} с)"
+        );
+        match deadline {
+            PollDeadline::After(seconds) => Ok((Some(seconds), None)),
+            PollDeadline::At(time) => Ok((
+                None,
+                Some(
+                    i32::try_from(time)
+                        .map_err(|_| anyhow::anyhow!("Дата завершения вне диапазона Telegram"))?,
+                ),
+            )),
+        }
+    }
+
     pub fn validate(self) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            !self.open_answers || self.public,
-            "Добавление вариантов доступно в публичном опросе"
+            !self.open_answers || (self.public && self.quiz.is_none()),
+            "Добавление вариантов доступно в обычном публичном опросе"
         );
         let question = self.question.trim().to_owned();
         anyhow::ensure!(!question.is_empty(), "Введите вопрос");
@@ -2179,13 +2453,15 @@ impl PollDraft {
             question.chars().count() <= 300,
             "Вопрос должен быть до 300 символов"
         );
-        let choices: Vec<_> = self
+        let (positions, choices): (Vec<_>, Vec<_>) = self
             .choices
             .iter()
-            .map(|choice| choice.trim())
-            .filter(|choice| !choice.is_empty())
-            .map(str::to_owned)
-            .collect();
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                let choice = choice.trim();
+                (!choice.is_empty()).then(|| (index, choice.to_owned()))
+            })
+            .unzip();
         anyhow::ensure!(
             (2..=MAX_POLL_CHOICES).contains(&choices.len()),
             "Добавьте от 2 до {MAX_POLL_CHOICES} вариантов"
@@ -2201,9 +2477,33 @@ impl PollDraft {
                 .all(|(index, choice)| !choices[..index].contains(choice)),
             "Варианты должны различаться"
         );
+        let mut quiz = self.quiz;
+        if let Some(quiz) = &mut quiz {
+            anyhow::ensure!(!quiz.correct.is_empty(), "Отметьте правильный ответ");
+            anyhow::ensure!(
+                self.multiple || quiz.correct.len() == 1,
+                "Отметьте только один правильный ответ"
+            );
+            let correct: Vec<_> = positions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, position)| quiz.correct.contains(position).then_some(index))
+                .collect();
+            anyhow::ensure!(
+                correct.len() == quiz.correct.len(),
+                "Отметьте заполненные варианты ответа"
+            );
+            quiz.correct = correct;
+            quiz.solution = quiz.solution.trim().to_owned();
+            anyhow::ensure!(
+                quiz.solution.chars().count() <= 200 && quiz.solution.lines().count() <= 3,
+                "Пояснение должно быть до 200 символов и трёх строк"
+            );
+        }
         Ok(Self {
             question,
             choices,
+            quiz,
             ..self
         })
     }
@@ -2214,6 +2514,7 @@ impl PollDraft {
             id,
             question: self.question,
             creator: true,
+            hide_results_until_close: false,
             choices: self
                 .choices
                 .into_iter()
@@ -2230,10 +2531,11 @@ impl PollDraft {
             closed: false,
             public: self.public,
             multiple: self.multiple,
-            quiz: false,
-            revoting_disabled: false,
+            quiz: self.quiz.is_some(),
+            revoting_disabled: self.quiz.is_some(),
             total: None,
             solution: None,
+            closes_at: None,
         }
     }
 }
@@ -2261,6 +2563,12 @@ pub struct ReplyPreview {
 }
 
 impl Message {
+    pub fn open_poll_to_close(&self) -> Option<&Poll> {
+        self.poll.as_ref().filter(|poll| {
+            self.can_close_poll && !self.forwarded && !self.ephemeral && !poll.closed
+        })
+    }
+
     pub fn displayed_sender<'a>(&'a self, own_name: Option<&'a str>) -> &'a str {
         if self.self_authored
             && let Some(name) = own_name
@@ -2300,6 +2608,9 @@ impl Message {
     }
 
     pub fn preview_text(&self) -> Cow<'_, str> {
+        if let Some(sticker) = &self.sticker {
+            return Cow::Owned(sticker.label());
+        }
         if let Some(poll) = &self.poll {
             let kind = if poll.quiz {
                 "Викторина"
@@ -2551,6 +2862,23 @@ pub fn prepend_history_page(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sticker_emoji_search_preserves_sequences_and_bounds_pasted_input() {
+        for query in ["🚀", "👩🏽‍💻", "🇺🇦", "❤️", "#️⃣"] {
+            assert_eq!(
+                super::sticker_emoji_query(&format!(" {query} "))
+                    .unwrap()
+                    .as_deref(),
+                Some(query)
+            );
+        }
+        assert_eq!(super::sticker_emoji_query(" \n\t").unwrap(), None);
+        assert!(super::sticker_emoji_query("🚀\n🐱").is_err());
+        assert!(super::sticker_emoji_query("🚀\0").is_err());
+        assert!(super::sticker_emoji_query(&"🚀".repeat(33)).is_err());
+        assert!(super::sticker_emoji_query(&" ".repeat(513)).is_err());
+    }
+
     use super::*;
 
     fn chat_addresses() -> ChatAddresses {
@@ -2569,6 +2897,37 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn sticker_pack_links_accept_only_telegram_sets_and_valid_short_names() {
+        for input in [
+            "  Cat_Set  ",
+            "https://t.me/addstickers/Cat_Set",
+            "t.me/addstickers/Cat_Set/",
+            "https://telegram.me/addstickers/Cat_Set",
+            "tg://addstickers?set=Cat_Set",
+        ] {
+            assert_eq!(sticker_pack_name(input).unwrap(), "Cat_Set");
+        }
+        for input in [
+            "",
+            "1cat",
+            "Кот",
+            "cat/set",
+            "https://example.org/addstickers/Cat_Set",
+            "https://t.me.evil.test/addstickers/Cat_Set",
+            "https://user@t.me/addstickers/Cat_Set",
+            "https://t.me/addstickers/cat?other=1",
+            "https://t.me/addstickers/cat/more",
+            "tg://addstickers?set=cat&set=dog",
+            "tg://addstickers?other=cat",
+            "tg://addemoji?set=cat",
+        ] {
+            assert!(sticker_pack_name(input).is_err(), "{input}");
+        }
+        assert!(sticker_pack_name(&"a".repeat(64)).is_ok());
+        assert!(sticker_pack_name(&"a".repeat(65)).is_err());
     }
 
     #[test]
@@ -2633,6 +2992,7 @@ mod tests {
     fn chat_creation_validates_type_address_and_unique_contacts() {
         let mut draft = NewChatDraft {
             kind: NewChatKind::Group,
+            forum: false,
             info: ChatInfo {
                 title: "  План  ".into(),
                 about: " Справка ".into(),
@@ -2656,12 +3016,28 @@ mod tests {
         assert_eq!(group.info.title, "План");
         assert_eq!(group.info.about, "Справка");
         assert_eq!(group.members.len(), 1);
+        draft.forum = true;
+        assert!(draft.clone().validate().is_err());
+        draft.kind = NewChatKind::Supergroup;
+        assert!(
+            draft
+                .clone()
+                .validate()
+                .unwrap()
+                .chat(-1000000000234, 0)
+                .forum
+        );
+        draft.kind = NewChatKind::Group;
+        draft.forum = false;
         draft.username = " @project_1 ".into();
         assert!(draft.clone().validate().is_err());
         draft.kind = NewChatKind::Channel;
         let channel = draft.clone().validate().unwrap();
         assert_eq!(channel.username, "project_1");
         assert!(channel.chat(-1000000000234, 0).can_write);
+        draft.forum = true;
+        assert!(draft.clone().validate().is_err());
+        draft.forum = false;
         draft.members[0].kind = ChatKind::Bot;
         assert!(draft.validate().is_err());
         for invalid in [
@@ -3159,11 +3535,13 @@ mod tests {
                 audio: None,
                 thumbnail: None,
                 poll: None,
+                sticker: None,
                 reply_to: None,
                 reply_preview: None,
                 can_reply: true,
                 can_edit: false,
                 can_delete: false,
+                can_close_poll: false,
                 can_forward: false,
                 forwarded: false,
                 pinned: false,
@@ -3251,6 +3629,35 @@ mod tests {
     }
 
     #[test]
+    fn enabling_topics_rechecks_linked_discussions_and_history_consent() {
+        let disabled = ForumMode {
+            enabled: false,
+            linked_discussion: false,
+            hidden_history: false,
+        };
+        let enabled = ForumMode {
+            enabled: true,
+            ..disabled
+        };
+        let hidden = ForumMode {
+            hidden_history: true,
+            ..disabled
+        };
+        let linked = ForumMode {
+            linked_discussion: true,
+            ..disabled
+        };
+        assert!(disabled.needs_change(disabled).unwrap());
+        assert!(!enabled.needs_change(disabled).unwrap());
+        assert!(hidden.needs_change(disabled).is_err());
+        assert!(hidden.needs_change(hidden).unwrap());
+        assert!(disabled.needs_change(hidden).unwrap());
+        assert!(linked.needs_change(disabled).is_err());
+        assert!(enabled.needs_change(enabled).unwrap());
+        assert!(!disabled.needs_change(enabled).unwrap());
+    }
+
+    #[test]
     fn forum_topic_changes_keep_concurrent_edits_and_validate_utf8() {
         use ForumTopicChange::*;
 
@@ -3328,6 +3735,54 @@ mod tests {
     }
 
     #[test]
+    fn quiz_draft_maps_answers_after_empty_rows_and_hides_the_key_before_voting() {
+        let draft = PollDraft {
+            question: "Какие дни выходные?".into(),
+            choices: vec![
+                " ".into(),
+                "Суббота".into(),
+                "Пятница".into(),
+                String::new(),
+                "Воскресенье".into(),
+            ],
+            multiple: true,
+            quiz: Some(PollQuizDraft {
+                correct: vec![4, 1],
+                solution: "  Суббота\nи воскресенье.  ".into(),
+            }),
+            ..PollDraft::default()
+        };
+        let normalized = draft.clone().validate().unwrap();
+        assert!(normalized == normalized.clone().validate().unwrap());
+        assert_eq!(
+            normalized.quiz,
+            Some(PollQuizDraft {
+                correct: vec![0, 2],
+                solution: "Суббота\nи воскресенье.".into(),
+            })
+        );
+        let poll = normalized.into_poll(46);
+        assert!(poll.quiz && poll.multiple && poll.revoting_disabled);
+        assert!(poll.choices.iter().all(|choice| !choice.correct));
+        assert_eq!(poll.solution, None);
+
+        for correct in [vec![], vec![0], vec![4, 4], vec![5]] {
+            let mut invalid = draft.clone();
+            invalid.quiz.as_mut().unwrap().correct = correct;
+            assert!(invalid.validate().is_err());
+        }
+        let mut single = draft.clone();
+        single.multiple = false;
+        assert!(single.validate().is_err());
+
+        for solution in ["а".repeat(201), "Раз\nДва\nТри\nЧетыре".into()] {
+            let mut invalid = draft.clone();
+            invalid.quiz.as_mut().unwrap().solution = solution;
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
     fn poll_partial_updates_preserve_vote_and_explicit_targets_do_not_leak() {
         let mut poll = PollDraft {
             question: "Когда?".into(),
@@ -3367,6 +3822,30 @@ mod tests {
         assert!(update.apply(-100, 10, &mut poll));
         assert_eq!(poll.total, Some(3));
         assert!(!poll.can_vote());
+    }
+
+    #[test]
+    fn voter_names_require_visible_public_results() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            public: true,
+            ..PollDraft::default()
+        }
+        .into_poll(72);
+        assert!(!poll.can_list_voters());
+        poll.total = Some(3);
+        assert!(poll.can_list_voters());
+        poll.creator = false;
+        assert!(!poll.can_list_voters());
+        poll.choices[0].chosen = true;
+        assert!(poll.can_list_voters());
+        poll.hide_results_until_close = true;
+        assert!(!poll.can_list_voters());
+        poll.closed = true;
+        assert!(poll.can_list_voters());
+        poll.public = false;
+        assert!(!poll.can_list_voters());
     }
 
     #[test]
@@ -3421,7 +3900,16 @@ mod tests {
         };
         assert!(draft.clone().validate().is_err());
         draft.public = true;
-        assert!(draft.validate().unwrap().into_poll(17).answers_open());
+        let mut poll = draft.clone().validate().unwrap().into_poll(17);
+        assert!(poll.answers_open());
+        poll.closes_at = Some(1_800_000_000);
+        assert!(poll.answers_open_at(1_799_999_999));
+        assert!(!poll.answers_open_at(1_800_000_000));
+        draft.quiz = Some(PollQuizDraft {
+            correct: vec![0],
+            solution: String::new(),
+        });
+        assert!(draft.validate().is_err());
         let text = "я".repeat(100);
         assert_eq!(
             normalized_poll_answer(&format!("  {text}\n")).unwrap(),
@@ -3528,5 +4016,59 @@ mod tests {
             Some(3),
         ));
         assert_eq!(current.into_keys().collect::<Vec<_>>(), [1, 2, 4]);
+    }
+
+    #[test]
+    fn timed_poll_encodes_one_deadline_and_uses_the_current_server_limit() {
+        let now = 1_800_000_000;
+        let mut draft = PollDraft {
+            deadline: Some(PollDeadline::After(60)),
+            ..PollDraft::default()
+        };
+        assert_eq!(draft.close_fields(now, 120).unwrap(), (Some(60), None));
+        draft.deadline = Some(PollDeadline::At(now + 120));
+        assert_eq!(
+            draft.close_fields(now, 120).unwrap(),
+            (None, Some(1_800_000_120))
+        );
+        assert!(draft.close_fields(now, 119).is_err());
+        assert!(draft.close_fields(now + 61, 120).is_err());
+        draft.deadline = None;
+        draft.hide_results_until_close = true;
+        assert!(draft.close_fields(now, 120).is_err());
+    }
+
+    #[test]
+    fn elapsed_deadline_stops_voting_and_waits_for_server_confirmation_to_show_results() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            ..PollDraft::default()
+        }
+        .into_poll(7);
+        poll.creator = false;
+        poll.closes_at = Some(1_800_000_000);
+        poll.hide_results_until_close = true;
+        assert!(poll.can_vote_at(1_799_999_999));
+        assert!(!poll.can_vote_at(1_800_000_000));
+        assert!(!poll.results_visible());
+        let mut confirmed = poll.clone();
+        confirmed.closes_at = None;
+        confirmed.closed = true;
+        assert!(
+            PollUpdate {
+                id: 7,
+                target: Some((3, 4)),
+                definition: Some(confirmed),
+                results: None,
+                total: Some(4),
+                solution: None,
+                partial: false,
+            }
+            .apply(3, 4, &mut poll)
+        );
+        assert_eq!(poll.closes_at, Some(1_800_000_000));
+        assert!(poll.results_visible());
+        assert!(!poll.can_vote_at(1_799_999_999));
     }
 }

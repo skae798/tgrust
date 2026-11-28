@@ -111,3 +111,8 @@ scale.waveform-position slider {
   color: white;
   font-size: 0.8em;
 }
+
+.chat-title-button {
+  padding-left: 0;
+  padding-right: 0;
+}
