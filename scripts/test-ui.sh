@@ -6,7 +6,7 @@ usage() {
         'Usage: scripts/test-ui.sh [--wayland] [FILTER]' \
         '       scripts/test-ui.sh [--wayland] --demo [--binary PATH]' \
         'Runs GTK tests or a bounded demo on a private display and D-Bus session.' \
-        'Wayland requires Mutter; the default display requires Xvfb.'
+        'All modes require Xvfb; Wayland also requires Mutter and checks its preference.'
 }
 
 backend=x11
@@ -34,13 +34,11 @@ if [[ -n $binary && $mode != demo ]] || (( ${#filters[@]} > 1 )) ||
     usage >&2
     exit 2
 fi
-for tool in dbus-run-session dbus-update-activation-environment timeout; do
+for tool in dbus-run-session dbus-update-activation-environment timeout xvfb-run; do
     command -v "$tool" >/dev/null || { printf 'Required: %s\n' "$tool" >&2; exit 1; }
 done
 if [[ $backend == wayland ]]; then
     command -v mutter >/dev/null || { printf '%s\n' 'Required: mutter' >&2; exit 1; }
-else
-    command -v xvfb-run >/dev/null || { printf '%s\n' 'Required: xvfb-run' >&2; exit 1; }
 fi
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
@@ -54,13 +52,13 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-mkdir -- "$runtime/data" "$runtime/config" "$runtime/cache"
+mkdir -- "$runtime/data" "$runtime/config" "$runtime/cache" "$runtime/state"
 # These changes apply only to the child session, never to GNOME or the launcher.
 env -u DISPLAY -u XAUTHORITY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u GDK_BACKEND \
     -u DBUS_SESSION_BUS_ADDRESS -u DBUS_SESSION_BUS_PID -u DBUS_STARTER_ADDRESS \
     -u DBUS_STARTER_BUS_TYPE -u AT_SPI_BUS_ADDRESS \
     XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" \
-    XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache" \
+    XDG_CONFIG_HOME="$runtime/config" XDG_CACHE_HOME="$runtime/cache" XDG_STATE_HOME="$runtime/state" \
     GTK_A11Y=none GSETTINGS_BACKEND=memory GIO_USE_VFS=local \
     dbus-run-session -- bash -s -- "$backend" "$mode" "$binary" "${filters[@]}" <<'SESSION'
 set -euo pipefail
@@ -69,7 +67,7 @@ mode=$2
 binary=$3
 shift 3
 if [[ $backend == wayland ]]; then
-    # No X11 fallback and no forced GTK backend: verify normal Wayland selection.
+    # No forced GTK backend: verify Wayland is preferred over a private Xvfb.
     export WAYLAND_DISPLAY=tgrust-test
     mutter --headless --no-x11 --wayland --wayland-display="$WAYLAND_DISPLAY" \
         --virtual-monitor=1024x768 >"$XDG_RUNTIME_DIR/compositor.log" 2>&1 &
@@ -89,15 +87,19 @@ if [[ $backend == wayland ]]; then
     fi
     # This is the private bus. Never pass --systemd: GNOME must stay untouched.
     dbus-update-activation-environment WAYLAND_DISPLAY
-    display_command=()
 else
     export GDK_BACKEND=x11
-    display_command=(xvfb-run -a -s '-screen 0 1920x1440x24' bash -c '
-        set -e
-        dbus-update-activation-environment DISPLAY XAUTHORITY GDK_BACKEND
-        exec "$@"
-    ' --)
 fi
+# X11 is deliberately available in both modes, as in a GNOME/Wayland session.
+# The Wayland demo must still create a Wayland surface to pass.
+display_command=(xvfb-run -a -s '-screen 0 1920x1440x24' bash -c '
+    set -e
+    dbus-update-activation-environment DISPLAY XAUTHORITY
+    if [[ -n ${GDK_BACKEND:-} ]]; then
+        dbus-update-activation-environment GDK_BACKEND
+    fi
+    exec "$@"
+' --)
 if [[ $mode == tests ]]; then
     "${display_command[@]}" cargo test --locked "$@" -- --ignored --nocapture --test-threads=1
 else
@@ -124,7 +126,7 @@ else
             tail -80 "$XDG_RUNTIME_DIR/demo.log" >&2
             exit 1
         fi
-        printf '%s\n' 'Demo displayed a surface through Wayland with GDK_BACKEND unset.'
+        printf '%s\n' 'Demo preferred Wayland with X11 available and GDK_BACKEND unset.'
     else
         printf '%s\n' 'Demo completed its bounded run on isolated Xvfb.'
     fi
