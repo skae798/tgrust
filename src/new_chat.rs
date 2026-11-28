@@ -40,6 +40,11 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
     details.add(&name);
     let username = adw::EntryRow::builder().title("Публичное имя").build();
     details.add(&username);
+    let forum = adw::SwitchRow::builder()
+        .title("Темы")
+        .visible(false)
+        .build();
+    details.add(&forum);
     form.append(&details);
     let privacy_hint = caption();
     privacy_hint.set_text("Оставьте публичное имя пустым для закрытого чата.");
@@ -108,6 +113,7 @@ pub fn open(window: &adw::ApplicationWindow, context: CreateContext) -> adw::Dia
         name,
         about,
         username,
+        forum,
         privacy_hint,
         submit,
         status,
@@ -168,6 +174,7 @@ struct Form {
     name: adw::EntryRow,
     about: gtk::TextView,
     username: adw::EntryRow,
+    forum: adw::SwitchRow,
     privacy_hint: gtk::Label,
     submit: gtk::Button,
     status: gtk::Label,
@@ -192,6 +199,8 @@ impl Form {
     fn update_type(&self) {
         let public = self.kind() != NewChatKind::Group;
         self.username.set_visible(public);
+        self.forum
+            .set_visible(self.kind() == NewChatKind::Supergroup);
         self.privacy_hint.set_visible(public);
         let hint = if public {
             "Участники (необязательно)"
@@ -231,6 +240,7 @@ impl Form {
         let about = self.about.buffer();
         let draft = NewChatDraft {
             kind: self.kind(),
+            forum: self.kind() == NewChatKind::Supergroup && self.forum.is_active(),
             info: ChatInfo {
                 title: self.name.text().into(),
                 about: about

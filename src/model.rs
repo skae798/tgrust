@@ -366,7 +366,35 @@ pub struct PeerProfile {
     pub can_read_admin_log: bool,
     pub addresses: Option<ChatAddresses>,
     pub group_permissions: Option<GroupPermissionSettings>,
+    pub forum_mode: Option<ForumMode>,
     pub bot_commands: Vec<BotCommand>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForumMode {
+    pub enabled: bool,
+    pub linked_discussion: bool,
+    pub hidden_history: bool,
+}
+
+impl ForumMode {
+    pub fn needs_change(self, confirmed: Self) -> anyhow::Result<bool> {
+        let enable = !confirmed.enabled;
+        if self.enabled == enable {
+            return Ok(false);
+        }
+        if enable {
+            anyhow::ensure!(
+                !self.linked_discussion,
+                "Темы недоступны в группе обсуждения, привязанной к каналу"
+            );
+            anyhow::ensure!(
+                !self.hidden_history || confirmed.hidden_history,
+                "Видимость истории изменилась. Откройте настройки тем снова"
+            );
+        }
+        Ok(true)
+    }
 }
 
 pub const ADMIN_LOG_PAGE_SIZE: usize = 25;
@@ -1137,6 +1165,7 @@ pub enum NewChatKind {
 #[derive(Clone)]
 pub struct NewChatDraft {
     pub kind: NewChatKind,
+    pub forum: bool,
     pub info: ChatInfo,
     pub username: String,
     pub members: Vec<Contact>,
@@ -1164,6 +1193,10 @@ impl NewChatDraft {
             "Публичное имя доступно для супергрупп и каналов"
         );
         anyhow::ensure!(
+            !self.forum || self.kind == NewChatKind::Supergroup,
+            "Темы доступны в супергруппах"
+        );
+        anyhow::ensure!(
             self.kind != NewChatKind::Group || !self.members.is_empty(),
             "Выберите хотя бы одного участника"
         );
@@ -1188,7 +1221,7 @@ impl NewChatDraft {
             preview_sender: None,
             preview_image: None,
             group: self.kind != NewChatKind::Channel,
-            forum: false,
+            forum: self.forum,
             unread: 0,
             unread_mark: false,
             last_message_id: 0,
@@ -1725,6 +1758,108 @@ impl ChatFolder {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StickerSource {
+    Recent,
+    Favorites,
+    Set(i64),
+}
+
+#[derive(Clone, Debug)]
+pub struct StickerCollection {
+    pub source: StickerSource,
+    pub title: String,
+    pub installed: Option<bool>,
+}
+
+pub struct StickerPackChange {
+    pub collection: StickerCollection,
+    pub archived: Option<usize>,
+}
+
+pub fn sticker_pack_name(input: &str) -> anyhow::Result<String> {
+    let input = input.trim();
+    let name =
+        if input.contains("://") || input.starts_with("t.me/") || input.starts_with("telegram.me/")
+        {
+            let link = if input.contains("://") {
+                input.to_owned()
+            } else {
+                format!("https://{input}")
+            };
+            let url = url::Url::parse(&link)?;
+            anyhow::ensure!(
+                url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port().is_none()
+                    && url.fragment().is_none(),
+                "Введите имя набора или ссылку Telegram"
+            );
+            if url.scheme() == "tg" && url.host_str() == Some("addstickers") {
+                let pairs: Vec<_> = url.query_pairs().collect();
+                anyhow::ensure!(
+                    url.path().is_empty() && pairs.len() == 1 && pairs[0].0 == "set",
+                    "Некорректная ссылка на набор"
+                );
+                pairs[0].1.to_string()
+            } else {
+                anyhow::ensure!(
+                    url.scheme() == "https"
+                        && matches!(url.host_str(), Some("t.me" | "telegram.me"))
+                        && url.query().is_none(),
+                    "Введите ссылку t.me/addstickers/имя"
+                );
+                let parts: Vec<_> = url.path().trim_matches('/').split('/').collect();
+                anyhow::ensure!(
+                    parts.len() == 2 && parts[0] == "addstickers",
+                    "Введите ссылку t.me/addstickers/имя"
+                );
+                parts[1].to_owned()
+            }
+        } else {
+            input.to_owned()
+        };
+    anyhow::ensure!(
+        (1..=64).contains(&name.len())
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_'),
+        "Имя набора должно содержать до 64 латинских букв, цифр и подчёркиваний и начинаться с буквы"
+    );
+    Ok(name)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StickerKind {
+    Static,
+    Animated,
+    Video,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sticker {
+    pub favorite: bool,
+    pub id: i64,
+    pub emoji: String,
+    pub kind: StickerKind,
+}
+
+impl Sticker {
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            StickerKind::Static => "Стикер",
+            StickerKind::Animated => "Анимированный стикер",
+            StickerKind::Video => "Видеостикер",
+        };
+        if self.emoji.is_empty() {
+            kind.into()
+        } else {
+            format!("{} {kind}", self.emoji)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Avatar {
     pub peer: i64,
     pub photo: i64,
@@ -1739,6 +1874,7 @@ pub enum AttachmentThumbnail {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChatImage {
+    Sticker(i64),
     Avatar(Avatar),
     Attachment {
         chat: i64,
@@ -1972,6 +2108,19 @@ pub enum PlaybackSource {
     Stream(PlayableMedia, crate::media_stream::StreamSource),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct StickerAnimationTiming {
+    pub frames: usize,
+    pub fps: f64,
+    pub width: usize,
+    pub height: usize,
+}
+
+pub enum StickerAnimationSource {
+    Video(PlaybackSource),
+    Tgs(Vec<u8>),
+}
+
 impl PlaybackSource {
     pub fn media(&self) -> PlayableMedia {
         match self {
@@ -1999,6 +2148,7 @@ pub struct Message {
     pub audio: Option<AudioInfo>,
     pub thumbnail: Option<AttachmentThumbnail>,
     pub poll: Option<Poll>,
+    pub sticker: Option<Sticker>,
     pub reply_to: Option<i32>,
     pub reply_preview: Option<ReplyPreview>,
     pub can_reply: bool,
@@ -2278,6 +2428,9 @@ impl Message {
     }
 
     pub fn preview_text(&self) -> Cow<'_, str> {
+        if let Some(sticker) = &self.sticker {
+            return Cow::Owned(sticker.label());
+        }
         if let Some(poll) = &self.poll {
             let kind = if poll.quiz {
                 "Викторина"
@@ -2535,6 +2688,37 @@ mod tests {
     }
 
     #[test]
+    fn sticker_pack_links_accept_only_telegram_sets_and_valid_short_names() {
+        for input in [
+            "  Cat_Set  ",
+            "https://t.me/addstickers/Cat_Set",
+            "t.me/addstickers/Cat_Set/",
+            "https://telegram.me/addstickers/Cat_Set",
+            "tg://addstickers?set=Cat_Set",
+        ] {
+            assert_eq!(sticker_pack_name(input).unwrap(), "Cat_Set");
+        }
+        for input in [
+            "",
+            "1cat",
+            "Кот",
+            "cat/set",
+            "https://example.org/addstickers/Cat_Set",
+            "https://t.me.evil.test/addstickers/Cat_Set",
+            "https://user@t.me/addstickers/Cat_Set",
+            "https://t.me/addstickers/cat?other=1",
+            "https://t.me/addstickers/cat/more",
+            "tg://addstickers?set=cat&set=dog",
+            "tg://addstickers?other=cat",
+            "tg://addemoji?set=cat",
+        ] {
+            assert!(sticker_pack_name(input).is_err(), "{input}");
+        }
+        assert!(sticker_pack_name(&"a".repeat(64)).is_ok());
+        assert!(sticker_pack_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
     fn chat_address_edits_reconcile_retries_and_preserve_unmodified_remote_names() {
         let original = chat_addresses();
         let mut proposed = original.clone();
@@ -2596,6 +2780,7 @@ mod tests {
     fn chat_creation_validates_type_address_and_unique_contacts() {
         let mut draft = NewChatDraft {
             kind: NewChatKind::Group,
+            forum: false,
             info: ChatInfo {
                 title: "  План  ".into(),
                 about: " Справка ".into(),
@@ -2619,12 +2804,28 @@ mod tests {
         assert_eq!(group.info.title, "План");
         assert_eq!(group.info.about, "Справка");
         assert_eq!(group.members.len(), 1);
+        draft.forum = true;
+        assert!(draft.clone().validate().is_err());
+        draft.kind = NewChatKind::Supergroup;
+        assert!(
+            draft
+                .clone()
+                .validate()
+                .unwrap()
+                .chat(-1000000000234, 0)
+                .forum
+        );
+        draft.kind = NewChatKind::Group;
+        draft.forum = false;
         draft.username = " @project_1 ".into();
         assert!(draft.clone().validate().is_err());
         draft.kind = NewChatKind::Channel;
         let channel = draft.clone().validate().unwrap();
         assert_eq!(channel.username, "project_1");
         assert!(channel.chat(-1000000000234, 0).can_write);
+        draft.forum = true;
+        assert!(draft.clone().validate().is_err());
+        draft.forum = false;
         draft.members[0].kind = ChatKind::Bot;
         assert!(draft.validate().is_err());
         for invalid in [
@@ -3122,6 +3323,7 @@ mod tests {
                 audio: None,
                 thumbnail: None,
                 poll: None,
+                sticker: None,
                 reply_to: None,
                 reply_preview: None,
                 can_reply: true,
@@ -3211,6 +3413,35 @@ mod tests {
         topic.id = GENERAL_TOPIC;
         assert!(admin.allows(&topic, &Hidden(true)));
         assert!(!admin.allows(&topic, &Delete));
+    }
+
+    #[test]
+    fn enabling_topics_rechecks_linked_discussions_and_history_consent() {
+        let disabled = ForumMode {
+            enabled: false,
+            linked_discussion: false,
+            hidden_history: false,
+        };
+        let enabled = ForumMode {
+            enabled: true,
+            ..disabled
+        };
+        let hidden = ForumMode {
+            hidden_history: true,
+            ..disabled
+        };
+        let linked = ForumMode {
+            linked_discussion: true,
+            ..disabled
+        };
+        assert!(disabled.needs_change(disabled).unwrap());
+        assert!(!enabled.needs_change(disabled).unwrap());
+        assert!(hidden.needs_change(disabled).is_err());
+        assert!(hidden.needs_change(hidden).unwrap());
+        assert!(disabled.needs_change(hidden).unwrap());
+        assert!(linked.needs_change(disabled).is_err());
+        assert!(enabled.needs_change(enabled).unwrap());
+        assert!(!disabled.needs_change(enabled).unwrap());
     }
 
     #[test]

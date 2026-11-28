@@ -429,3 +429,142 @@ pub fn create(
     dialog.present(Some(window));
     dialog
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[track_caller]
+    fn settle(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !ready() && Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready(), "Quiz editor did not settle");
+    }
+
+    fn find<W: IsA<gtk::Widget> + Clone>(
+        root: &impl IsA<gtk::Widget>,
+        predicate: &impl Fn(&W) -> bool,
+    ) -> Option<W> {
+        if let Ok(widget) = root.as_ref().clone().downcast::<W>()
+            && predicate(&widget)
+        {
+            return Some(widget);
+        }
+        let mut child = root.as_ref().first_child();
+        while let Some(widget) = child {
+            if let Some(found) = find(&widget, predicate) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn quiz_editor_normalizes_choices_and_retries_without_duplicate_operations() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.QuizEditorTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(720)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            let attempts = Rc::new(RefCell::new(Vec::<(PollDraft, i64)>::new()));
+            let sent = attempts.clone();
+            let dialog = create(&window, move |draft, id| {
+                sent.borrow_mut().push((draft, id));
+                Box::pin(async { anyhow::bail!("Synthetic send interruption") })
+            });
+            settle(|| dialog.is_mapped());
+            let entry =
+                |title: &str| find(&dialog, &|row: &adw::EntryRow| row.title() == title).unwrap();
+            let switch =
+                |title: &str| find(&dialog, &|row: &adw::SwitchRow| row.title() == title).unwrap();
+            let question = entry("Вопрос");
+            question.set_text("Что видно ночью?");
+            let first = entry("Вариант 1");
+            first.set_text("Звёзды");
+            switch("Викторина").set_active(true);
+            let add = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Добавить вариант")
+            })
+            .unwrap();
+            add.emit_clicked();
+            let third = entry("Вариант 3");
+            third.set_text("Луна");
+            let correct = |row: &adw::EntryRow| find(row, &|_: &gtk::CheckButton| true).unwrap();
+            let submit = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Создать викторину")
+            })
+            .unwrap();
+            settle(|| submit.is_mapped());
+            assert!(submit.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&submit));
+            settle(|| {
+                find(&dialog, &|label: &gtk::Label| {
+                    label.is_visible() && label.text().contains("Отметьте правильный ответ")
+                })
+                .is_some()
+            });
+            assert!(attempts.borrow().is_empty());
+            correct(&third).set_active(true);
+            correct(&first).set_active(true);
+            assert!(!correct(&third).is_active());
+            correct(&third).set_active(true);
+            let solution = find(&dialog, &|_: &gtk::TextView| true).unwrap();
+            solution
+                .buffer()
+                .set_text("Луна отражает свет.\nЗвёзды светят сами.");
+            let send = |count| {
+                assert!(submit.grab_focus());
+                assert!(gtk::prelude::WidgetExt::activate(&submit));
+                settle(|| attempts.borrow().len() == count && submit.is_sensitive());
+            };
+            send(1);
+            send(2);
+            {
+                let attempts = attempts.borrow();
+                assert_eq!(attempts[0].1, attempts[1].1);
+                let draft = &attempts[0].0;
+                assert_eq!(draft.choices, ["Звёзды", "Луна"]);
+                assert_eq!(draft.quiz.as_ref().unwrap().correct, [1]);
+                assert!(draft.quiz.as_ref().unwrap().solution.contains('\n'));
+            }
+            switch("Несколько ответов").set_active(true);
+            correct(&first).set_active(true);
+            switch("Публичное голосование").set_active(true);
+            send(3);
+            {
+                let attempts = attempts.borrow();
+                assert_ne!(attempts[1].1, attempts[2].1);
+                assert_eq!(attempts[2].0.quiz.as_ref().unwrap().correct, [0, 1]);
+                assert!(attempts[2].0.multiple && attempts[2].0.public);
+            }
+            switch("Несколько ответов").set_active(false);
+            assert!(correct(&first).is_active());
+            assert!(!correct(&third).is_active());
+            first.set_text("");
+            assert!(!correct(&first).is_active());
+            assert!(!correct(&first).is_sensitive());
+            first.set_text("Звёзды");
+            switch("Викторина").set_active(false);
+            assert!(!correct(&first).is_visible());
+            send(4);
+            assert!(attempts.borrow()[3].0.quiz.is_none());
+            assert!(dialog.width() <= window.width());
+            dialog.close();
+            window.close();
+        });
+    }
+}

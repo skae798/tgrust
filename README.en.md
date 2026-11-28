@@ -9,7 +9,7 @@ An unofficial Telegram client for GNOME/Wayland, built with Rust, GTK 4, and Lib
 For Fedora 45 x86_64, download `tgrust-fedora45-x86_64` from the [latest release](https://github.com/skae798/tgrust/releases/latest). Install the client and launch the demo from the download folder.
 
 ~~~sh
-sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good
+sudo dnf install gtk4 libadwaita gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free
 install -Dm755 ./tgrust-fedora45-x86_64 ~/.local/bin/tgrust
 ~/.local/bin/tgrust --demo
 ~~~
@@ -18,12 +18,17 @@ Demo mode works without an account. To sign in, launch tgrust without `--demo` a
 
 The prebuilt client checks for updates automatically and opens the new build on the next launch.
 
+In GNOME/Wayland, normal launches use Wayland, including after updates. The X11 setting used for background tests applies only to the test command.
+
 ## Features
 
-- **Messages** — scroll to load history, search, reply, edit, react, and create or vote in polls and quizzes.
+- **Messages** — paginated history, search, replies, edits, reactions, polls, and quizzes. Completed actions survive switching chats.
 - **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers.
-- **Chats** — create groups and channels, manage supergroup topics, folders, archive, GNOME notifications, member and admin management, group and individual restrictions, slow mode, invitations, public addresses, and recent actions.
+- **Chats** — create groups and channels, enable and manage supergroup topics, folders, archive, GNOME notifications, member and admin management, group and individual restrictions, slow mode, invitations, public addresses, and recent actions.
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.
+- **Stickers** — preview, install, and remove packs by Telegram links; recent and favorite stickers; send to chats or topics, including replies. WebP images render in full; video stickers loop directly in messages, with transparency and no sound. TGS animations also play directly in messages. Stickers have no captions in history or the picker.
+
+Building from source also requires C++ and `gstreamer1-devel`, `gstreamer1-plugins-base-devel`; see the guide for all dependencies.
 
 ## Documentation
 
