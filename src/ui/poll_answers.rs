@@ -46,7 +46,7 @@ impl Ui {
                 ),
             );
         }
-        let own = self.poll_answer_owner();
+        let own = self.poll_viewer_id();
         let now = restriction_now();
         if poll
             .choices
@@ -63,15 +63,6 @@ impl Ui {
                 ),
             );
         }
-    }
-
-    fn poll_answer_owner(&self) -> Option<i64> {
-        if self.is_demo.get() {
-            return Some(self.demo_profile.borrow().id);
-        }
-        self.accounts
-            .identity(&self.account)
-            .map(|identity| identity.user_id)
     }
 
     fn editable_answers<'a>(&self, target: Conversation, message: &'a Message) -> Option<&'a Poll> {
@@ -114,9 +105,10 @@ impl Ui {
         ) else {
             return;
         };
+        let poll = poll.for_viewer(self.poll_viewer_id());
         let (limit, period) = self.poll_answer_limits.get();
         let editor = if delete {
-            let own = self.poll_answer_owner();
+            let own = self.poll_viewer_id();
             let now = restriction_now();
             let choices: Vec<_> = poll
                 .choices
@@ -199,7 +191,7 @@ impl Ui {
 
     fn demo_answer_change(self: &Rc<Self>, mut poll: Poll, change: PollAnswerChange) -> Result<()> {
         let (limit, period) = self.poll_answer_limits.get();
-        let own = self.poll_answer_owner();
+        let own = self.poll_viewer_id();
         let previous_vote = poll.has_vote();
         match change {
             PollAnswerChange::Add(text) => {

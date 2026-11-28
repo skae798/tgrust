@@ -4055,7 +4055,7 @@ fn poll_media(
             quiz: correct_answers.is_some(),
             open_answers: poll.open_answers,
             revoting_disabled: poll.revoting_disabled || correct_answers.is_some(),
-            shuffle_answers: false,
+            shuffle_answers: poll.shuffle_answers,
             hide_results_until_close: poll.hide_results_until_close,
             creator: false,
             subscribers_only: false,
@@ -4114,6 +4114,7 @@ fn poll_definition(raw: &types::Poll) -> Poll {
         multiple: raw.multiple_choice,
         quiz: raw.quiz,
         revoting_disabled: raw.revoting_disabled,
+        shuffle_answers: raw.shuffle_answers,
         total: None,
         solution: None,
         closes_at: raw.close_date.filter(|date| *date > 0).map(i64::from),
@@ -4739,6 +4740,32 @@ mod tests {
             assert!(!poll.quiz);
             assert_eq!(poll.revoting_disabled, locked);
             assert!(request.correct_answers.is_none());
+        }
+    }
+
+    #[test]
+    fn shuffled_quiz_request_keeps_the_original_answer_indices() {
+        for quiz in [false, true] {
+            let draft = PollDraft {
+                question: "Когда?".into(),
+                choices: vec!["Первый".into(), "".into(), "Второй".into()],
+                shuffle_answers: true,
+                quiz: quiz.then(|| crate::model::PollQuizDraft {
+                    correct: vec![2],
+                    solution: String::new(),
+                }),
+                ..PollDraft::default()
+            }
+            .validate()
+            .unwrap();
+            let request = poll_media(draft, 17, None, None);
+            let enums::Poll::Poll(poll) = request.poll;
+            assert!(poll.shuffle_answers);
+            let enums::PollAnswer::InputPollAnswer(first) = &poll.answers[0] else {
+                panic!("Expected an input answer")
+            };
+            assert_eq!(poll_question(&first.text), "Первый");
+            assert_eq!(request.correct_answers, quiz.then(|| vec![1]));
         }
     }
 

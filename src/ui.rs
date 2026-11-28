@@ -6202,6 +6202,15 @@ impl Ui {
         self.poll_dialog.set(Some(&dialog));
     }
 
+    fn poll_viewer_id(&self) -> Option<i64> {
+        if self.is_demo.get() {
+            return Some(self.demo_profile.borrow().id);
+        }
+        self.accounts
+            .identity(&self.account)
+            .map(|identity| identity.user_id)
+    }
+
     fn can_list_poll_voters(&self, chat: i64, poll: &Poll) -> bool {
         poll.can_list_voters() && self.chat_view(chat).is_some_and(|chat| !chat.broadcast)
     }
@@ -6224,8 +6233,9 @@ impl Ui {
         };
         let demo = self.is_demo.get().then(|| poll.clone());
         let client = self.client.borrow().clone();
+        let display = poll.for_viewer(self.poll_viewer_id());
         let dialog = crate::poll_voters::dialog(
-            &poll,
+            &display,
             crate::poll_voters::VoterContext {
                 runtime: self.runtime.clone(),
                 load: Box::new(move |option, offset| {
@@ -6257,7 +6267,8 @@ impl Ui {
     }
 
     fn poll_card(self: &Rc<Self>, chat: i64, id: i32, poll: &Poll) -> gtk::Box {
-        let card = crate::poll_dialog::card(poll);
+        let display = poll.for_viewer(self.poll_viewer_id());
+        let card = crate::poll_dialog::card(&display);
         if !poll.can_vote() {
             return card;
         }
@@ -6283,9 +6294,10 @@ impl Ui {
                     return;
                 }
                 let expected = poll.id;
+                let display = poll.for_viewer(ui.poll_viewer_id());
                 crate::poll_dialog::vote(
                     &window,
-                    poll,
+                    &display,
                     glib::clone!(
                         #[weak]
                         ui,
@@ -7854,6 +7866,165 @@ mod tests {
             caption.select_region(2, 7);
             assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
             assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn shuffled_quiz_keeps_display_order_and_votes_for_the_original_option() {
+        gtk::test_synced(|| {
+            fn settle(mut ready: impl FnMut() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !ready() && Instant::now() < deadline {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(ready(), "Shuffled quiz did not settle");
+            }
+            fn find(
+                root: &gtk::Widget,
+                test: &impl Fn(&gtk::Widget) -> bool,
+            ) -> Option<gtk::Widget> {
+                if test(root) {
+                    return Some(root.clone());
+                }
+                let mut child = root.first_child();
+                while let Some(widget) = child {
+                    if let Some(found) = find(&widget, test) {
+                        return Some(found);
+                    }
+                    child = widget.next_sibling();
+                }
+                None
+            }
+            fn answers(root: &gtk::Widget) -> Vec<String> {
+                let mut result = Vec::new();
+                if let Some(label) = root.downcast_ref::<gtk::Label>()
+                    && label.text().starts_with("Ответ ")
+                {
+                    result.push(label.text().into());
+                }
+                let mut child = root.first_child();
+                while let Some(widget) = child {
+                    result.extend(answers(&widget));
+                    child = widget.next_sibling();
+                }
+                result
+            }
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.PollShuffleTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            settle(|| (340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            let target = ui.conversation().unwrap();
+            ui.input.buffer().set_text("Черновик с викториной");
+            let quiz = PollQuizDraft {
+                correct: vec![2],
+                solution: "Третий исходный вариант.".into(),
+            };
+            let draft = crate::model::PollDraft {
+                question: "Найдите правильный ответ".into(),
+                choices: (0..5).map(|index| format!("Ответ {index}")).collect(),
+                shuffle_answers: true,
+                quiz: Some(quiz.clone()),
+                ..crate::model::PollDraft::default()
+            };
+            let mut message = demo::poll_message(904, draft);
+            message.outgoing = false;
+            message.self_authored = false;
+            message.sender = "Анна".into();
+            message.can_close_poll = false;
+            let poll = message.poll.as_mut().unwrap();
+            poll.id = 17;
+            poll.creator = false;
+            let display = poll.for_viewer(ui.poll_viewer_id());
+            let expected: Vec<_> = display
+                .choices
+                .iter()
+                .map(|choice| choice.label.clone())
+                .collect();
+            assert_ne!(
+                expected,
+                poll.choices
+                    .iter()
+                    .map(|choice| choice.label.clone())
+                    .collect::<Vec<_>>()
+            );
+            ui.demo_quizzes.borrow_mut().insert(17, quiz);
+            ui.add_demo_messages(target, vec![message]);
+            let message = || {
+                find(ui.history.upcast_ref(), &|widget| {
+                    widget.widget_name() == "message-904"
+                })
+                .unwrap()
+            };
+            assert_eq!(answers(&message()), expected);
+            let vote = find(&message(), &|widget| {
+                widget
+                    .downcast_ref::<gtk::Button>()
+                    .is_some_and(|button| button.label().as_deref() == Some("Голосовать"))
+            })
+            .unwrap();
+            settle(|| vote.is_mapped());
+            assert!(vote.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&vote));
+            settle(|| window.visible_dialog().is_some());
+            let dialog = window.visible_dialog().unwrap();
+            assert_eq!(answers(dialog.upcast_ref()), expected);
+            let choice = find(dialog.upcast_ref(), &|widget| {
+                widget
+                    .downcast_ref::<gtk::CheckButton>()
+                    .is_some_and(|button| {
+                        button
+                            .child()
+                            .and_downcast::<gtk::Label>()
+                            .is_some_and(|label| label.text() == "Ответ 2")
+                    })
+            })
+            .unwrap()
+            .downcast::<gtk::CheckButton>()
+            .unwrap();
+            choice.set_active(true);
+            let send = find(dialog.upcast_ref(), &|widget| {
+                widget
+                    .downcast_ref::<gtk::Button>()
+                    .is_some_and(|button| button.label().as_deref() == Some("Голосовать"))
+            })
+            .unwrap();
+            settle(|| send.is_mapped());
+            assert!(send.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&send));
+            settle(|| {
+                ui.messages.borrow()[&904].poll.as_ref().unwrap().has_vote()
+                    && window.visible_dialog().is_none()
+            });
+            let actual = ui.messages.borrow()[&904].poll.clone().unwrap();
+            assert_eq!(actual.choices[2].option, [2]);
+            assert!(actual.choices[2].chosen && actual.choices[2].correct);
+            assert!(actual.choices.iter().filter(|choice| choice.chosen).count() == 1);
+            assert_eq!(answers(&message()), expected);
+            ui.show_chat(2, None);
+            ui.show_chat(1, None);
+            assert_eq!(answers(&message()), expected);
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик с викториной"
+            );
+            window.close();
         });
     }
 

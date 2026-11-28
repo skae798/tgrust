@@ -1220,6 +1220,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 open_answers: false,
                 choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
                 multiple: true,
+                shuffle_answers: true,
                 ..PollDraft::default()
             },
         );
