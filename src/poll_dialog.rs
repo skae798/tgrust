@@ -24,6 +24,7 @@ fn label(text: &str) -> gtk::Label {
 pub fn card(poll: &Poll) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let question = label(&poll.question);
+    question.set_selectable(true);
     question.add_css_class("heading");
     card.append(&question);
     let kind = match (poll.quiz, poll.public) {
@@ -76,9 +77,14 @@ pub fn card(poll: &Poll) -> gtk::Box {
     if let Some(solution) = &poll.solution {
         card.append(&label(solution));
     }
+    let closed = if poll.quiz {
+        "Викторина завершена"
+    } else {
+        "Опрос закрыт"
+    };
     let status = match (poll.closed, poll.total) {
-        (true, Some(total)) => format!("Опрос закрыт · Всего проголосовало: {total}"),
-        (true, None) => "Опрос закрыт".to_owned(),
+        (true, Some(total)) => format!("{closed} · Всего проголосовало: {total}"),
+        (true, None) => closed.to_owned(),
         (false, Some(total)) => format!("Всего проголосовало: {total}"),
         (false, None) => String::new(),
     };

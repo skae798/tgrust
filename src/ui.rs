@@ -189,7 +189,7 @@ struct Ui {
     uploads: RefCell<HashMap<Conversation, Vec<Upload>>>,
     replies: RefCell<HashMap<Conversation, Reply>>,
     reacting: RefCell<HashSet<(i64, i32)>>,
-    voting: RefCell<HashSet<(i64, i32)>>,
+    poll_actions: RefCell<HashSet<(i64, i32)>>,
     poll_revision: Cell<u64>,
     recent_polls: RefCell<VecDeque<(u64, PollUpdate)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
@@ -449,6 +449,7 @@ fn build_window(
         .sensitive(false)
         .build();
     profile_button.add_css_class("flat");
+    profile_button.add_css_class("chat-title-button");
     profile_button.update_property(&[gtk::accessible::Property::Label("Информация о чате")]);
     pane_header.set_title_widget(Some(&profile_button));
     let archive_chat = icon_button("folder-symbolic", "Переместить в архив");
@@ -730,7 +731,7 @@ fn build_window(
         uploads: RefCell::new(HashMap::new()),
         replies: RefCell::new(HashMap::new()),
         reacting: RefCell::new(HashSet::new()),
-        voting: RefCell::new(HashSet::new()),
+        poll_actions: RefCell::new(HashSet::new()),
         poll_revision: Cell::new(0),
         recent_polls: RefCell::new(VecDeque::new()),
         images: RefCell::new(HashMap::new()),
@@ -5534,6 +5535,24 @@ impl Ui {
                 ),
             );
         }
+        if let (Some(target), Some(poll)) = (target, message.open_poll_to_close())
+            && !self.poll_actions.borrow().contains(&(chat, id))
+        {
+            let expected = poll.id;
+            add_menu_button(
+                &menu,
+                if poll.quiz {
+                    "Завершить викторину"
+                } else {
+                    "Завершить опрос"
+                },
+                glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move || ui.confirm_close_poll(target, id, expected)
+                ),
+            );
+        }
         if let Some(media) = message
             .playback
             .filter(|_| !message.ephemeral && message.sticker.is_none())
@@ -6115,7 +6134,7 @@ impl Ui {
             "Голосовать"
         });
         button.set_halign(gtk::Align::Start);
-        button.set_sensitive(!self.voting.borrow().contains(&(chat, id)));
+        button.set_sensitive(!self.poll_actions.borrow().contains(&(chat, id)));
         button.connect_clicked(glib::clone!(
             #[weak(rename_to = ui)]
             self,
@@ -6144,6 +6163,100 @@ impl Ui {
         ));
         card.append(&button);
         card
+    }
+
+    fn poll_to_close(&self, target: Conversation, id: i32, expected: i64) -> Option<Poll> {
+        if self.conversation() != Some(target)
+            || self.poll_actions.borrow().contains(&(target.chat, id))
+        {
+            return None;
+        }
+        self.messages
+            .borrow()
+            .get(&id)
+            .and_then(Message::open_poll_to_close)
+            .filter(|poll| poll.id == expected)
+            .cloned()
+    }
+
+    fn confirm_close_poll(self: &Rc<Self>, target: Conversation, id: i32, expected: i64) {
+        let (Some(window), Some(poll)) = (
+            self.window.upgrade(),
+            self.poll_to_close(target, id, expected),
+        ) else {
+            return;
+        };
+        let heading = if poll.quiz {
+            "Завершить викторину?"
+        } else {
+            "Завершить опрос?"
+        };
+        let dialog = adw::AlertDialog::new(
+            Some(heading),
+            Some("Голосование закончится для всех участников. Итоги сохранятся в сообщении."),
+        );
+        // When opened from the message popover, the narrow alert can focus its last response.
+        dialog.add_responses(&[("close", "Завершить"), ("cancel", "Отмена")]);
+        dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+        dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_focus(dialog.default_widget().as_ref());
+        dialog.connect_response(
+            Some("close"),
+            glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                move |_, _| ui.close_poll(target, id, expected)
+            ),
+        );
+        dialog.present(Some(&window));
+    }
+
+    fn close_poll(self: &Rc<Self>, target: Conversation, id: i32, expected: i64) {
+        let Some(mut poll) = self.poll_to_close(target, id, expected) else {
+            return;
+        };
+        let chat = target.chat;
+        if self.is_demo.get() {
+            poll.closed = true;
+            self.apply_poll_update(PollUpdate {
+                id: expected,
+                target: None,
+                definition: Some(poll),
+                results: None,
+                total: None,
+                solution: None,
+                partial: false,
+            });
+            return;
+        }
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        self.poll_actions.borrow_mut().insert((chat, id));
+        self.render_poll_change();
+        self.job(
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    client.close_poll(chat, id, expected),
+                )
+                .await
+                .context("Telegram не подтвердил завершение голосования вовремя")?
+            },
+            move |ui, result| {
+                ui.poll_actions.borrow_mut().remove(&(chat, id));
+                match result {
+                    Ok(update) => ui.apply_poll_update(update),
+                    Err(error) => {
+                        ui.toast(&format!("Не удалось завершить голосование. {error}"));
+                        if ui.conversation() == Some(target) {
+                            ui.render_poll_change();
+                        }
+                    }
+                }
+            },
+        );
     }
 
     fn vote(self: &Rc<Self>, chat: i64, id: i32, expected: i64, options: Vec<Vec<u8>>) {
@@ -6196,7 +6309,7 @@ impl Ui {
         let Some(client) = self.client.borrow().clone() else {
             return;
         };
-        if !self.voting.borrow_mut().insert((chat, id)) {
+        if !self.poll_actions.borrow_mut().insert((chat, id)) {
             return;
         }
         self.render_poll_change();
@@ -6210,7 +6323,7 @@ impl Ui {
                 .context("Telegram не подтвердил голос вовремя")?
             },
             move |ui, result| {
-                ui.voting.borrow_mut().remove(&(chat, id));
+                ui.poll_actions.borrow_mut().remove(&(chat, id));
                 match result {
                     Ok(Some(update)) => ui.apply_poll_update(update),
                     Ok(None) => {
@@ -6314,6 +6427,7 @@ impl Ui {
                 can_reply: true,
                 can_edit: uploads.is_empty(),
                 can_delete: true,
+                can_close_poll: false,
                 can_forward: true,
                 forwarded: false,
                 pinned: false,
@@ -6685,6 +6799,7 @@ impl Ui {
                     reply_preview: None,
                     can_edit: false,
                     can_delete: true,
+                    can_close_poll: false,
                     forwarded: true,
                     pinned: false,
                     reactions: Vec::new(),
@@ -7493,6 +7608,114 @@ mod tests {
             caption.select_region(2, 7);
             assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
             assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn poll_closing_confirms_safely_and_updates_its_chat_after_switching() {
+        gtk::test_synced(|| {
+            fn settle(mut ready: impl FnMut() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready() && Instant::now() < deadline {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(ready(), "Poll closing did not settle");
+            }
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.PollClosingTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            settle(|| (340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            let target = ui.conversation().unwrap();
+            ui.input.buffer().set_text("Черновик первого чата");
+            ui.add_demo_messages(target, vec![demo::poll_message(900, demo::sample_quiz())]);
+            let open = ui.messages.borrow()[&900].poll.clone().unwrap();
+            ui.close_poll(target, 900, open.id + 1);
+            assert!(!ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            ui.confirm_close_poll(target, 900, open.id);
+            let prompt = window
+                .visible_dialog()
+                .unwrap()
+                .downcast::<adw::AlertDialog>()
+                .unwrap();
+            assert_eq!(prompt.default_response().as_deref(), Some("cancel"));
+            let cancel = prompt
+                .default_widget()
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            settle(|| cancel.is_mapped());
+            assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= window.width());
+            assert!(cancel.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&cancel));
+            settle(|| window.visible_dialog().is_none());
+            assert!(!ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            ui.confirm_close_poll(target, 900, open.id);
+            let prompt = window.visible_dialog().unwrap();
+            ui.show_chat(2, None);
+            ui.input.buffer().set_text("Черновик второго чата");
+            prompt.emit_by_name::<()>("response", &[&"close"]);
+            prompt.close();
+            assert!(
+                !ui.demo_messages.borrow()[&1]
+                    .iter()
+                    .find(|message| message.id == 900)
+                    .unwrap()
+                    .poll
+                    .as_ref()
+                    .unwrap()
+                    .closed
+            );
+            let mut closed = open.clone();
+            closed.closed = true;
+            let mut update = PollUpdate {
+                id: open.id,
+                target: Some((1, 900)),
+                definition: Some(closed),
+                results: None,
+                total: None,
+                solution: None,
+                partial: false,
+            };
+            // A network completion arrives after the originating chat was cached.
+            ui.apply_poll_update(update.clone());
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик второго чата"
+            );
+            ui.show_chat(1, None);
+            assert!(ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            update.definition = Some(open);
+            ui.apply_poll_update(update);
+            assert!(ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик первого чата"
+            );
+            ui.add_demo_messages(target, vec![demo::poll_message(901, demo::sample_quiz())]);
+            let expected = ui.messages.borrow()[&901].poll.as_ref().unwrap().id;
+            ui.close_poll(target, 901, expected);
+            ui.close_poll(target, 901, expected);
+            assert!(ui.messages.borrow()[&901].poll.as_ref().unwrap().closed);
+            ui.show_chat(2, None);
+            ui.show_chat(1, None);
+            assert!(ui.messages.borrow()[&901].poll.as_ref().unwrap().closed);
+            window.close();
         });
     }
 
