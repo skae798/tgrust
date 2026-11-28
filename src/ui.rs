@@ -5838,7 +5838,10 @@ impl Ui {
             .build();
         picture.update_property(&[gtk::accessible::Property::Label(&sticker.label())]);
         image.add_named(&picture, Some("image"));
-        if matches!(playback, Some(PlayableMedia::Video { .. })) {
+        if sticker.kind == crate::model::StickerKind::Animated
+            || matches!(playback, Some(PlayableMedia::Video { .. }))
+        {
+            let tgs = sticker.kind == crate::model::StickerKind::Animated;
             let demo = self.is_demo.get();
             let client = self.client.borrow().clone();
             body.append(&crate::inline_sticker::build(
@@ -5848,13 +5851,26 @@ impl Ui {
                     let client = client.clone();
                     Box::pin(async move {
                         let (progress, _) = tokio::sync::watch::channel(Default::default());
-                        if demo {
-                            demo::sticker_video_preview(progress, true).await
+                        if tgs {
+                            let bytes = if demo {
+                                include_bytes!("../data/demo-sticker.tgs").to_vec()
+                            } else {
+                                client
+                                    .context("Нет подключения к Telegram")?
+                                    .sticker_tgs_preview(chat, id)
+                                    .await?
+                            };
+                            Ok(crate::model::StickerAnimationSource::Tgs(bytes))
                         } else {
-                            client
-                                .context("Нет подключения к Telegram")?
-                                .sticker_video_preview(chat, id, progress, true)
-                                .await
+                            let source = if demo {
+                                demo::sticker_video_preview(progress, true).await?
+                            } else {
+                                client
+                                    .context("Нет подключения к Telegram")?
+                                    .sticker_video_preview(chat, id, progress, true)
+                                    .await?
+                            };
+                            Ok(crate::model::StickerAnimationSource::Video(source))
                         }
                     })
                 }),
@@ -6989,14 +7005,16 @@ impl Ui {
                         .get(&chat)
                         .and_then(|messages| messages.iter().find(|message| message.id == id))
                         .and_then(|message| message.sticker.as_ref())
-                        .and_then(|sticker| match sticker.kind {
+                        .map(|sticker| match sticker.kind {
                             crate::model::StickerKind::Static => {
-                                Some(include_bytes!("../data/demo-sticker.webp").to_vec())
+                                include_bytes!("../data/demo-sticker.webp").to_vec()
                             }
                             crate::model::StickerKind::Video => {
-                                Some(include_bytes!("../data/demo-sticker-video.webm").to_vec())
+                                include_bytes!("../data/demo-sticker-video.webm").to_vec()
                             }
-                            _ => None,
+                            crate::model::StickerKind::Animated => {
+                                include_bytes!("../data/demo-sticker.tgs").to_vec()
+                            }
                         }),
                 })
                 .flatten();

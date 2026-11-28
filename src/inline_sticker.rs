@@ -2,16 +2,16 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use anyhow::Result;
 use gtk::glib;
 use tokio::runtime::Handle;
 
-use crate::model::PlaybackSource;
+use crate::model::{PlaybackSource, StickerAnimationSource};
 
-type Load = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<PlaybackSource>> + Send>>>;
+type Load = Box<dyn Fn() -> Pin<Box<dyn Future<Output = Result<StickerAnimationSource>> + Send>>>;
 
 mod frame {
     use super::*;
@@ -96,7 +96,13 @@ struct Player {
     indicator: gtk::Image,
     runtime: Handle,
     load: Load,
-    source: RefCell<Option<PlaybackSource>>,
+    source: RefCell<Option<StickerAnimationSource>>,
+    renderer: RefCell<Option<crate::tgs::Renderer>>,
+    frame_timer: RefCell<Option<glib::SourceId>>,
+    frame_pending: Cell<bool>,
+    frame_index: Cell<Option<usize>>,
+    elapsed: Cell<Duration>,
+    last_tick: Cell<Instant>,
     media: RefCell<Option<gtk::MediaFile>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     timer: RefCell<Option<glib::SourceId>>,
@@ -137,6 +143,12 @@ fn build_player(thumbnail: &gtk::Stack, runtime: Handle, load: Load) -> (gtk::Bu
         runtime,
         load,
         source: RefCell::default(),
+        renderer: RefCell::default(),
+        frame_timer: RefCell::default(),
+        frame_pending: Cell::new(false),
+        frame_index: Cell::new(None),
+        elapsed: Cell::new(Duration::ZERO),
+        last_tick: Cell::new(Instant::now()),
         media: RefCell::default(),
         task: RefCell::default(),
         timer: RefCell::default(),
@@ -245,7 +257,7 @@ impl Player {
             return;
         }
         let generation = self.generation.get();
-        self.hint(Some("Загрузка видеостикера…"));
+        self.hint(Some("Загрузка стикера…"));
         let task = self.runtime.spawn((self.load)());
         self.task.replace(Some(task.abort_handle()));
         let weak = Rc::downgrade(self);
@@ -260,23 +272,35 @@ impl Player {
             {
                 state.task.take();
                 match result {
-                    Ok(source @ PlaybackSource::File(_)) => {
+                    Ok(
+                        source @ (StickerAnimationSource::Video(PlaybackSource::File(_))
+                        | StickerAnimationSource::Tgs(_)),
+                    ) => {
                         state.source.replace(Some(source));
                         state.play();
                     }
-                    Ok(_) => state.fail("Видеостикер должен быть загружен целиком"),
-                    Err(error) => state.fail(&format!("Не удалось загрузить видеостикер. {error}")),
+                    Ok(_) => state.fail("Стикер должен быть загружен целиком"),
+                    Err(error) => state.fail(&format!("Не удалось загрузить стикер. {error}")),
                 }
             }
         });
     }
 
     fn play(self: &Rc<Self>) {
+        if let Some(StickerAnimationSource::Tgs(bytes)) = self.source.borrow().as_ref() {
+            self.play_tgs(bytes.clone());
+            return;
+        }
         let Some(input) = self
             .source
             .borrow()
             .as_ref()
-            .map(|source| crate::media_viewer::media_input(source, &self.runtime))
+            .and_then(|source| match source {
+                StickerAnimationSource::Video(source) => {
+                    Some(crate::media_viewer::media_input(source, &self.runtime))
+                }
+                _ => None,
+            })
         else {
             return;
         };
@@ -310,9 +334,7 @@ impl Player {
                         state,
                         move || {
                             if state.generation.get() == generation {
-                                state.fail(&format!(
-                                    "Не удалось воспроизвести видеостикер. {error}"
-                                ));
+                                state.fail(&format!("Не удалось воспроизвести стикер. {error}"));
                             }
                         }
                     ));
@@ -332,8 +354,97 @@ impl Player {
         self.hint(None);
     }
 
+    fn play_tgs(self: &Rc<Self>, bytes: Vec<u8>) {
+        let generation = self.generation.get();
+        let task = self.runtime.spawn(crate::tgs::Renderer::open(bytes));
+        self.task.replace(Some(task.abort_handle()));
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = task.await.map_err(anyhow::Error::from).and_then(|r| r);
+            if let Some(state) = weak.upgrade()
+                && state.generation.get() == generation
+                && state.active.get()
+            {
+                state.task.take();
+                match result {
+                    Ok(renderer) => {
+                        state.renderer.replace(Some(renderer));
+                        state.last_tick.set(Instant::now());
+                        state.frame_tick();
+                        let weak = Rc::downgrade(&state);
+                        let timer = glib::timeout_add_local(Duration::from_millis(16), move || {
+                            let Some(state) = weak.upgrade() else {
+                                return glib::ControlFlow::Break;
+                            };
+                            state.frame_tick();
+                            glib::ControlFlow::Continue
+                        });
+                        state.frame_timer.replace(Some(timer));
+                        state.hint(None);
+                    }
+                    Err(error) => state.fail(&format!("Не удалось воспроизвести TGS. {error}")),
+                }
+            }
+        });
+    }
+
+    fn frame_tick(self: &Rc<Self>) {
+        let now = Instant::now();
+        let delta = now.saturating_duration_since(self.last_tick.replace(now));
+        if !self.paused.get() {
+            self.elapsed.set(self.elapsed.get() + delta);
+        }
+        if self.frame_pending.get() {
+            return;
+        }
+        let Some((frame, receiver)) = self.renderer.borrow().as_ref().and_then(|renderer| {
+            let frame = (self.elapsed.get().as_secs_f64() * renderer.timing.fps) as usize
+                % renderer.timing.frames;
+            if self.frame_index.get() == Some(frame) {
+                return None;
+            }
+            renderer.request(frame).map(|receiver| (frame, receiver))
+        }) else {
+            return;
+        };
+        self.frame_pending.set(true);
+        let generation = self.generation.get();
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let result = receiver.await;
+            if let Some(state) = weak.upgrade()
+                && state.generation.get() == generation
+                && state.active.get()
+            {
+                state.frame_pending.set(false);
+                match result {
+                    Ok(bytes) => {
+                        let texture = gtk::gdk::MemoryTexture::new(
+                            160,
+                            160,
+                            gtk::gdk::MemoryFormat::B8g8r8a8Premultiplied,
+                            &glib::Bytes::from_owned(bytes),
+                            160 * 4,
+                        );
+                        state.picture.set_paintable(Some(&texture));
+                        state.stack.set_visible_child_name("animation");
+                        state.frame_index.set(Some(frame));
+                    }
+                    Err(_) => state.fail("Обработчик TGS остановлен. Повторите попытку"),
+                }
+            }
+        });
+    }
+
     fn suspend(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
+        if let Some(timer) = self.frame_timer.take() {
+            timer.remove();
+        }
+        self.renderer.take();
+        self.frame_pending.set(false);
+        self.frame_index.set(None);
+        self.elapsed.set(Duration::ZERO);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -355,13 +466,13 @@ impl Player {
     fn hint(&self, status: Option<&str>) {
         let hint = if self.failed.get() {
             self.indicator.set_icon_name(Some("view-refresh-symbolic"));
-            "Повторить воспроизведение видеостикера"
+            "Повторить воспроизведение стикера"
         } else if self.paused.get() {
             self.indicator
                 .set_icon_name(Some("media-playback-start-symbolic"));
-            "Продолжить видеостикер"
+            "Продолжить стикер"
         } else {
-            "Приостановить видеостикер"
+            "Приостановить стикер"
         };
         self.indicator
             .set_visible(self.failed.get() || self.paused.get());
@@ -397,6 +508,112 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(ready(), "Inline sticker did not settle");
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn tgs_sticker_loops_inline_and_stops_its_worker_when_scrolled_out() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.InlineTgsTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(300)
+                .build();
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let scroll = gtk::ScrolledWindow::builder().child(&content).build();
+            window.set_content(Some(&scroll));
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let thumbnail = gtk::Stack::new();
+            thumbnail.set_size_request(160, 160);
+            thumbnail.add_child(&gtk::Picture::for_paintable(
+                &crate::stickers::demo_texture(),
+            ));
+            let (button, state) = build_player(
+                &thumbnail,
+                runtime.handle().clone(),
+                Box::new(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async {
+                        Ok(StickerAnimationSource::Tgs(
+                            include_bytes!("../data/demo-sticker.tgs").to_vec(),
+                        ))
+                    })
+                }),
+            );
+            content.append(&button);
+            content.append(&gtk::Box::builder().height_request(1200).build());
+            let frames = Rc::new(Cell::new(0));
+            state.picture.connect_paintable_notify(glib::clone!(
+                #[strong]
+                frames,
+                move |_| frames.set(frames.get() + 1)
+            ));
+            window.present();
+            let windows = gtk::Window::list_toplevels().len();
+            settle(|| frames.get() > 135);
+            assert!(state.media.borrow().is_none());
+            assert!(!state.failed.get());
+            assert!(button.measure(gtk::Orientation::Horizontal, -1).1 <= 180);
+            assert_eq!(gtk::Window::list_toplevels().len(), windows);
+            assert!(button.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&button));
+            settle(|| state.paused.get() && !state.frame_pending.get());
+            let paused = state.picture.paintable().unwrap();
+            let waited = Rc::new(Cell::new(false));
+            glib::timeout_add_local_once(
+                Duration::from_millis(200),
+                glib::clone!(
+                    #[strong]
+                    waited,
+                    move || waited.set(true)
+                ),
+            );
+            settle(|| waited.get());
+            assert_eq!(
+                state.picture.paintable().as_ref(),
+                Some(&paused),
+                "Paused TGS changed its frame"
+            );
+            let texture = paused.downcast::<gtk::gdk::Texture>().unwrap();
+            let pixels = image::load_from_memory(texture.save_to_png_bytes().as_ref())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(pixels.get_pixel(0, 0)[3], 0);
+            assert!(pixels.get_pixel(80, 80)[3] > 200);
+            assert!(
+                pixels.get_pixel(80, 80)[0] > pixels.get_pixel(80, 80)[2],
+                "BGRA frame changed colors during display"
+            );
+            assert!(gtk::prelude::WidgetExt::activate(&button));
+            settle(|| {
+                !state.paused.get()
+                    && state.picture.paintable().as_ref() != Some(texture.upcast_ref())
+            });
+            scroll.vadjustment().set_value(700.0);
+            settle(|| state.renderer.borrow().is_none());
+            assert!(state.frame_timer.borrow().is_none());
+            assert!(state.source.borrow().is_some());
+            scroll.vadjustment().set_value(0.0);
+            settle(|| state.renderer.borrow().is_some() && state.picture.paintable().is_some());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            content.remove(&button);
+            assert!(state.renderer.borrow().is_none());
+            assert!(state.frame_timer.borrow().is_none());
+            assert!(state.source.borrow().is_none());
+            assert!(state.task.borrow().is_none());
+            window.close();
+        });
     }
 
     #[test]
@@ -440,13 +657,17 @@ mod tests {
                         if attempt == 1 {
                             let mut file = tempfile::tempfile()?;
                             std::io::Write::write_all(&mut file, b"invalid synthetic WebM")?;
-                            return Ok(PlaybackSource::File(crate::model::PlaybackFile {
-                                file,
-                                media: crate::demo::sticker_video_media(),
-                            }));
+                            return Ok(StickerAnimationSource::Video(PlaybackSource::File(
+                                crate::model::PlaybackFile {
+                                    file,
+                                    media: crate::demo::sticker_video_media(),
+                                },
+                            )));
                         }
                         let (progress, _) = tokio::sync::watch::channel(Default::default());
-                        crate::demo::sticker_video_preview(progress, true).await
+                        crate::demo::sticker_video_preview(progress, true)
+                            .await
+                            .map(StickerAnimationSource::Video)
                     })
                 }),
             );

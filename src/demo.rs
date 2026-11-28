@@ -1415,6 +1415,17 @@ pub fn history(chat: i64) -> Vec<Message> {
         );
         video.timestamp = today - 5;
         messages.push(video);
+        let mut animated = sticker_message(
+            87,
+            crate::model::Sticker {
+                favorite: false,
+                id: 2,
+                emoji: "🚀".into(),
+                kind: crate::model::StickerKind::Animated,
+            },
+        );
+        animated.timestamp = today - 2;
+        messages.push(animated);
     }
     messages
 }
@@ -1616,7 +1627,7 @@ pub fn sticker_message(id: i32, sticker: crate::model::Sticker) -> Message {
     message.attachment = match sticker.kind {
         crate::model::StickerKind::Static => Some(format!("sticker-{id}.webp")),
         crate::model::StickerKind::Video => Some(format!("sticker-{id}.webm")),
-        _ => None,
+        crate::model::StickerKind::Animated => Some(format!("sticker-{id}.tgs")),
     };
     message.playback = (sticker.kind == crate::model::StickerKind::Video).then(sticker_video_media);
     message.sticker = Some(sticker);

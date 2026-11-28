@@ -16,7 +16,7 @@ if (( $# != 0 )); then
     exit 2
 fi
 
-for tool in git cargo flock tar desktop-file-edit desktop-file-validate; do
+for tool in git cargo cmake c++ flock tar desktop-file-edit desktop-file-validate; do
     if ! command -v "$tool" >/dev/null; then
         printf 'Требуется %s. См. зависимости сборки в README.md.\n' "$tool" >&2
         exit 1

@@ -34,6 +34,46 @@ enum Origin {
 }
 
 impl Telegram {
+    pub async fn sticker_tgs_preview(&self, chat: i64, message: i32) -> Result<Vec<u8>> {
+        let peer = self.peer(chat).await?;
+        let fresh = || async {
+            let Media::Sticker(sticker) = self.attachment_media(peer, message).await? else {
+                bail!("Стикер в сообщении изменился");
+            };
+            ensure!(
+                sticker_view(&sticker.document)
+                    .is_some_and(|view| view.kind == StickerKind::Animated)
+                    && sticker
+                        .document
+                        .size()
+                        .is_some_and(|size| (1..=64 * 1024).contains(&size)),
+                "TGS в сообщении недоступен или превышает 64 КиБ"
+            );
+            Ok(sticker.document)
+        };
+        let document = fresh().await?;
+        let expected = document.size();
+        with_refreshed_sticker(
+            document,
+            |document| async move {
+                ensure!(document.size() == expected, "Размер TGS изменился");
+                let mut bytes = Vec::new();
+                let mut download = self.client.iter_download(&document);
+                while let Some(chunk) = download.next().await? {
+                    ensure!(
+                        bytes.len() + chunk.len() <= 64 * 1024,
+                        "TGS превышает 64 КиБ"
+                    );
+                    bytes.extend_from_slice(&chunk);
+                }
+                ensure!(Some(bytes.len()) == expected, "TGS загружен не полностью");
+                Ok(bytes)
+            },
+            fresh,
+        )
+        .await
+    }
+
     pub async fn sticker_collections(&self) -> Result<Vec<StickerCollection>> {
         self.sticker_list(StickerSource::Favorites).await?;
         let mut collections = vec![
