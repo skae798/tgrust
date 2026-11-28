@@ -13,6 +13,7 @@ mod forum_mode;
 mod forum_topic_editor;
 mod forum_topics;
 mod group_permissions;
+mod inline_sticker;
 mod invite_links;
 mod invite_members;
 mod join_requests;
