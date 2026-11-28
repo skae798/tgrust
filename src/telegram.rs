@@ -735,7 +735,8 @@ impl Telegram {
                 },
                 preview_image: last.and_then(|message| {
                     let (media, _) = attachment(message)?;
-                    thumbnail(&media).map(|media| ChatImage::attachment(id, message.id(), media))
+                    visible_thumbnail(&media)
+                        .map(|media| ChatImage::attachment(id, message.id(), media))
                 }),
                 group,
                 supergroup: matches!(peer, Peer::Community(_)),
@@ -3153,6 +3154,23 @@ impl Downloadable for PhotoPreview {
     }
 }
 
+fn visible_thumbnail(media: &Media) -> Option<AttachmentThumbnail> {
+    if attachment_spoiler(media).is_some() {
+        None
+    } else {
+        thumbnail(media)
+    }
+}
+
+fn attachment_spoiler(media: &Media) -> Option<AttachmentThumbnail> {
+    let hidden = match media {
+        Media::Photo(photo) => photo.raw.spoiler,
+        Media::Document(document) => document.raw.spoiler,
+        _ => false,
+    };
+    hidden.then(|| attachment_id(media)).flatten()
+}
+
 fn attachment_id(media: &Media) -> Option<AttachmentThumbnail> {
     match media {
         Media::Photo(photo) => Some(AttachmentThumbnail::Photo(photo.id())),
@@ -3916,6 +3934,9 @@ fn message_view(
     let attachment = attachment(message);
     let sticker = stickers::message_sticker(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
+    let media_spoiler = attachment
+        .as_ref()
+        .and_then(|(media, _)| attachment_spoiler(media));
     let playback = attachment
         .as_ref()
         .and_then(|(media, _)| playable_media(media));
@@ -3998,6 +4019,7 @@ fn message_view(
         outgoing,
         attachment: attachment.map(|(_, name)| name),
         photo_preview,
+        media_spoiler,
         playback,
         audio,
         thumbnail,
@@ -4637,10 +4659,18 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
     if raw.ttl_period.is_some() {
         return None;
     }
-    let media = message.media()?;
+    attachment_from_raw(raw.media.as_ref()?, message.id())
+}
+
+fn attachment_from_raw(raw: &enums::MessageMedia, id: i32) -> Option<(Media, String)> {
+    let raw = match raw {
+        enums::MessageMedia::Poll(poll) => poll.attached_media.as_ref()?,
+        media => media,
+    };
+    let media = Media::from_raw(raw.clone())?;
     let name = match &media {
         Media::Photo(photo) if photo.raw.ttl_seconds.is_none() => {
-            format!("photo-{}.jpg", message.id())
+            format!("photo-{id}.jpg")
         }
         Media::Sticker(sticker) if sticker.document.raw.ttl_seconds.is_none() => {
             let extension = match sticker.document.mime_type() {
@@ -4649,11 +4679,11 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
                 Some("video/webm") => "webm",
                 _ => "bin",
             };
-            let fallback = format!("sticker-{}.{extension}", message.id());
+            let fallback = format!("sticker-{id}.{extension}");
             attachment_name(sticker.document.name().unwrap_or(&fallback), &fallback)
         }
         Media::Document(document) if document.raw.ttl_seconds.is_none() => {
-            let fallback = format!("file-{}", message.id());
+            let fallback = format!("file-{id}");
             attachment_name(document.name().unwrap_or(&fallback), &fallback)
         }
         _ => return None,
@@ -5833,6 +5863,128 @@ mod tests {
                 muted
             );
         }
+    }
+
+    #[test]
+    fn poll_attachment_uses_the_same_download_path_and_rejects_expiring_media() {
+        let mut photo = types::MessageMediaPhoto {
+            spoiler: false,
+            live_photo: false,
+            photo: Some(
+                types::Photo {
+                    has_stickers: false,
+                    id: 111,
+                    access_hash: 2,
+                    file_reference: vec![3],
+                    date: 0,
+                    sizes: vec![
+                        types::PhotoSize {
+                            r#type: "m".into(),
+                            w: 64,
+                            h: 64,
+                            size: 40,
+                        }
+                        .into(),
+                    ],
+                    video_sizes: None,
+                    dc_id: 2,
+                }
+                .into(),
+            ),
+            ttl_seconds: None,
+            video: None,
+        };
+        let draft = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            ..PollDraft::default()
+        };
+        let mut poll = types::MessageMediaPoll {
+            poll: poll_media(draft, 52, None, None).poll,
+            results: types::PollResults {
+                min: true,
+                has_unread_votes: false,
+                can_view_stats: false,
+                results: None,
+                total_voters: None,
+                recent_voters: None,
+                solution: None,
+                solution_entities: None,
+                solution_media: None,
+            }
+            .into(),
+            attached_media: Some(photo.clone().into()),
+        };
+        let (media, name) =
+            attachment_from_raw(&poll.clone().into(), 20).expect("Poll attachment was lost");
+        assert_eq!(name, "photo-20.jpg");
+        assert_eq!(attachment_id(&media), Some(AttachmentThumbnail::Photo(111)));
+        assert!(matches!(media, Media::Photo(_)));
+        assert_eq!(attachment_spoiler(&media), None);
+        assert!(visible_thumbnail(&media).is_some());
+        photo.spoiler = true;
+        poll.attached_media = Some(photo.clone().into());
+        let (hidden, _) = attachment_from_raw(&poll.clone().into(), 20).unwrap();
+        assert_eq!(
+            attachment_spoiler(&hidden),
+            Some(AttachmentThumbnail::Photo(111))
+        );
+        assert!(visible_thumbnail(&hidden).is_none());
+        photo.ttl_seconds = Some(1);
+        poll.attached_media = Some(photo.into());
+        assert!(attachment_from_raw(&poll.clone().into(), 20).is_none());
+        let mut video = types::MessageMediaDocument {
+            nopremium: false,
+            spoiler: true,
+            video: true,
+            round: false,
+            voice: false,
+            document: Some(
+                types::Document {
+                    id: 112,
+                    access_hash: 2,
+                    file_reference: vec![3],
+                    date: 0,
+                    mime_type: "video/mp4".into(),
+                    size: 40,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![
+                        types::DocumentAttributeFilename {
+                            file_name: "clip.mp4".into(),
+                        }
+                        .into(),
+                    ],
+                }
+                .into(),
+            ),
+            alt_documents: None,
+            video_cover: None,
+            video_timestamp: None,
+            ttl_seconds: None,
+        };
+        poll.attached_media = Some(video.clone().into());
+        let (video_media, name) = attachment_from_raw(&poll.clone().into(), 20).unwrap();
+        assert_eq!(name, "clip.mp4");
+        assert_eq!(
+            attachment_id(&video_media),
+            Some(AttachmentThumbnail::Document(112))
+        );
+        assert_eq!(
+            attachment_spoiler(&video_media),
+            Some(AttachmentThumbnail::Document(112))
+        );
+        assert!(matches!(
+            playable_media(&video_media),
+            Some(PlayableMedia::Video { size: 40, .. })
+        ));
+        assert!(visible_thumbnail(&video_media).is_none());
+        video.ttl_seconds = Some(i32::MAX);
+        poll.attached_media = Some(video.into());
+        assert!(attachment_from_raw(&poll.clone().into(), 20).is_none());
+        poll.attached_media = None;
+        assert!(attachment_from_raw(&poll.into(), 20).is_none());
     }
 
     #[test]

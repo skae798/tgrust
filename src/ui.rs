@@ -18,11 +18,11 @@ use crate::demo;
 use crate::formatting::{SPOILER_LINK, editor_text, render_message, set_editor_text, setup_editor};
 use crate::media_viewer::fit_viewport as photo_viewport;
 use crate::model::{
-    Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
-    HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
-    Poll, PollQuizDraft, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit,
-    TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats,
-    prepend_history_page, redact_spoilers,
+    AttachmentThumbnail, Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact,
+    FormattedText, HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage,
+    MAX_ALBUM_ITEMS, Message, Poll, PollQuizDraft, PollUpdate, PollVoteCount, Reaction,
+    ReadRequest, Reply, SearchHit, TextStyle, UpdateStatus, Upload, UploadKind,
+    merge_latest_history, order_chats, prepend_history_page, redact_spoilers,
 };
 use crate::model::{
     ChatInfo, Conversation, ForumTopic, ForumWriteResult, GENERAL_TOPIC, GroupPermissionEdit,
@@ -181,6 +181,7 @@ struct Ui {
     downloading: Cell<bool>,
     messages: RefCell<BTreeMap<i32, Message>>,
     revealed_spoilers: RefCell<HashMap<i32, FormattedText>>,
+    revealed_media_spoilers: RefCell<HashMap<i32, AttachmentThumbnail>>,
     history_cache: RefCell<HistoryCache>,
     history_revision: Cell<HistoryRevision>,
     history_refreshed: Cell<Option<Instant>>,
@@ -728,6 +729,7 @@ fn build_window(
         downloading: Cell::new(false),
         messages: RefCell::new(BTreeMap::new()),
         revealed_spoilers: RefCell::new(HashMap::new()),
+        revealed_media_spoilers: RefCell::new(HashMap::new()),
         history_cache: RefCell::new(HistoryCache::default()),
         history_revision: Cell::new(HistoryRevision::default()),
         history_refreshed: Cell::new(None),
@@ -4230,6 +4232,7 @@ impl Ui {
         self.has_older.set(false);
         self.messages.borrow_mut().clear();
         self.revealed_spoilers.borrow_mut().clear();
+        self.revealed_media_spoilers.borrow_mut().clear();
         self.history_refreshed.set(None);
         self.content
             .set_visible_child_name(if overview { "forum" } else { "conversation" });
@@ -4823,6 +4826,13 @@ impl Ui {
         self.revealed_spoilers
             .borrow_mut()
             .retain(|id, _| messages.contains_key(id));
+        self.revealed_media_spoilers
+            .borrow_mut()
+            .retain(|id, media| {
+                messages
+                    .get(id)
+                    .is_some_and(|message| message.media_spoiler == Some(*media))
+            });
         if messages.is_empty() {
             let text = if self.loaded.get() {
                 "Нет сообщений"
@@ -4950,6 +4960,9 @@ impl Ui {
                     }
                 } else {
                     for item in &group {
+                        if let Some(widget) = self.attachment_widget(chat, item, is_album) {
+                            bubble.append(&widget);
+                        }
                         if let Some(poll) = &item.poll {
                             bubble.append(&self.poll_card(chat, item.id, poll));
                         }
@@ -4960,9 +4973,6 @@ impl Ui {
                                 sticker,
                                 item.playback,
                             ));
-                        }
-                        if let Some(widget) = self.attachment_widget(chat, item, is_album) {
-                            bubble.append(&widget);
                         }
                         self.append_message_text(&bubble, item);
                     }
@@ -5114,6 +5124,52 @@ impl Ui {
     ) -> Option<gtk::Widget> {
         if message.sticker.is_some() {
             return None;
+        }
+        if let Some(media) = message.media_spoiler
+            && self.revealed_media_spoilers.borrow().get(&message.id) != Some(&media)
+        {
+            let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            container.set_widget_name(&format!("media-spoiler-{}", message.id));
+            let title = gtk::Label::builder()
+                .label("Показать медиа со спойлером")
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .build();
+            let show = gtk::Button::builder()
+                .child(&title)
+                .height_request(92)
+                .build();
+            show.update_property(&[gtk::accessible::Property::Label(
+                "Показать медиа со спойлером",
+            )]);
+            container.append(&show);
+            let id = message.id;
+            show.connect_clicked(glib::clone!(
+                #[weak(rename_to = ui)]
+                self,
+                #[weak]
+                container,
+                move |_| {
+                    if ui.selection.get() != Some(chat) {
+                        return;
+                    }
+                    let Some(message) = ui.messages.borrow().get(&id).cloned() else {
+                        return;
+                    };
+                    // A stale reveal action must not expose replacement media.
+                    if message.media_spoiler != Some(media) {
+                        return;
+                    }
+                    ui.revealed_media_spoilers.borrow_mut().insert(id, media);
+                    if let Some(widget) = ui.attachment_widget(chat, &message, in_album) {
+                        while let Some(child) = container.first_child() {
+                            container.remove(&child);
+                        }
+                        container.append(&widget);
+                    }
+                }
+            ));
+            return Some(container.upcast());
         }
         let id = message.id;
         let playback = message.playback.filter(|_| !message.ephemeral);
@@ -6678,6 +6734,7 @@ impl Ui {
                 timestamp: demo::now(),
                 attachment: None,
                 photo_preview: false,
+                media_spoiler: None,
                 playback: None,
                 audio: None,
                 thumbnail: None,
@@ -6718,6 +6775,7 @@ impl Ui {
                         Message {
                             id,
                             photo_preview: photo,
+                            media_spoiler: None,
                             thumbnail: photo
                                 .then_some(crate::model::AttachmentThumbnail::Photo(i64::from(id))),
                             text: if first {
@@ -7385,7 +7443,7 @@ impl Ui {
                 .then(|| match (chat, id) {
                     (1, 83) => Some(demo::FILE_CONTENT.as_bytes().to_vec()),
                     (5, 2) => Some(include_bytes!("../data/demo-video.webm").to_vec()),
-                    (1, 84) | (3, 1) => Some(
+                    (1, 84) | (3, 1) | (6, 2) | (6, demo::SAMPLE_QUIZ_ID) => Some(
                         ui.demo_image
                             .get_or_init(demo_texture)
                             .save_to_png_bytes()
@@ -7869,6 +7927,139 @@ mod tests {
             caption.select_region(2, 7);
             assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
             assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn poll_photos_precede_the_question_and_spoilers_require_a_current_reveal_action() {
+        gtk::test_synced(|| {
+            #[track_caller]
+            fn settle(mut ready: impl FnMut() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !ready() && Instant::now() < deadline {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(ready(), "Poll media did not settle");
+            }
+            fn find(
+                root: &gtk::Widget,
+                predicate: &impl Fn(&gtk::Widget) -> bool,
+            ) -> Option<gtk::Widget> {
+                if predicate(root) {
+                    return Some(root.clone());
+                }
+                let mut child = root.first_child();
+                while let Some(widget) = child {
+                    if let Some(found) = find(&widget, predicate) {
+                        return Some(found);
+                    }
+                    child = widget.next_sibling();
+                }
+                None
+            }
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.PollMediaTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            settle(|| (340..=360).contains(&window.width()));
+            ui.show_chat(6, Some(demo::SAMPLE_QUIZ_ID));
+            settle(|| ui.loaded.get() && ui.messages.borrow().contains_key(&demo::SAMPLE_QUIZ_ID));
+            ui.input.buffer().set_text("Черновик рядом с опросом");
+            let root: &gtk::Widget = ui.history.upcast_ref();
+            let named = |name: &str| find(root, &|widget| widget.widget_name() == name);
+            let preview = named("attachment-2").unwrap();
+            let question = ui.messages.borrow()[&2]
+                .poll
+                .as_ref()
+                .unwrap()
+                .question
+                .clone();
+            let card = preview.next_sibling().unwrap();
+            assert!(
+                find(&card, &|widget| widget
+                    .downcast_ref::<gtk::Label>()
+                    .is_some_and(|label| label.text() == question))
+                .is_some()
+            );
+            let spoiler_name = format!("media-spoiler-{}", demo::SAMPLE_QUIZ_ID);
+            let hidden = named(&spoiler_name).unwrap();
+            let show = hidden
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            assert!(named("attachment-1").is_none());
+            let windows = gtk::Window::list_toplevels().len();
+            assert!(show.grab_focus());
+            settle(|| show.is_mapped());
+            assert!(gtk::prelude::WidgetExt::activate(&show));
+            settle(|| named("attachment-1").is_some());
+            assert_eq!(gtk::Window::list_toplevels().len(), windows);
+            ui.render_history(false);
+            assert!(named("attachment-1").is_some());
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик рядом с опросом"
+            );
+            {
+                let mut messages = ui.messages.borrow_mut();
+                let message = messages.get_mut(&demo::SAMPLE_QUIZ_ID).unwrap();
+                message.media_spoiler = Some(AttachmentThumbnail::Photo(999));
+                message.thumbnail = message.media_spoiler;
+            }
+            ui.render_history(false);
+            assert!(named("attachment-1").is_none());
+            let pending = named(&spoiler_name)
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            {
+                let mut messages = ui.messages.borrow_mut();
+                let message = messages.get_mut(&demo::SAMPLE_QUIZ_ID).unwrap();
+                message.media_spoiler = Some(AttachmentThumbnail::Photo(1000));
+                message.thumbnail = message.media_spoiler;
+            }
+            // The old card remains alive while the model already has new media.
+            pending.emit_clicked();
+            assert!(
+                named("attachment-1").is_none(),
+                "A stale action revealed replacement media"
+            );
+            assert!(ui.revealed_media_spoilers.borrow().is_empty());
+            ui.render_history(false);
+            let hidden = named(&spoiler_name).unwrap();
+            let current = hidden
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            assert!(current.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&current));
+            settle(|| named("attachment-1").is_some());
+            ui.show_chat(2, None);
+            assert!(ui.revealed_media_spoilers.borrow().is_empty());
+            ui.show_chat(6, Some(demo::SAMPLE_QUIZ_ID));
+            settle(|| named(&spoiler_name).is_some());
+            assert!(named("attachment-1").is_none());
+            settle(|| (340..=360).contains(&window.width()));
+            window.close();
         });
     }
 
