@@ -7,6 +7,10 @@ use tokio::sync::{Semaphore, oneshot};
 const MAX_COMPRESSED: usize = 64 * 1024;
 const MAX_JSON: usize = 4 * 1024 * 1024;
 const SIDE: usize = 160;
+pub fn render_side(scale: i32) -> usize {
+    (SIDE * scale.clamp(1, 4) as usize).min(512)
+}
+
 static WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
 pub use crate::model::StickerAnimationTiming as Timing;
@@ -39,11 +43,12 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn open(compressed: Vec<u8>) -> Result<Self> {
-        Self::with_limit(compressed, WORKERS.clone()).await
+    pub async fn open(compressed: Vec<u8>, scale: i32) -> Result<Self> {
+        Self::with_limit(compressed, scale, WORKERS.clone()).await
     }
 
-    async fn with_limit(compressed: Vec<u8>, limit: Arc<Semaphore>) -> Result<Self> {
+    async fn with_limit(compressed: Vec<u8>, scale: i32, limit: Arc<Semaphore>) -> Result<Self> {
+        let side = render_side(scale);
         ensure!(compressed.len() <= MAX_COMPRESSED, "TGS превышает 64 КиБ");
         // Admission precedes spawn_blocking; waiting/cancelled clients cannot fill its queue.
         let permit = limit.acquire_owned().await?;
@@ -59,8 +64,8 @@ impl Renderer {
                 let timing = Timing {
                     frames: animation.totalframe(),
                     fps: animation.framerate(),
-                    width: SIDE,
-                    height: SIDE,
+                    width: side,
+                    height: side,
                 };
                 ensure!(
                     animation.size() == rlottie::Size::new(512, 512)
@@ -72,7 +77,7 @@ impl Renderer {
                     "Недопустимые параметры анимации TGS"
                 );
                 // Warm the renderer before reporting success; no GTK object crosses this boundary.
-                let mut surface = rlottie::Surface::new(rlottie::Size::new(SIDE, SIDE));
+                let mut surface = rlottie::Surface::new(rlottie::Size::new(side, side));
                 animation.render(0, &mut surface);
                 Ok((animation, surface, timing))
             })();
@@ -200,6 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn renders_at_monitor_resolution_with_a_bounded_surface() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (scale, side) in [(-3, 160), (1, 160), (2, 320), (3, 480), (i32::MAX, 512)] {
+                let renderer =
+                    Renderer::open(include_bytes!("../data/demo-sticker.tgs").to_vec(), scale)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    (renderer.timing.width, renderer.timing.height),
+                    (side, side)
+                );
+                let pixels = renderer.request(0).unwrap().await.unwrap();
+                assert_eq!(pixels.len(), side * side * 4);
+                assert_eq!(pixels[3], 0);
+                assert!(pixels[((side / 2) * side + side / 2) * 4 + 3] > 200);
+                renderer.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn rejects_truncation_expansion_bombs_external_files_and_invalid_timing() {
         let demo = include_bytes!("../data/demo-sticker.tgs");
         let json = unpack(demo).unwrap();
@@ -236,7 +267,7 @@ mod tests {
         runtime.block_on(async {
             let bytes = include_bytes!("../data/demo-sticker.tgs").to_vec();
             let gate = Arc::new(Semaphore::new(1));
-            let renderer = Renderer::with_limit(bytes.clone(), gate.clone())
+            let renderer = Renderer::with_limit(bytes.clone(), 1, gate.clone())
                 .await
                 .unwrap();
             let first = renderer.request(0).unwrap().await.unwrap();
@@ -258,7 +289,7 @@ mod tests {
             assert!(
                 tokio::time::timeout(
                     Duration::from_millis(20),
-                    Renderer::with_limit(bytes.clone(), gate.clone())
+                    Renderer::with_limit(bytes.clone(), 1, gate.clone())
                 )
                 .await
                 .is_err()
@@ -266,10 +297,14 @@ mod tests {
             assert_eq!(gate.available_permits(), 0);
             renderer.shutdown().await.unwrap();
             assert_eq!(gate.available_permits(), 1);
-            let renderer = Renderer::with_limit(bytes, gate.clone()).await.unwrap();
+            let renderer = Renderer::with_limit(bytes, 1, gate.clone()).await.unwrap();
             renderer.shutdown().await.unwrap();
             assert_eq!(gate.available_permits(), 1);
-            assert!(Renderer::with_limit(vec![0], gate.clone()).await.is_err());
+            assert!(
+                Renderer::with_limit(vec![0], 1, gate.clone())
+                    .await
+                    .is_err()
+            );
             // Native initialization has already completed and its permit is returned on failure.
             let permit = tokio::time::timeout(Duration::from_secs(2), gate.acquire())
                 .await
