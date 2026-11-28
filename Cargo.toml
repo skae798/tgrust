@@ -16,6 +16,9 @@ grammers-client = { version = "0.12", default-features = false, features = ["pro
 grammers-session = "0.12"
 gtk = { package = "gtk4", version = "0.10", features = ["v4_16"] }
 flate2 = "1"
+gstreamer = { version = "0.24", features = ["v1_24"] }
+gstreamer-app = { version = "0.24", features = ["v1_24"] }
+gstreamer-video = { version = "0.24", features = ["v1_24"] }
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
 qrcodegen = "1.8"
 rlottie = { version = "0.5.4", default-features = false, features = ["vendor-telegram"] }

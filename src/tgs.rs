@@ -9,11 +9,7 @@ const MAX_JSON: usize = 4 * 1024 * 1024;
 const SIDE: usize = 160;
 static WORKERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 
-#[derive(Clone, Copy, Debug)]
-pub struct Timing {
-    pub frames: usize,
-    pub fps: f64,
-}
+pub use crate::model::StickerAnimationTiming as Timing;
 
 struct Request {
     frame: usize,
@@ -63,6 +59,8 @@ impl Renderer {
                 let timing = Timing {
                     frames: animation.totalframe(),
                     fps: animation.framerate(),
+                    width: SIDE,
+                    height: SIDE,
                 };
                 ensure!(
                     animation.size() == rlottie::Size::new(512, 512)
@@ -112,12 +110,15 @@ impl Renderer {
             return None;
         }
         let (reply, receiver) = oneshot::channel();
-        self.worker
+        match self
+            .worker
             .sender
             .as_ref()?
             .try_send(Request { frame, reply })
-            .ok()?;
-        Some(receiver)
+        {
+            Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => Some(receiver),
+            Err(mpsc::TrySendError::Full(_)) => None,
+        }
     }
 
     #[cfg(test)]

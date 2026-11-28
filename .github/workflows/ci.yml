@@ -14,7 +14,7 @@ jobs:
     container: fedora:45
     steps:
       - name: Install system dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc gcc-c++ git gtk4-devel libadwaita-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth
+        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc gcc-c++ git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -32,7 +32,7 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Test GTK and media playback
-        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored --nocapture --test-threads=1
+        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GSETTINGS_BACKEND=memory GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored --nocapture --test-threads=1
       - name: Test patched search pagination
         run: cargo test --locked -p grammers-client --lib --no-default-features
       - name: Validate desktop entry
@@ -50,7 +50,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Install build dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel make pkgconf-pkg-config
+        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config
       - uses: actions/checkout@v6
         with:
           persist-credentials: false

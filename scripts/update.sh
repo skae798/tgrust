@@ -16,12 +16,17 @@ if (( $# != 0 )); then
     exit 2
 fi
 
-for tool in git cargo cmake c++ flock tar desktop-file-edit desktop-file-validate; do
+for tool in git cargo cmake c++ pkg-config flock tar desktop-file-edit desktop-file-validate; do
     if ! command -v "$tool" >/dev/null; then
         printf 'Требуется %s. См. зависимости сборки в README.md.\n' "$tool" >&2
         exit 1
     fi
 done
+
+if ! pkg-config --exists 'gstreamer-app-1.0 >= 1.24' 'gstreamer-video-1.0 >= 1.24'; then
+    printf '%s\n' 'Нужны пакеты разработки GStreamer. См. зависимости сборки в docs/guide.md.' >&2
+    exit 1
+fi
 
 mkdir -p -- "$cache_dir"
 exec 9>"$cache_dir/update.lock"

@@ -71,6 +71,17 @@ glib::wrapper! {
 }
 
 impl StickerFrame {
+    #[cfg(test)]
+    fn image(&self) -> gtk::gdk::Texture {
+        use glib::subclass::prelude::ObjectSubclassIsExt;
+        self.imp()
+            .0
+            .get()
+            .unwrap()
+            .clone()
+            .downcast::<gtk::gdk::Texture>()
+            .unwrap()
+    }
     fn new(source: &impl IsA<gtk::gdk::Paintable>) -> Self {
         use glib::subclass::prelude::ObjectSubclassIsExt;
         let frame: Self = glib::Object::new();
@@ -89,6 +100,53 @@ impl StickerFrame {
     }
 }
 
+enum Animation {
+    Vector(crate::tgs::Renderer),
+    Video(crate::sticker_video::Frames),
+}
+
+impl Animation {
+    fn timing(&self) -> crate::model::StickerAnimationTiming {
+        match self {
+            Self::Vector(renderer) => renderer.timing,
+            Self::Video(frames) => frames.timing,
+        }
+    }
+    fn request(&self, frame: usize) -> Option<tokio::sync::oneshot::Receiver<Vec<u8>>> {
+        match self {
+            Self::Vector(renderer) => renderer.request(frame),
+            Self::Video(frames) => frames.request(frame),
+        }
+    }
+}
+
+type AnimationLoad = Pin<Box<dyn Future<Output = Result<Animation>> + Send>>;
+
+fn load_animation(source: &StickerAnimationSource) -> Result<AnimationLoad> {
+    match source {
+        StickerAnimationSource::Tgs(bytes) => {
+            let bytes = bytes.clone();
+            Ok(Box::pin(async move {
+                crate::tgs::Renderer::open(bytes)
+                    .await
+                    .map(Animation::Vector)
+            }))
+        }
+        StickerAnimationSource::Video(PlaybackSource::File(file)) => {
+            let file = crate::model::PlaybackFile {
+                file: file.file.try_clone()?,
+                media: file.media,
+            };
+            Ok(Box::pin(async move {
+                crate::sticker_video::Frames::open(file)
+                    .await
+                    .map(Animation::Video)
+            }))
+        }
+        _ => anyhow::bail!("Стикер должен быть загружен целиком"),
+    }
+}
+
 struct Player {
     button: glib::WeakRef<gtk::Button>,
     stack: gtk::Stack,
@@ -97,13 +155,12 @@ struct Player {
     runtime: Handle,
     load: Load,
     source: RefCell<Option<StickerAnimationSource>>,
-    renderer: RefCell<Option<crate::tgs::Renderer>>,
+    renderer: RefCell<Option<Animation>>,
     frame_timer: RefCell<Option<glib::SourceId>>,
     frame_pending: Cell<bool>,
     frame_index: Cell<Option<usize>>,
     elapsed: Cell<Duration>,
     last_tick: Cell<Instant>,
-    media: RefCell<Option<gtk::MediaFile>>,
     task: RefCell<Option<tokio::task::AbortHandle>>,
     timer: RefCell<Option<glib::SourceId>>,
     generation: Cell<u64>,
@@ -149,7 +206,6 @@ fn build_player(thumbnail: &gtk::Stack, runtime: Handle, load: Load) -> (gtk::Bu
         frame_index: Cell::new(None),
         elapsed: Cell::new(Duration::ZERO),
         last_tick: Cell::new(Instant::now()),
-        media: RefCell::default(),
         task: RefCell::default(),
         timer: RefCell::default(),
         generation: Cell::new(0),
@@ -196,13 +252,6 @@ fn build_player(thumbnail: &gtk::Stack, runtime: Handle, load: Load) -> (gtk::Bu
                 state.activate();
             } else {
                 state.paused.set(!state.paused.get());
-                if let Some(media) = state.media.borrow().as_ref() {
-                    if state.paused.get() {
-                        media.pause();
-                    } else {
-                        media.play();
-                    }
-                }
                 state.hint(None);
             }
         }
@@ -287,76 +336,18 @@ impl Player {
     }
 
     fn play(self: &Rc<Self>) {
-        if let Some(StickerAnimationSource::Tgs(bytes)) = self.source.borrow().as_ref() {
-            self.play_tgs(bytes.clone());
-            return;
-        }
-        let Some(input) = self
-            .source
-            .borrow()
-            .as_ref()
-            .and_then(|source| match source {
-                StickerAnimationSource::Video(source) => {
-                    Some(crate::media_viewer::media_input(source, &self.runtime))
-                }
-                _ => None,
-            })
-        else {
+        let Some(load) = self.source.borrow().as_ref().map(load_animation) else {
             return;
         };
-        let media = gtk::MediaFile::new();
-        self.media.replace(Some(media.clone()));
-        // Keep Telegram's 512px source from widening the message in a narrow window.
-        self.picture.set_paintable(Some(&StickerFrame::new(&media)));
-        media.connect_prepared_notify(glib::clone!(
-            #[weak(rename_to = state)]
-            self,
-            move |media| {
-                if state.media.borrow().as_ref() == Some(media)
-                    && media.is_prepared()
-                    && media.error().is_none()
-                {
-                    state.stack.set_visible_child_name("animation");
-                    state.hint(None);
-                }
+        let load = match load {
+            Ok(load) => load,
+            Err(error) => {
+                self.fail(&format!("Не удалось воспроизвести стикер. {error}"));
+                return;
             }
-        ));
-        media.connect_error_notify(glib::clone!(
-            #[weak(rename_to = state)]
-            self,
-            move |media| {
-                let current = state.media.borrow().as_ref() == Some(media);
-                if current && let Some(error) = media.error() {
-                    // Let the backend finish its notification before clearing its source.
-                    let generation = state.generation.get();
-                    glib::idle_add_local_once(glib::clone!(
-                        #[weak]
-                        state,
-                        move || {
-                            if state.generation.get() == generation {
-                                state.fail(&format!("Не удалось воспроизвести стикер. {error}"));
-                            }
-                        }
-                    ));
-                }
-            }
-        ));
-        // GtkGstMediaFile reads loop while opening the source, and mute after binding.
-        media.set_loop(true);
-        input.bind(&media);
-        if self.failed.get() || media.error().is_some() {
-            return;
-        }
-        media.set_muted(true);
-        if !self.paused.get() && !self.failed.get() {
-            media.play();
-        }
-        self.hint(None);
-    }
-
-    fn play_tgs(self: &Rc<Self>, bytes: Vec<u8>) {
+        };
         let generation = self.generation.get();
-        let task = self.runtime.spawn(crate::tgs::Renderer::open(bytes));
+        let task = self.runtime.spawn(load);
         self.task.replace(Some(task.abort_handle()));
         let weak = Rc::downgrade(self);
         glib::MainContext::default().spawn_local(async move {
@@ -382,7 +373,7 @@ impl Player {
                         state.frame_timer.replace(Some(timer));
                         state.hint(None);
                     }
-                    Err(error) => state.fail(&format!("Не удалось воспроизвести TGS. {error}")),
+                    Err(error) => state.fail(&format!("Не удалось воспроизвести стикер. {error}")),
                 }
             }
         });
@@ -398,8 +389,8 @@ impl Player {
             return;
         }
         let Some((frame, receiver)) = self.renderer.borrow().as_ref().and_then(|renderer| {
-            let frame = (self.elapsed.get().as_secs_f64() * renderer.timing.fps) as usize
-                % renderer.timing.frames;
+            let timing = renderer.timing();
+            let frame = (self.elapsed.get().as_secs_f64() * timing.fps) as usize % timing.frames;
             if self.frame_index.get() == Some(frame) {
                 return None;
             }
@@ -419,18 +410,24 @@ impl Player {
                 state.frame_pending.set(false);
                 match result {
                     Ok(bytes) => {
+                        let Some(timing) = state.renderer.borrow().as_ref().map(Animation::timing)
+                        else {
+                            return;
+                        };
                         let texture = gtk::gdk::MemoryTexture::new(
-                            160,
-                            160,
+                            timing.width as i32,
+                            timing.height as i32,
                             gtk::gdk::MemoryFormat::B8g8r8a8Premultiplied,
                             &glib::Bytes::from_owned(bytes),
-                            160 * 4,
+                            timing.width * 4,
                         );
-                        state.picture.set_paintable(Some(&texture));
+                        state
+                            .picture
+                            .set_paintable(Some(&StickerFrame::new(&texture)));
                         state.stack.set_visible_child_name("animation");
                         state.frame_index.set(Some(frame));
                     }
-                    Err(_) => state.fail("Обработчик TGS остановлен. Повторите попытку"),
+                    Err(_) => state.fail("Обработчик анимации остановлен. Повторите попытку"),
                 }
             }
         });
@@ -447,10 +444,6 @@ impl Player {
         self.elapsed.set(Duration::ZERO);
         if let Some(task) = self.task.take() {
             task.abort();
-        }
-        if let Some(media) = self.media.take() {
-            media.pause();
-            media.clear();
         }
         self.picture.set_paintable(None::<&gtk::gdk::Paintable>);
         self.stack.set_visible_child_name("thumbnail");
@@ -562,7 +555,6 @@ mod tests {
             window.present();
             let windows = gtk::Window::list_toplevels().len();
             settle(|| frames.get() > 135);
-            assert!(state.media.borrow().is_none());
             assert!(!state.failed.get());
             assert!(button.measure(gtk::Orientation::Horizontal, -1).1 <= 180);
             assert_eq!(gtk::Window::list_toplevels().len(), windows);
@@ -585,21 +577,19 @@ mod tests {
                 Some(&paused),
                 "Paused TGS changed its frame"
             );
-            let texture = paused.downcast::<gtk::gdk::Texture>().unwrap();
+            let texture = paused.clone().downcast::<StickerFrame>().unwrap().image();
             let pixels = image::load_from_memory(texture.save_to_png_bytes().as_ref())
                 .unwrap()
                 .to_rgba8();
             assert_eq!(pixels.get_pixel(0, 0)[3], 0);
-            assert!(pixels.get_pixel(80, 80)[3] > 200);
+            assert!(pixels.get_pixel(pixels.width() / 2, pixels.height() / 2)[3] > 200);
             assert!(
-                pixels.get_pixel(80, 80)[0] > pixels.get_pixel(80, 80)[2],
+                pixels.get_pixel(pixels.width() / 2, pixels.height() / 2)[0]
+                    > pixels.get_pixel(pixels.width() / 2, pixels.height() / 2)[2],
                 "BGRA frame changed colors during display"
             );
             assert!(gtk::prelude::WidgetExt::activate(&button));
-            settle(|| {
-                !state.paused.get()
-                    && state.picture.paintable().as_ref() != Some(texture.upcast_ref())
-            });
+            settle(|| !state.paused.get() && state.picture.paintable().as_ref() != Some(&paused));
             scroll.vadjustment().set_value(700.0);
             settle(|| state.renderer.borrow().is_none());
             assert!(state.frame_timer.borrow().is_none());
@@ -689,7 +679,6 @@ mod tests {
                     && state.failed.get()
                     && state.task.borrow().is_none()
             });
-            assert!(state.media.borrow().is_none());
             assert!(state.source.borrow().is_none());
             assert!(
                 button
@@ -698,24 +687,16 @@ mod tests {
                     .contains("Не удалось воспроизвести")
             );
             assert!(gtk::prelude::WidgetExt::activate(&button));
-            settle(|| {
-                state
-                    .media
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|m| m.is_prepared())
-            });
-            let media = state.media.borrow().as_ref().unwrap().clone();
+            settle(|| state.renderer.borrow().is_some() && state.picture.paintable().is_some());
+            let count = state.renderer.borrow().as_ref().unwrap().timing().frames;
             let frames = Rc::new(Cell::new(0));
-            media.connect_invalidate_contents(glib::clone!(
+            state.picture.connect_paintable_notify(glib::clone!(
                 #[strong]
                 frames,
                 move |_| frames.set(frames.get() + 1)
             ));
-            settle(|| frames.get() > 45);
-            assert!(media.is_loop());
-            assert!(media.is_muted());
-            assert!(media.error().is_none());
+            settle(|| frames.get() > count + 15);
+            assert!(!state.failed.get());
             assert!(button.width() <= 360, "Sticker widened its window");
             assert!(
                 button.measure(gtk::Orientation::Horizontal, -1).1 <= 180,
@@ -732,40 +713,33 @@ mod tests {
                 Some("animation")
             );
             assert!(gtk::prelude::WidgetExt::activate(&button));
-            settle(|| !media.is_playing());
-            let snapshot = gtk::Snapshot::new();
-            media.current_image().snapshot(&snapshot, 160.0, 160.0);
-            let texture = window.renderer().unwrap().render_texture(
-                snapshot.to_node().expect("decoded sticker frame"),
-                Some(&gtk::graphene::Rect::new(0.0, 0.0, 160.0, 160.0)),
-            );
+            settle(|| state.paused.get() && !state.frame_pending.get());
+            let paused = state.picture.paintable().unwrap();
+            let texture = paused.clone().downcast::<StickerFrame>().unwrap().image();
             let pixels = image::load_from_memory(texture.save_to_png_bytes().as_ref())
                 .unwrap()
                 .to_rgba8();
             assert_eq!(pixels.get_pixel(0, 0)[3], 0, "Lost sticker transparency");
-            assert!(pixels.get_pixel(80, 80)[3] > 200, "Empty frame");
+            assert!(
+                pixels.get_pixel(pixels.width() / 2, pixels.height() / 2)[3] > 200,
+                "Empty frame"
+            );
             assert!(gtk::prelude::WidgetExt::activate(&button));
-            settle(|| media.is_playing());
+            settle(|| !state.paused.get() && state.picture.paintable().as_ref() != Some(&paused));
             scroll.vadjustment().set_value(700.0);
-            settle(|| state.media.borrow().is_none());
-            assert!(!media.is_playing());
+            settle(|| state.renderer.borrow().is_none());
+            assert!(state.frame_timer.borrow().is_none());
             assert!(state.source.borrow().is_some());
             scroll.vadjustment().set_value(0.0);
-            settle(|| {
-                state
-                    .media
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|m| m.is_prepared())
-            });
+            settle(|| state.renderer.borrow().is_some() && state.picture.paintable().is_some());
             assert_eq!(
                 attempts.load(Ordering::SeqCst),
                 3,
                 "Scrolling redownloaded the sticker"
             );
-            let resumed = state.media.borrow().as_ref().unwrap().clone();
             content.remove(&button);
-            assert!(!resumed.is_playing());
+            assert!(state.renderer.borrow().is_none());
+            assert!(state.frame_timer.borrow().is_none());
             assert!(state.source.borrow().is_none());
             assert!(state.task.borrow().is_none());
             assert!(state.timer.borrow().is_none());
@@ -776,13 +750,7 @@ mod tests {
             content.remove(&button);
             assert!(state.task.borrow().is_none());
             content.prepend(&button);
-            settle(|| {
-                state
-                    .media
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|m| m.is_prepared())
-            });
+            settle(|| state.renderer.borrow().is_some() && state.picture.paintable().is_some());
             assert_eq!(attempts.load(Ordering::SeqCst), 5);
             assert!(state.task.borrow().is_none());
             content.remove(&button);
