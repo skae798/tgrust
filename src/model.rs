@@ -2108,6 +2108,14 @@ pub enum PlaybackSource {
     Stream(PlayableMedia, crate::media_stream::StreamSource),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct StickerAnimationTiming {
+    pub frames: usize,
+    pub fps: f64,
+    pub width: usize,
+    pub height: usize,
+}
+
 pub enum StickerAnimationSource {
     Video(PlaybackSource),
     Tgs(Vec<u8>),

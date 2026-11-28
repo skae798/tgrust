@@ -28,6 +28,8 @@ In GNOME/Wayland, normal launches use Wayland, including after updates. The X11 
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.
 - **Stickers** — preview, install, and remove packs by Telegram links; recent and favorite stickers; send to chats or topics, including replies. WebP images render in full; video stickers loop directly in messages, with transparency and no sound. TGS animations also play directly in messages. Stickers have no captions in history or the picker.
 
+Building from source also requires C++ and `gstreamer1-devel`, `gstreamer1-plugins-base-devel`; see the guide for all dependencies.
+
 ## Documentation
 
 - [Build from source or package as Flatpak (Russian)](docs/guide.md#установка)
