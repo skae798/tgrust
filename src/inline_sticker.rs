@@ -303,14 +303,26 @@ impl Player {
             move |media| {
                 let current = state.media.borrow().as_ref() == Some(media);
                 if current && let Some(error) = media.error() {
-                    state.fail(&format!("Не удалось воспроизвести видеостикер. {error}"));
+                    // Let the backend finish its notification before clearing its source.
+                    let generation = state.generation.get();
+                    glib::idle_add_local_once(glib::clone!(
+                        #[weak]
+                        state,
+                        move || {
+                            if state.generation.get() == generation {
+                                state.fail(&format!(
+                                    "Не удалось воспроизвести видеостикер. {error}"
+                                ));
+                            }
+                        }
+                    ));
                 }
             }
         ));
         // GtkGstMediaFile reads loop while opening the source, and mute after binding.
         media.set_loop(true);
         input.bind(&media);
-        if self.failed.get() {
+        if self.failed.get() || media.error().is_some() {
             return;
         }
         media.set_muted(true);

@@ -32,7 +32,7 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Test GTK and media playback
-        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored
+        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored --nocapture --test-threads=1
       - name: Test patched search pagination
         run: cargo test --locked -p grammers-client --lib --no-default-features
       - name: Validate desktop entry
