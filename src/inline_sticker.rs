@@ -122,12 +122,12 @@ impl Animation {
 
 type AnimationLoad = Pin<Box<dyn Future<Output = Result<Animation>> + Send>>;
 
-fn load_animation(source: &StickerAnimationSource) -> Result<AnimationLoad> {
+fn load_animation(source: &StickerAnimationSource, scale: i32) -> Result<AnimationLoad> {
     match source {
         StickerAnimationSource::Tgs(bytes) => {
             let bytes = bytes.clone();
             Ok(Box::pin(async move {
-                crate::tgs::Renderer::open(bytes)
+                crate::tgs::Renderer::open(bytes, scale)
                     .await
                     .map(Animation::Vector)
             }))
@@ -256,10 +256,39 @@ fn build_player(thumbnail: &gtk::Stack, runtime: Handle, load: Load) -> (gtk::Bu
             }
         }
     ));
+    state.picture.connect_scale_factor_notify(glib::clone!(
+        #[weak]
+        state,
+        move |_| state.scale_changed()
+    ));
     (button, state)
 }
 
 impl Player {
+    fn scale_changed(self: &Rc<Self>) {
+        if !self.active.get()
+            || !matches!(
+                self.source.borrow().as_ref(),
+                Some(StickerAnimationSource::Tgs(_))
+            )
+        {
+            return;
+        }
+        let side = crate::tgs::render_side(self.picture.scale_factor());
+        if self
+            .renderer
+            .borrow()
+            .as_ref()
+            .is_some_and(|renderer| renderer.timing().width == side)
+        {
+            return;
+        }
+        let elapsed = self.elapsed.get();
+        self.suspend();
+        self.elapsed.set(elapsed);
+        self.activate();
+    }
+
     fn in_view(&self) -> bool {
         let Some(button) = self.button.upgrade().filter(WidgetExt::is_mapped) else {
             return false;
@@ -336,7 +365,13 @@ impl Player {
     }
 
     fn play(self: &Rc<Self>) {
-        let Some(load) = self.source.borrow().as_ref().map(load_animation) else {
+        let scale = self.picture.scale_factor();
+        let Some(load) = self
+            .source
+            .borrow()
+            .as_ref()
+            .map(|source| load_animation(source, scale))
+        else {
             return;
         };
         let load = match load {
@@ -578,6 +613,8 @@ mod tests {
                 "Paused TGS changed its frame"
             );
             let texture = paused.clone().downcast::<StickerFrame>().unwrap().image();
+            let expected_side = (160 * state.picture.scale_factor().clamp(1, 4)).min(512);
+            assert_eq!(texture.width(), expected_side, "TGS lost HiDPI resolution");
             let pixels = image::load_from_memory(texture.save_to_png_bytes().as_ref())
                 .unwrap()
                 .to_rgba8();
@@ -588,6 +625,48 @@ mod tests {
                     > pixels.get_pixel(pixels.width() / 2, pixels.height() / 2)[2],
                 "BGRA frame changed colors during display"
             );
+            // Simulate an actor retained from a monitor with a different scale.
+            let other_scale = if state.picture.scale_factor() == 1 {
+                2
+            } else {
+                1
+            };
+            let previous = runtime
+                .block_on(crate::tgs::Renderer::open(
+                    include_bytes!("../data/demo-sticker.tgs").to_vec(),
+                    other_scale,
+                ))
+                .unwrap();
+            state.renderer.replace(Some(Animation::Vector(previous)));
+            let elapsed = state.elapsed.get();
+            let generation = state.generation.get();
+            state.scale_changed();
+            settle(|| {
+                state.renderer.borrow().is_some()
+                    && !state.frame_pending.get()
+                    && state.picture.paintable().is_some()
+            });
+            assert!(state.generation.get() > generation);
+            assert!(state.paused.get());
+            assert_eq!(state.elapsed.get(), elapsed);
+            let resized = state
+                .picture
+                .paintable()
+                .unwrap()
+                .downcast::<StickerFrame>()
+                .unwrap()
+                .image();
+            assert_eq!(resized.width(), expected_side);
+            let resized = image::load_from_memory(resized.save_to_png_bytes().as_ref())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(
+                resized, pixels,
+                "Resizing a paused sticker changed its frame"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(gtk::Window::list_toplevels().len(), windows);
+            let paused = state.picture.paintable().unwrap();
             assert!(gtk::prelude::WidgetExt::activate(&button));
             settle(|| !state.paused.get() && state.picture.paintable().as_ref() != Some(&paused));
             scroll.vadjustment().set_value(700.0);
