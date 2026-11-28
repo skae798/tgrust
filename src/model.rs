@@ -2449,6 +2449,7 @@ pub struct PollDraft {
     pub public: bool,
     pub subscribers_only: bool,
     pub countries: Vec<String>,
+    pub attached_photo: Option<crate::poll_photo::Photo>,
     pub quiz: Option<PollQuizDraft>,
 }
 
@@ -2616,6 +2617,14 @@ pub struct ReplyPreview {
 }
 
 impl Message {
+    pub fn preview_image(&self, chat: i64) -> Option<ChatImage> {
+        if self.ephemeral || self.media_spoiler.is_some() {
+            return None;
+        }
+        self.thumbnail
+            .map(|media| ChatImage::attachment(chat, self.id, media))
+    }
+
     pub fn open_poll_to_close(&self) -> Option<&Poll> {
         self.poll.as_ref().filter(|poll| {
             self.can_close_poll && !self.forwarded && !self.ephemeral && !poll.closed
@@ -3550,6 +3559,18 @@ mod tests {
             assert_eq!(options.public_voters, !broadcast);
             assert_eq!(options.open_answers, !broadcast);
         }
+    }
+
+    #[test]
+    fn message_preview_images_hide_spoilers_and_expiring_media() {
+        let mut message = crate::demo::poll_message(20, PollDraft::default());
+        message.thumbnail = Some(AttachmentThumbnail::Photo(10));
+        assert!(message.preview_image(6).is_some());
+        message.media_spoiler = message.thumbnail;
+        assert!(message.preview_image(6).is_none());
+        message.media_spoiler = None;
+        message.ephemeral = true;
+        assert!(message.preview_image(6).is_none());
     }
 
     #[test]
