@@ -2108,6 +2108,11 @@ pub enum PlaybackSource {
     Stream(PlayableMedia, crate::media_stream::StreamSource),
 }
 
+pub enum StickerAnimationSource {
+    Video(PlaybackSource),
+    Tgs(Vec<u8>),
+}
+
 impl PlaybackSource {
     pub fn media(&self) -> PlayableMedia {
         match self {

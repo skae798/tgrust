@@ -40,6 +40,7 @@ mod session_runner;
 mod stickers;
 mod storage;
 mod telegram;
+mod tgs;
 mod ui;
 mod update_dialog;
 mod updater;
