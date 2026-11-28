@@ -6,7 +6,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::model::{MAX_POLL_CHOICES, Poll, PollDraft, PollQuizDraft};
+use crate::model::{MAX_POLL_CHOICES, Poll, PollCreateOptions, PollDraft, PollQuizDraft};
 
 use crate::model::{PollDeadline, unix_now};
 
@@ -14,6 +14,8 @@ type SendPoll = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
 type ChoiceRows = Rc<RefCell<Vec<(adw::EntryRow, gtk::CheckButton)>>>;
 
 const LOCKED_VOTE_HINT: &str = "После отправки голос нельзя изменить или отозвать";
+const SUBSCRIBER_VOTE_HINT: &str =
+    "Только участники, вступившие в чат минимум за 24 часа до публикации опроса";
 
 fn label(text: &str) -> gtk::Label {
     gtk::Label::builder()
@@ -59,6 +61,11 @@ pub fn card(poll: &Poll) -> gtk::Box {
     card.append(&kind);
     if poll.revoting_disabled && !poll.closed {
         let hint = label(LOCKED_VOTE_HINT);
+        hint.add_css_class("dim-label");
+        card.append(&hint);
+    }
+    if poll.subscribers_only {
+        let hint = label(SUBSCRIBER_VOTE_HINT);
         hint.add_css_class("dim-label");
         card.append(&hint);
     }
@@ -156,6 +163,9 @@ pub fn vote(
     if poll.revoting_disabled {
         body.append(&label(LOCKED_VOTE_HINT));
     }
+    if poll.subscribers_only {
+        body.append(&label(SUBSCRIBER_VOTE_HINT));
+    }
     let mut controls: Vec<(gtk::CheckButton, Vec<u8>)> = Vec::new();
     for choice in &poll.choices {
         let option = gtk::CheckButton::new();
@@ -227,7 +237,7 @@ pub fn vote(
 
 pub fn create(
     window: &adw::ApplicationWindow,
-    allow_open_answers: bool,
+    options: PollCreateOptions,
     send: impl Fn(PollDraft, i64) -> SendPoll + 'static,
 ) -> adw::Dialog {
     let dialog = adw::Dialog::builder()
@@ -376,8 +386,15 @@ pub fn create(
             vote_lock.set_active(quiz.is_active() || ordinary_lock.get());
         }
     ));
+    public.set_visible(options.public_voters);
+    let subscribers = adw::SwitchRow::builder()
+        .title("Только для подписчиков")
+        .subtitle(SUBSCRIBER_VOTE_HINT)
+        .visible(options.subscribers_only)
+        .build();
     settings.add(&multiple);
     settings.add(&public);
+    settings.add(&subscribers);
     settings.add(&vote_lock);
     let shuffle = adw::SwitchRow::builder()
         .title("Перемешать варианты")
@@ -390,7 +407,7 @@ pub fn create(
         .title("Участники могут добавлять варианты")
         .visible(false)
         .build();
-    if allow_open_answers {
+    if options.open_answers {
         public.connect_active_notify(glib::clone!(
             #[weak]
             quiz,
@@ -473,7 +490,8 @@ pub fn create(
                 },
                 hide_results_until_close: timing.mode.selected() != 0 && timing.hide.is_active(),
                 question: question.text().into(),
-                open_answers: allow_open_answers
+                open_answers: options.open_answers
+                    && options.public_voters
                     && public.is_active()
                     && !quiz.is_active()
                     && open_answers.is_active(),
@@ -481,7 +499,8 @@ pub fn create(
                 multiple: multiple.is_active(),
                 revoting_disabled: vote_lock.is_active(),
                 shuffle_answers: shuffle.is_active(),
-                public: public.is_active(),
+                public: options.public_voters && public.is_active(),
+                subscribers_only: options.subscribers_only && subscribers.is_active(),
                 quiz: quiz.is_active().then(|| {
                     let buffer = solution.buffer();
                     PollQuizDraft {
@@ -749,6 +768,95 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn subscriber_controls_respect_the_chat_and_explain_the_condition_before_voting() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.SubscriberPollTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(720)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            for channel in [false, true] {
+                let sent = Rc::new(RefCell::new(None::<PollDraft>));
+                let result = sent.clone();
+                let dialog = create(
+                    &window,
+                    PollCreateOptions {
+                        open_answers: !channel,
+                        public_voters: !channel,
+                        subscribers_only: channel,
+                    },
+                    move |draft, _| {
+                        result.replace(Some(draft));
+                        Box::pin(async { Ok(()) })
+                    },
+                );
+                settle(|| dialog.is_mapped());
+                for (title, text) in [
+                    ("Вопрос", "Когда?"),
+                    ("Вариант 1", "Сейчас"),
+                    ("Вариант 2", "Завтра"),
+                ] {
+                    find(&dialog, &|row: &adw::EntryRow| row.title() == title)
+                        .unwrap()
+                        .set_text(text);
+                }
+                let subscribers = find(&dialog, &|row: &adw::SwitchRow| {
+                    row.title() == "Только для подписчиков"
+                })
+                .unwrap();
+                let public = find(&dialog, &|row: &adw::SwitchRow| {
+                    row.title() == "Публичное голосование"
+                })
+                .unwrap();
+                assert_eq!(subscribers.is_visible(), channel);
+                assert_eq!(public.is_visible(), !channel);
+                // Hidden controls must not leak flags even if their state changes.
+                subscribers.set_active(true);
+                public.set_active(true);
+                let submit = find(&dialog, &|button: &gtk::Button| {
+                    button.label().as_deref() == Some("Создать опрос")
+                })
+                .unwrap();
+                settle(|| submit.is_mapped());
+                assert!(submit.grab_focus());
+                assert!(gtk::prelude::WidgetExt::activate(&submit));
+                settle(|| sent.borrow().is_some() && window.visible_dialog().is_none());
+                let draft = sent.borrow_mut().take().unwrap();
+                assert_eq!(draft.subscribers_only, channel);
+                assert_eq!(draft.public, !channel);
+                assert!(!draft.open_answers);
+                if channel {
+                    let poll = draft.into_poll(49);
+                    assert!(
+                        find(&card(&poll), &|label: &gtk::Label| label.text()
+                            == SUBSCRIBER_VOTE_HINT)
+                        .is_some()
+                    );
+                    vote(&window, &poll, |_| {});
+                    settle(|| window.visible_dialog().is_some());
+                    let vote_dialog = window.visible_dialog().unwrap();
+                    assert!(
+                        find(&vote_dialog, &|label: &gtk::Label| label.text()
+                            == SUBSCRIBER_VOTE_HINT)
+                        .is_some()
+                    );
+                    vote_dialog.close();
+                    settle(|| window.visible_dialog().is_none());
+                }
+            }
+            window.close();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn quiz_editor_normalizes_choices_and_retries_without_duplicate_operations() {
         gtk::test_synced(|| {
             let app = adw::Application::builder()
@@ -765,10 +873,18 @@ mod tests {
             window.present();
             let attempts = Rc::new(RefCell::new(Vec::<(PollDraft, i64)>::new()));
             let sent = attempts.clone();
-            let dialog = create(&window, true, move |draft, id| {
-                sent.borrow_mut().push((draft, id));
-                Box::pin(async { anyhow::bail!("Synthetic send interruption") })
-            });
+            let dialog = create(
+                &window,
+                PollCreateOptions {
+                    open_answers: true,
+                    public_voters: true,
+                    subscribers_only: true,
+                },
+                move |draft, id| {
+                    sent.borrow_mut().push((draft, id));
+                    Box::pin(async { anyhow::bail!("Synthetic send interruption") })
+                },
+            );
             settle(|| dialog.is_mapped());
             let entry =
                 |title: &str| find(&dialog, &|row: &adw::EntryRow| row.title() == title).unwrap();
@@ -921,15 +1037,20 @@ mod tests {
             assert!(attempts.borrow()[11].0.revoting_disabled);
             switch("Викторина").set_active(false);
             assert!(!lock.is_active() && lock.is_sensitive());
+            let subscribers = switch("Только для подписчиков");
+            assert!(subscribers.is_visible() && !subscribers.is_active());
+            subscribers.set_active(true);
             let shuffle = switch("Перемешать варианты");
             shuffle.set_active(true);
             send(13);
             assert!(attempts.borrow()[12].0.shuffle_answers);
+            assert!(attempts.borrow()[12].0.subscribers_only);
             assert!(attempts.borrow()[12].0.quiz.is_none());
             switch("Викторина").set_active(true);
             send(14);
             assert!(attempts.borrow()[13].0.shuffle_answers);
             assert!(attempts.borrow()[13].0.quiz.is_some());
+            assert!(attempts.borrow()[13].0.subscribers_only);
             switch("Викторина").set_active(false);
             assert!(shuffle.is_active());
             assert!(dialog.width() <= window.width());

@@ -21,6 +21,7 @@ pub struct Chat {
     pub preview_sender: Option<String>,
     pub preview_image: Option<ChatImage>,
     pub group: bool,
+    pub supergroup: bool,
     pub forum: bool,
     pub unread: i32,
     pub unread_mark: bool,
@@ -97,6 +98,7 @@ impl Contact {
             preview_sender: None,
             preview_image: None,
             group: false,
+            supergroup: false,
             forum: false,
             unread: 0,
             unread_mark: false,
@@ -120,6 +122,14 @@ pub struct ReadRequest {
 }
 
 impl Chat {
+    pub fn poll_options(&self) -> PollCreateOptions {
+        PollCreateOptions {
+            open_answers: !self.broadcast,
+            public_voters: !self.broadcast,
+            subscribers_only: self.broadcast || self.supergroup,
+        }
+    }
+
     pub fn is_unread(&self) -> bool {
         self.unread > 0 || self.unread_mark
     }
@@ -1221,6 +1231,7 @@ impl NewChatDraft {
             preview_sender: None,
             preview_image: None,
             group: self.kind != NewChatKind::Channel,
+            supergroup: self.kind == NewChatKind::Group,
             forum: self.forum,
             unread: 0,
             unread_mark: false,
@@ -2187,6 +2198,7 @@ pub struct Poll {
     pub choices: Vec<PollChoice>,
     pub closed: bool,
     pub public: bool,
+    pub subscribers_only: bool,
     pub multiple: bool,
     pub shuffle_answers: bool,
     pub quiz: bool,
@@ -2415,6 +2427,13 @@ pub fn unix_now() -> i64 {
         .map_or(0, |duration| duration.as_secs() as i64)
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct PollCreateOptions {
+    pub open_answers: bool,
+    pub public_voters: bool,
+    pub subscribers_only: bool,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct PollDraft {
     pub deadline: Option<PollDeadline>,
@@ -2426,6 +2445,7 @@ pub struct PollDraft {
     pub shuffle_answers: bool,
     pub revoting_disabled: bool,
     pub public: bool,
+    pub subscribers_only: bool,
     pub quiz: Option<PollQuizDraft>,
 }
 
@@ -2555,6 +2575,7 @@ impl PollDraft {
                 .collect(),
             closed: false,
             public: self.public,
+            subscribers_only: self.subscribers_only,
             multiple: self.multiple,
             shuffle_answers: self.shuffle_answers,
             quiz: self.quiz.is_some(),
@@ -3507,6 +3528,25 @@ mod tests {
     }
 
     #[test]
+    fn subscriber_poll_control_is_available_only_in_supergroups_and_channels() {
+        let mut chat = crate::demo::chats().remove(0);
+        for (group, supergroup, broadcast) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            chat.group = group;
+            chat.supergroup = supergroup;
+            chat.broadcast = broadcast;
+            let options = chat.poll_options();
+            assert_eq!(options.subscribers_only, supergroup || broadcast);
+            assert_eq!(options.public_voters, !broadcast);
+            assert_eq!(options.open_answers, !broadcast);
+        }
+    }
+
+    #[test]
     fn explicit_folder_members_override_categories_and_archive_filter() {
         let chat = Chat {
             id: 1,
@@ -3517,6 +3557,7 @@ mod tests {
             preview_sender: None,
             preview_image: None,
             group: true,
+            supergroup: false,
             forum: false,
             unread: 0,
             unread_mark: false,

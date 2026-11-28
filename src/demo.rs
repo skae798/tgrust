@@ -80,6 +80,7 @@ pub fn chats() -> Vec<Chat> {
                 .map(|media| ChatImage::attachment(id, message.id, media))
         }),
         group: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP | FORUM_CHAT),
+        supergroup: matches!(id, 1 | 6 | SLOW_MODE_GROUP | MODERATION_GROUP | FORUM_CHAT),
         forum: id == FORUM_CHAT,
         unread,
         unread_mark: false,
@@ -1221,6 +1222,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
                 multiple: true,
                 shuffle_answers: true,
+                subscribers_only: true,
                 ..PollDraft::default()
             },
         );
