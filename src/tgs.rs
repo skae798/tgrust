@@ -205,6 +205,60 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_renderers_match_serial_pixels_at_different_monitor_scales() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let bytes = include_bytes!("../data/demo-sticker.tgs").to_vec();
+            let scales = [1, 2, 3, 4];
+            let frames = [0, 15, 30];
+            let mut references = Vec::new();
+            for scale in scales {
+                let renderer = Renderer::open(bytes.clone(), scale).await.unwrap();
+                let mut pixels = Vec::new();
+                for frame in frames {
+                    pixels.push(renderer.request(frame).unwrap().await.unwrap());
+                }
+                references.push(pixels);
+                renderer.shutdown().await.unwrap();
+            }
+            let mut renderers = Vec::new();
+            for index in 0..8 {
+                renderers.push(
+                    Renderer::open(bytes.clone(), scales[index % scales.len()])
+                        .await
+                        .unwrap(),
+                );
+            }
+            for round in 0..24 {
+                let frame = round % frames.len();
+                // Queue every worker before awaiting any result, as multiple visible
+                // stickers do. Each worker owns its separate native animation.
+                let replies: Vec<_> = renderers
+                    .iter()
+                    .map(|renderer| renderer.request(frames[frame]).unwrap())
+                    .collect();
+                for (index, reply) in replies.into_iter().enumerate() {
+                    let actual = reply.await.unwrap();
+                    let expected = &references[index % scales.len()][frame];
+                    assert!(
+                        actual == *expected,
+                        "Parallel TGS pixels differ: worker {index}, scale {}, frame {}",
+                        scales[index % scales.len()],
+                        frames[frame]
+                    );
+                }
+            }
+            for renderer in renderers {
+                renderer.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn renders_at_monitor_resolution_with_a_bounded_surface() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)

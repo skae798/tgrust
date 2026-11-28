@@ -14,6 +14,9 @@ endif()
 
 #declare target
 add_library( rlottie )
+# External sticker workers render concurrently without rlottie's internal pool.
+# Use per-call outlines/strokers instead of the scheduler's shared scratch state.
+target_compile_definitions(rlottie PRIVATE LOTTIE_THREAD_SAFE)
 set_target_properties( rlottie PROPERTIES DEFINE_SYMBOL LOT_BUILD )
 
 #declare version of the target
