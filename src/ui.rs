@@ -18,9 +18,9 @@ use crate::media_viewer::fit_viewport as photo_viewport;
 use crate::model::{
     Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
-    Poll, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit, TextStyle,
-    UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, prepend_history_page,
-    redact_spoilers,
+    Poll, PollQuizDraft, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit,
+    TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats,
+    prepend_history_page, redact_spoilers,
 };
 use crate::model::{
     ChatInfo, Conversation, ForumTopic, ForumWriteResult, GENERAL_TOPIC, GroupPermissionEdit,
@@ -181,6 +181,7 @@ struct Ui {
     history_revision: Cell<HistoryRevision>,
     history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
+    demo_quizzes: RefCell<HashMap<i64, PollQuizDraft>>,
     demo_read_topics: Rc<RefCell<HashSet<Conversation>>>,
     demo_forums: Rc<RefCell<HashMap<i64, demo::ForumTopics>>>,
     demo_next_message: Cell<i32>,
@@ -721,6 +722,7 @@ fn build_window(
         history_revision: Cell::new(HistoryRevision::default()),
         history_refreshed: Cell::new(None),
         demo_messages: RefCell::new(HashMap::new()),
+        demo_quizzes: RefCell::new(HashMap::new()),
         demo_read_topics: Rc::new(RefCell::new(HashSet::new())),
         demo_forums: Rc::new(RefCell::new(HashMap::new())),
         demo_next_message: Cell::new(200),
@@ -1521,6 +1523,11 @@ impl Ui {
 
     fn start_demo(self: &Rc<Self>) {
         self.is_demo.set(true);
+        if let Some(quiz) = demo::sample_quiz().quiz {
+            self.demo_quizzes
+                .borrow_mut()
+                .insert(i64::from(demo::SAMPLE_QUIZ_ID), quiz);
+        }
         self.unread_overrides.borrow_mut().clear();
         self.reading_chats.borrow_mut().clear();
         self.client.replace(None);
@@ -6033,11 +6040,15 @@ impl Ui {
                     anyhow::bail!("{}", slow_mode_status(wait));
                 }
                 if ui.is_demo.get() {
+                    let id = ui.next_demo_message();
+                    if let Some(quiz) = draft.quiz.clone() {
+                        ui.demo_quizzes.borrow_mut().insert(i64::from(id), quiz);
+                    }
                     ui.add_demo_messages(
                         target,
                         vec![Message {
                             topic: target.topic,
-                            ..demo::poll_message(ui.next_demo_message(), draft)
+                            ..demo::poll_message(id, draft)
                         }],
                     );
                     ui.start_demo_slow_mode(chat);
@@ -6150,6 +6161,8 @@ impl Ui {
             };
             let total = poll.total.unwrap_or(0) - i32::from(poll.has_vote())
                 + i32::from(!options.is_empty());
+            let quizzes = self.demo_quizzes.borrow();
+            let quiz = quizzes.get(&expected);
             let results = poll
                 .choices
                 .iter()
@@ -6162,7 +6175,7 @@ impl Ui {
                         option: choice.option.clone(),
                         votes: Some(votes.max(0)),
                         chosen,
-                        correct: poll.quiz && index == 0,
+                        correct: quiz.is_some_and(|quiz| quiz.correct.contains(&index)),
                     }
                 })
                 .collect();
@@ -6172,7 +6185,10 @@ impl Ui {
                 definition: None,
                 results: Some(results),
                 total: Some(total.max(0)),
-                solution: poll.quiz.then_some("Первый вариант правильный.".into()),
+                solution: quiz
+                    .map(|quiz| &quiz.solution)
+                    .filter(|solution| !solution.is_empty())
+                    .cloned(),
                 partial: false,
             });
             return;

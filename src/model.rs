@@ -2280,6 +2280,13 @@ pub struct PollDraft {
     pub choices: Vec<String>,
     pub multiple: bool,
     pub public: bool,
+    pub quiz: Option<PollQuizDraft>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PollQuizDraft {
+    pub correct: Vec<usize>,
+    pub solution: String,
 }
 
 impl PollDraft {
@@ -2290,13 +2297,15 @@ impl PollDraft {
             question.chars().count() <= 300,
             "Вопрос должен быть до 300 символов"
         );
-        let choices: Vec<_> = self
+        let (positions, choices): (Vec<_>, Vec<_>) = self
             .choices
             .iter()
-            .map(|choice| choice.trim())
-            .filter(|choice| !choice.is_empty())
-            .map(str::to_owned)
-            .collect();
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                let choice = choice.trim();
+                (!choice.is_empty()).then(|| (index, choice.to_owned()))
+            })
+            .unzip();
         anyhow::ensure!(
             (2..=MAX_POLL_CHOICES).contains(&choices.len()),
             "Добавьте от 2 до {MAX_POLL_CHOICES} вариантов"
@@ -2312,9 +2321,33 @@ impl PollDraft {
                 .all(|(index, choice)| !choices[..index].contains(choice)),
             "Варианты должны различаться"
         );
+        let mut quiz = self.quiz;
+        if let Some(quiz) = &mut quiz {
+            anyhow::ensure!(!quiz.correct.is_empty(), "Отметьте правильный ответ");
+            anyhow::ensure!(
+                self.multiple || quiz.correct.len() == 1,
+                "Отметьте только один правильный ответ"
+            );
+            let correct: Vec<_> = positions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, position)| quiz.correct.contains(position).then_some(index))
+                .collect();
+            anyhow::ensure!(
+                correct.len() == quiz.correct.len(),
+                "Отметьте заполненные варианты ответа"
+            );
+            quiz.correct = correct;
+            quiz.solution = quiz.solution.trim().to_owned();
+            anyhow::ensure!(
+                quiz.solution.chars().count() <= 200 && quiz.solution.lines().count() <= 3,
+                "Пояснение должно быть до 200 символов и трёх строк"
+            );
+        }
         Ok(Self {
             question,
             choices,
+            quiz,
             ..self
         })
     }
@@ -2338,8 +2371,8 @@ impl PollDraft {
             closed: false,
             public: self.public,
             multiple: self.multiple,
-            quiz: false,
-            revoting_disabled: false,
+            quiz: self.quiz.is_some(),
+            revoting_disabled: self.quiz.is_some(),
             total: None,
             solution: None,
         }
@@ -3501,7 +3534,7 @@ mod tests {
             question: "  Когда? ".into(),
             choices: vec!["Сейчас".into(), " ".into(), "Завтра ".into()],
             multiple: true,
-            public: false,
+            ..PollDraft::default()
         };
         let mut invalid = draft.clone();
         invalid.choices.push(" Завтра".into());
@@ -3516,6 +3549,54 @@ mod tests {
         assert!(!poll.accepts(&[vec![0], vec![0]]));
         assert!(!poll.accepts(&[vec![2]]));
         assert!(!poll.accepts(&[]));
+    }
+
+    #[test]
+    fn quiz_draft_maps_answers_after_empty_rows_and_hides_the_key_before_voting() {
+        let draft = PollDraft {
+            question: "Какие дни выходные?".into(),
+            choices: vec![
+                " ".into(),
+                "Суббота".into(),
+                "Пятница".into(),
+                String::new(),
+                "Воскресенье".into(),
+            ],
+            multiple: true,
+            quiz: Some(PollQuizDraft {
+                correct: vec![4, 1],
+                solution: "  Суббота\nи воскресенье.  ".into(),
+            }),
+            ..PollDraft::default()
+        };
+        let normalized = draft.clone().validate().unwrap();
+        assert!(normalized == normalized.clone().validate().unwrap());
+        assert_eq!(
+            normalized.quiz,
+            Some(PollQuizDraft {
+                correct: vec![0, 2],
+                solution: "Суббота\nи воскресенье.".into(),
+            })
+        );
+        let poll = normalized.into_poll(46);
+        assert!(poll.quiz && poll.multiple && poll.revoting_disabled);
+        assert!(poll.choices.iter().all(|choice| !choice.correct));
+        assert_eq!(poll.solution, None);
+
+        for correct in [vec![], vec![0], vec![4, 4], vec![5]] {
+            let mut invalid = draft.clone();
+            invalid.quiz.as_mut().unwrap().correct = correct;
+            assert!(invalid.validate().is_err());
+        }
+        let mut single = draft.clone();
+        single.multiple = false;
+        assert!(single.validate().is_err());
+
+        for solution in ["а".repeat(201), "Раз\nДва\nТри\nЧетыре".into()] {
+            let mut invalid = draft.clone();
+            invalid.quiz.as_mut().unwrap().solution = solution;
+            assert!(invalid.validate().is_err());
+        }
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub const OWN_AVATAR: Avatar = Avatar {
 };
 pub const FILE_NAME: &str = "заметки.txt";
 pub const FILE_CONTENT: &str = "Подготовить макеты, согласовать сроки и проверить сборку.\n";
+pub const SAMPLE_QUIZ_ID: i32 = 1;
 pub const SLOW_MODE_GROUP: i64 = 8;
 pub const MODERATION_GROUP: i64 = 9;
 pub const FORUM_CHAT: i64 = 14;
@@ -1208,21 +1209,10 @@ pub fn history(chat: i64) -> Vec<Message> {
                 question: "Когда провести встречу?".into(),
                 choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
                 multiple: true,
-                public: false,
-            },
-        );
-        let mut quiz = poll_message(
-            1,
-            PollDraft {
-                question: "Какой день идёт после вторника?".into(),
-                choices: vec!["Среда".into(), "Воскресенье".into()],
                 ..PollDraft::default()
             },
         );
-        if let Some(poll) = &mut quiz.poll {
-            poll.quiz = true;
-            poll.revoting_disabled = true;
-        }
+        let mut quiz = poll_message(SAMPLE_QUIZ_ID, sample_quiz());
         for message in [&mut meeting, &mut quiz] {
             message.sender = "Анна".into();
             message.sender_avatar = Some(Avatar {
@@ -1428,6 +1418,18 @@ pub fn history(chat: i64) -> Vec<Message> {
         messages.push(animated);
     }
     messages
+}
+
+pub fn sample_quiz() -> PollDraft {
+    PollDraft {
+        question: "Какой день идёт после вторника?".into(),
+        choices: vec!["Среда".into(), "Воскресенье".into()],
+        quiz: Some(crate::model::PollQuizDraft {
+            correct: vec![0],
+            solution: "Первый вариант правильный.".into(),
+        }),
+        ..PollDraft::default()
+    }
 }
 
 pub fn poll_message(id: i32, draft: PollDraft) -> Message {
