@@ -119,6 +119,7 @@ impl Picker {
 
     fn select_collection(self: &Rc<Self>, collection: StickerCollection) {
         self.pending_pack.take();
+        self.search.set_text("");
         let index = {
             let mut collections = self.collections.borrow_mut();
             if let Some(index) = collections

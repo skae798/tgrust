@@ -32,6 +32,8 @@ struct Picker {
     collections: RefCell<Vec<StickerCollection>>,
     names: gtk::StringList,
     source: gtk::DropDown,
+    search: gtk::SearchEntry,
+    search_timer: RefCell<Option<glib::SourceId>>,
     open_pack: gtk::Button,
     pack_action: gtk::Button,
     notice: RefCell<Option<String>>,
@@ -71,6 +73,14 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
     source.set_enable_search(true);
     source.update_property(&[gtk::accessible::Property::Label("Набор стикеров")]);
     let open_pack = gtk::Button::with_label("Открыть набор по ссылке");
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Поиск по эмодзи")
+        .build();
+    search.update_property(&[gtk::accessible::Property::Label("Поиск стикеров по эмодзи")]);
+    search.set_tooltip_text(Some(
+        "Поиск стикеров Telegram по эмодзи; очистите поле, чтобы вернуться к набору",
+    ));
+    body.append(&search);
     body.append(&open_pack);
     body.append(&source);
     let pack_action = gtk::Button::with_label("Добавить набор");
@@ -103,13 +113,15 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
     body.append(&scroll);
     toolbar.set_content(Some(&body));
     dialog.set_child(Some(&toolbar));
-    dialog.set_focus(Some(&source));
+    dialog.set_focus(Some(&search));
     let state = Rc::new(Picker {
         context,
         dialog: dialog.downgrade(),
         collections: RefCell::new(Vec::new()),
         names,
         source,
+        search,
+        search_timer: RefCell::default(),
         open_pack,
         pack_action,
         notice: RefCell::new(None),
@@ -139,8 +151,24 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
     state.source.connect_selected_notify(glib::clone!(
         #[weak]
         state,
+        move |_| {
+            state.favorite_focus.set(None);
+            state.load();
+        }
+    ));
+    state.search.connect_changed(glib::clone!(
+        #[weak]
+        state,
+        move |_| state.query_changed()
+    ));
+    state.search.connect_activate(glib::clone!(
+        #[weak]
+        state,
         move |_| state.load()
     ));
+    state
+        .search
+        .connect_stop_search(|search| search.set_text(""));
     state.retry.connect_clicked(glib::clone!(
         #[weak]
         state,
@@ -172,6 +200,9 @@ fn build(window: &adw::ApplicationWindow, context: ContextData) -> (adw::Dialog,
 
 impl Picker {
     fn cancel_loading(&self) {
+        if let Some(timer) = self.search_timer.take() {
+            timer.remove();
+        }
         self.generation.set(self.generation.get().wrapping_add(1));
         if let Some(request) = self.request.take() {
             request.abort();
@@ -213,7 +244,10 @@ impl Picker {
         self.status
             .set_text(&format!("Не удалось загрузить стикеры. {error}"));
         self.retry.set_visible(true);
-        self.source.set_sensitive(true);
+        self.source
+            .set_sensitive(self.search.text().trim().is_empty());
+        self.search
+            .set_sensitive(!self.collections.borrow().is_empty());
     }
 
     fn load_collections(self: &Rc<Self>) {
@@ -221,6 +255,7 @@ impl Picker {
         self.status.set_text("Загрузка наборов…");
         self.retry.set_visible(false);
         self.source.set_sensitive(false);
+        self.search.set_sensitive(false);
         if let Some(client) = self.context.client.clone() {
             self.run(
                 async move { client.sticker_collections().await },
@@ -248,6 +283,7 @@ impl Picker {
             &labels.iter().map(String::as_str).collect::<Vec<_>>(),
         );
         self.source.set_sensitive(true);
+        self.search.set_sensitive(true);
         // The first insertion emits selected-notify; load explicitly only if it did not.
         if self.generation.get() == generation {
             self.load();
@@ -266,12 +302,21 @@ impl Picker {
         else {
             return;
         };
+        let query = match crate::model::sticker_emoji_query(self.search.text().as_str()) {
+            Ok(query) => query,
+            Err(error) => {
+                self.status.set_text(&error.to_string());
+                return;
+            }
+        };
+        self.source.set_sensitive(query.is_none());
         let installed = self
             .collections
             .borrow()
             .get(self.source.selected() as usize)
             .and_then(|item| item.installed);
-        self.pack_action.set_visible(installed.is_some());
+        self.pack_action
+            .set_visible(installed.is_some() && query.is_none());
         self.pack_action.set_label(if installed == Some(true) {
             "Убрать набор"
         } else {
@@ -286,7 +331,13 @@ impl Picker {
         }
         if let Some(client) = self.context.client.clone() {
             self.run(
-                async move { client.sticker_list(source).await },
+                async move {
+                    if let Some(query) = query {
+                        client.search_stickers(&query).await
+                    } else {
+                        client.sticker_list(source).await
+                    }
+                },
                 |state, result| match result {
                     Ok(stickers) => state.render(stickers),
                     Err(error) => state.fail(error),
@@ -298,12 +349,47 @@ impl Picker {
                 .into_iter()
                 .filter_map(|mut sticker| {
                     sticker.favorite = favorites.contains(&sticker.id);
-                    (source != StickerSource::Favorites || sticker.favorite).then_some(sticker)
+                    let matches = query.as_ref().map_or_else(
+                        || source != StickerSource::Favorites || sticker.favorite,
+                        |query| {
+                            sticker.emoji.trim_end_matches('\u{fe0f}')
+                                == query.trim_end_matches('\u{fe0f}')
+                        },
+                    );
+                    matches.then_some(sticker)
                 })
                 .collect();
             drop(favorites);
             self.render(stickers);
         }
+    }
+
+    fn query_changed(self: &Rc<Self>) {
+        if self.closed.get() || self.sending.get() || self.editing.get() {
+            return;
+        }
+        self.cancel_loading();
+        self.favorite_focus.set(None);
+        self.pending_pack.take();
+        self.retry.set_visible(false);
+        self.pack_action.set_visible(false);
+        while let Some(child) = self.flow.first_child() {
+            self.flow.remove(&child);
+        }
+        if self.search.text().trim().is_empty() {
+            self.load();
+            return;
+        }
+        self.source.set_sensitive(false);
+        self.status.set_text("Поиск по эмодзи…");
+        let weak = Rc::downgrade(self);
+        let timer = glib::timeout_add_local_once(Duration::from_millis(250), move || {
+            if let Some(state) = weak.upgrade() {
+                state.search_timer.take();
+                state.load();
+            }
+        });
+        self.search_timer.replace(Some(timer));
     }
 
     fn render(self: &Rc<Self>, stickers: Vec<Sticker>) {
@@ -314,7 +400,11 @@ impl Picker {
                 .take()
                 .as_deref()
                 .unwrap_or(if stickers.is_empty() {
-                    "Здесь пока нет стикеров"
+                    if self.search.text().trim().is_empty() {
+                        "Здесь пока нет стикеров"
+                    } else {
+                        "Стикеры не найдены"
+                    }
                 } else {
                     "Выберите стикер для отправки"
                 }),
@@ -404,7 +494,11 @@ impl Picker {
             self.flow.insert(&item, -1);
         }
         if focus.is_some() && !restored {
-            self.source.grab_focus();
+            if self.search.text().trim().is_empty() {
+                self.source.grab_focus();
+            } else {
+                self.search.grab_focus();
+            }
         }
     }
 
@@ -438,7 +532,9 @@ impl Picker {
     }
 
     fn controls_sensitive(&self, sensitive: bool) {
-        self.source.set_sensitive(sensitive);
+        self.source
+            .set_sensitive(sensitive && self.search.text().trim().is_empty());
+        self.search.set_sensitive(sensitive);
         self.flow.set_sensitive(sensitive);
         self.open_pack.set_sensitive(sensitive);
         self.pack_action.set_sensitive(sensitive);
@@ -601,6 +697,150 @@ mod tests {
             child = widget.next_sibling();
         }
         None
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn emoji_search_discards_completed_old_results_and_restores_the_selected_collection() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.StickerSearchTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(720)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let attempts = Rc::new(RefCell::new(Vec::new()));
+            let sent = attempts.clone();
+            let (dialog, state) = build(
+                &window,
+                ContextData {
+                    runtime: runtime.handle().clone(),
+                    client: None,
+                    demo_favorites: Rc::default(),
+                    demo_packs: Rc::default(),
+                    send: Box::new(move |sticker, _| {
+                        sent.borrow_mut().push(sticker.id);
+                        Box::pin(async { anyhow::bail!("Synthetic send interruption") })
+                    }),
+                },
+            );
+            assert_eq!(state.flow.observe_children().n_items(), 3);
+            settle(|| state.search.is_mapped());
+            let stale = Rc::new(Cell::new(false));
+            let called = stale.clone();
+            state.run(
+                async { Ok(Vec::<Sticker>::new()) },
+                move |state, stickers| {
+                    called.set(true);
+                    state.render(stickers.unwrap());
+                },
+            );
+            // Finish the old network task while the GTK completion is still queued.
+            let completed = state.request.borrow().as_ref().unwrap().clone();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !completed.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(completed.is_finished());
+            assert!(state.search.grab_focus());
+            state.search.set_text("🐱");
+            state.search.set_text("🚀");
+            assert_eq!(state.flow.observe_children().n_items(), 0);
+            assert!(!state.source.is_sensitive());
+            settle(|| {
+                state.search_timer.borrow().is_none()
+                    && state.flow.observe_children().n_items() == 1
+            });
+            assert!(!stale.get(), "The old completion replaced the new search");
+            let choice = || {
+                state
+                    .flow
+                    .child_at_index(0)
+                    .unwrap()
+                    .child()
+                    .unwrap()
+                    .first_child()
+                    .unwrap()
+            };
+            assert_eq!(choice().widget_name(), "sticker-2");
+            state.search.set_text("🚀\u{fe0f}");
+            settle(|| {
+                state.search_timer.borrow().is_none()
+                    && state.flow.observe_children().n_items() == 1
+            });
+            assert_eq!(choice().widget_name(), "sticker-2");
+            state.search.set_text("🧱");
+            settle(|| {
+                state.search_timer.borrow().is_none() && state.status.text().contains("не найдены")
+            });
+            assert_eq!(state.flow.observe_children().n_items(), 0);
+            state.search.emit_stop_search();
+            assert_eq!(state.flow.observe_children().n_items(), 3);
+            assert!(state.source.is_sensitive());
+            state.source.set_selected(1);
+            assert_eq!(state.flow.observe_children().n_items(), 0);
+            state.search.set_text("🐱");
+            settle(|| {
+                state.search_timer.borrow().is_none()
+                    && state.flow.observe_children().n_items() == 1
+            });
+            let star = state
+                .flow
+                .child_at_index(0)
+                .unwrap()
+                .child()
+                .unwrap()
+                .last_child()
+                .unwrap()
+                .downcast::<gtk::Button>()
+                .unwrap();
+            star.emit_clicked();
+            assert!(state.context.demo_favorites.borrow().contains(&1));
+            assert!(attempts.borrow().is_empty());
+            state.search.emit_stop_search();
+            assert_eq!(state.source.selected(), 1);
+            assert_eq!(state.flow.observe_children().n_items(), 1);
+            state.search.set_text("🚀");
+            settle(|| {
+                state.search_timer.borrow().is_none()
+                    && state.flow.observe_children().n_items() == 1
+            });
+            state.open_named_pack("SpaceDogs");
+            assert!(state.search.text().is_empty());
+            assert!(state.source.is_sensitive());
+            assert!(state.pack_action.is_visible());
+            assert_eq!(state.flow.observe_children().n_items(), 3);
+            state.search.set_text("🚀");
+            settle(|| {
+                state.search_timer.borrow().is_none()
+                    && state.flow.observe_children().n_items() == 1
+            });
+            let send = choice();
+            settle(|| send.is_mapped());
+            assert!(send.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&send));
+            settle(|| !state.sending.get() && !attempts.borrow().is_empty());
+            assert_eq!(&*attempts.borrow(), &[2]);
+            assert!(state.search.is_sensitive());
+            assert!(!state.source.is_sensitive());
+            state.search.set_text("🐱");
+            dialog.close();
+            settle(|| state.closed.get());
+            assert!(state.search_timer.borrow().is_none());
+            assert!(state.request.borrow().is_none());
+            window.close();
+        });
     }
 
     #[test]

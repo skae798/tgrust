@@ -7,7 +7,7 @@ use std::io::Cursor;
 use anyhow::{Context, Result, bail, ensure};
 use grammers_client::media::{Document, Sticker as TelegramSticker};
 use grammers_client::tl::functions::messages::{
-    FaveSticker, GetAllStickers, GetFavedStickers, GetRecentStickers, GetStickerSet,
+    FaveSticker, GetAllStickers, GetFavedStickers, GetRecentStickers, GetStickerSet, GetStickers,
     SaveRecentSticker,
 };
 
@@ -27,9 +27,10 @@ struct CachedSticker {
     origin: Origin,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Origin {
     Collection(StickerSource),
+    Search(String),
     Message { chat: i64, message: i32 },
 }
 
@@ -159,12 +160,31 @@ impl Telegram {
                 result.documents
             }
         };
+        Ok(self.remember_stickers(documents, Origin::Collection(source)))
+    }
+
+    pub async fn search_stickers(&self, input: &str) -> Result<Vec<Sticker>> {
+        let query = crate::model::sticker_emoji_query(input)?.context("Введите эмодзи")?;
+        let enums::messages::Stickers::Stickers(result) = self
+            .client
+            .invoke(&GetStickers {
+                emoticon: query.clone(),
+                hash: 0,
+            })
+            .await?
+        else {
+            bail!("Telegram не прислал результаты поиска стикеров")
+        };
+        Ok(self.remember_stickers(result.stickers, Origin::Search(query)))
+    }
+
+    fn remember_stickers(&self, documents: Vec<enums::Document>, origin: Origin) -> Vec<Sticker> {
         let mut cache = self.stickers.lock().unwrap();
         // References contain no image data. Bound the account-local cache nevertheless.
         if cache.documents.len().saturating_add(documents.len()) > 4096 {
             cache.documents.clear();
         }
-        if source == StickerSource::Favorites {
+        if matches!(&origin, Origin::Collection(StickerSource::Favorites)) {
             cache.favorites = favorite_ids(&documents);
         }
         let mut seen = HashSet::new();
@@ -182,12 +202,12 @@ impl Telegram {
                 sticker.id,
                 CachedSticker {
                     document,
-                    origin: Origin::Collection(source),
+                    origin: origin.clone(),
                 },
             );
             stickers.push(sticker);
         }
-        Ok(stickers)
+        stickers
     }
 
     async fn favorite_documents(&self) -> Result<Vec<enums::Document>> {
@@ -208,7 +228,7 @@ impl Telegram {
         with_refreshed_sticker(
             cached.document,
             |document| self.change_sticker_favorite(document, favorite),
-            || self.refresh_sticker(id, cached.origin),
+            || self.refresh_sticker(id, cached.origin.clone()),
         )
         .await
     }
@@ -278,6 +298,15 @@ impl Telegram {
                     "Стикер больше недоступен в наборе"
                 );
             }
+            Origin::Search(query) => {
+                ensure!(
+                    self.search_stickers(&query)
+                        .await?
+                        .iter()
+                        .any(|sticker| sticker.id == id),
+                    "Стикер больше недоступен в результатах поиска"
+                );
+            }
             Origin::Message { chat, message } => {
                 let message = self
                     .message_by_id(self.peer(chat).await?, message)
@@ -298,7 +327,7 @@ impl Telegram {
         let bytes = with_refreshed_sticker(
             cached.document,
             |document| async move { self.sticker_image_bytes(&document).await },
-            || self.refresh_sticker(id, cached.origin),
+            || self.refresh_sticker(id, cached.origin.clone()),
         )
         .await?;
         tokio::task::spawn_blocking(move || decode_sticker_image(&bytes)).await?
@@ -347,7 +376,7 @@ impl Telegram {
                     .await
                     .map_err(Into::into)
             },
-            || self.refresh_sticker(id, cached.origin),
+            || self.refresh_sticker(id, cached.origin.clone()),
         )
         .await?;
         // Saving recency is best effort: its failure must not turn a delivered sticker into a retry.

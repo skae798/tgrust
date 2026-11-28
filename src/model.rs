@@ -1764,6 +1764,19 @@ pub enum StickerSource {
     Set(i64),
 }
 
+pub fn sticker_emoji_query(input: &str) -> anyhow::Result<Option<String>> {
+    anyhow::ensure!(input.len() <= 512, "Слишком длинный запрос стикеров");
+    let query = input.trim();
+    if query.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        query.encode_utf16().count() <= 64 && !query.chars().any(char::is_control),
+        "Введите короткую последовательность эмодзи без управляющих символов"
+    );
+    Ok(Some(query.into()))
+}
+
 #[derive(Clone, Debug)]
 pub struct StickerCollection {
     pub source: StickerSource,
@@ -2667,6 +2680,23 @@ pub fn prepend_history_page(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sticker_emoji_search_preserves_sequences_and_bounds_pasted_input() {
+        for query in ["🚀", "👩🏽‍💻", "🇺🇦", "❤️", "#️⃣"] {
+            assert_eq!(
+                super::sticker_emoji_query(&format!(" {query} "))
+                    .unwrap()
+                    .as_deref(),
+                Some(query)
+            );
+        }
+        assert_eq!(super::sticker_emoji_query(" \n\t").unwrap(), None);
+        assert!(super::sticker_emoji_query("🚀\n🐱").is_err());
+        assert!(super::sticker_emoji_query("🚀\0").is_err());
+        assert!(super::sticker_emoji_query(&"🚀".repeat(33)).is_err());
+        assert!(super::sticker_emoji_query(&" ".repeat(513)).is_err());
+    }
+
     use super::*;
 
     fn chat_addresses() -> ChatAddresses {
