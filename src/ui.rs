@@ -1,3 +1,5 @@
+mod poll_answers;
+
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -26,6 +28,7 @@ use crate::model::{
     ChatInfo, Conversation, ForumTopic, ForumWriteResult, GENERAL_TOPIC, GroupPermissionEdit,
     GroupPermissions, PlayableMedia, slow_mode_change,
 };
+use crate::poll_dialog;
 use crate::storage::{PendingSave, SessionRemoval, attachment_name};
 use crate::telegram::{LoginStep, Telegram};
 
@@ -196,6 +199,8 @@ struct Ui {
     poll_deadline_source: RefCell<Option<glib::SourceId>>,
     elapsed_polls: RefCell<HashSet<(i32, i64)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
+    poll_answer_limits: Cell<(usize, i32)>,
+    poll_answer_refreshes: RefCell<HashMap<(i64, i32), poll_answers::AnswerRefresh>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
     inline_audio: RefCell<Option<InlineAudio>>,
@@ -741,6 +746,11 @@ fn build_window(
         poll_deadline_source: RefCell::new(None),
         elapsed_polls: RefCell::new(HashSet::new()),
         images: RefCell::new(HashMap::new()),
+        poll_answer_limits: Cell::new((
+            crate::model::MAX_POLL_CHOICES,
+            crate::model::POLL_ANSWER_DELETE_PERIOD,
+        )),
+        poll_answer_refreshes: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
         inline_audio: RefCell::new(None),
@@ -1566,6 +1576,34 @@ impl Ui {
             },
         );
         let mut changes = client.changes();
+        let options_client = client.clone();
+        self.job(
+            async move { Ok(options_client.poll_answer_limits().await) },
+            |ui, result| {
+                if let Ok(limits) = result {
+                    ui.poll_answer_limits.set(limits);
+                }
+            },
+        );
+        let mut answers = client.poll_answer_changes();
+        let mut answer_stop = self.stop.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            loop {
+                let change = tokio::select! {
+                    _ = answer_stop.changed() => break,
+                    change = answers.recv() => change,
+                };
+                let Some(ui) = weak.upgrade() else { break };
+                match change {
+                    Ok((chat, id)) => ui.refresh_open_poll(chat, id),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        ui.refresh_visible_open_polls();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
         let mut polls = client.poll_updates();
         let mut poll_stop = self.stop.clone();
         let weak = Rc::downgrade(self);
@@ -5468,6 +5506,9 @@ impl Ui {
                 ),
             );
         }
+        if let Some(target) = target {
+            self.add_poll_answer_actions(&menu, target, message);
+        }
         if message.can_reply {
             if self.input.is_sensitive() {
                 let reply = Reply {
@@ -6084,7 +6125,8 @@ impl Ui {
         };
         let chat = target.chat;
         let weak = Rc::downgrade(self);
-        let dialog = crate::poll_dialog::create(&window, move |draft, random_id| {
+        let allow_open = self.chat_view(chat).is_some_and(|chat| !chat.broadcast);
+        let send = move |draft: crate::model::PollDraft, random_id| {
             let weak = weak.clone();
             Box::pin(async move {
                 let ui = weak.upgrade().context("Аккаунт закрыт")?;
@@ -6146,8 +6188,9 @@ impl Ui {
                     ui.refresh_chats();
                 }
                 Ok(())
-            })
-        });
+            }) as _
+        };
+        let dialog = poll_dialog::create(&window, allow_open, send);
         dialog.connect_closed(glib::clone!(
             #[weak(rename_to = ui)]
             self,
@@ -6434,6 +6477,7 @@ impl Ui {
     }
 
     fn apply_poll_update(self: &Rc<Self>, update: PollUpdate) {
+        self.invalidate_pending_answer_refreshes(&update);
         self.history_cache
             .borrow_mut()
             .update_polls(|chat, id, poll| {

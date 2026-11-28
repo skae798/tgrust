@@ -209,6 +209,7 @@ pub fn vote(
 
 pub fn create(
     window: &adw::ApplicationWindow,
+    allow_open_answers: bool,
     send: impl Fn(PollDraft, i64) -> SendPoll + 'static,
 ) -> adw::Dialog {
     let dialog = adw::Dialog::builder()
@@ -335,6 +336,27 @@ pub fn create(
     settings.add(&public);
     let timing = TimingControls::append(&settings);
     content.append(&settings);
+    let open_answers = adw::SwitchRow::builder()
+        .title("Участники могут добавлять варианты")
+        .visible(false)
+        .build();
+    if allow_open_answers {
+        public.connect_active_notify(glib::clone!(
+            #[weak]
+            quiz,
+            #[weak]
+            open_answers,
+            move |public| open_answers.set_visible(public.is_active() && !quiz.is_active())
+        ));
+        quiz.connect_active_notify(glib::clone!(
+            #[weak]
+            public,
+            #[weak]
+            open_answers,
+            move |quiz| open_answers.set_visible(public.is_active() && !quiz.is_active())
+        ));
+        settings.add(&open_answers);
+    }
     let explanation = gtk::Box::new(gtk::Orientation::Vertical, 6);
     explanation.append(&label("Пояснение к ответу (необязательно)"));
     let solution = gtk::TextView::builder()
@@ -401,6 +423,10 @@ pub fn create(
                 },
                 hide_results_until_close: timing.mode.selected() != 0 && timing.hide.is_active(),
                 question: question.text().into(),
+                open_answers: allow_open_answers
+                    && public.is_active()
+                    && !quiz.is_active()
+                    && open_answers.is_active(),
                 choices: rows.iter().map(|(row, _)| row.text().into()).collect(),
                 multiple: multiple.is_active(),
                 public: public.is_active(),
@@ -628,7 +654,7 @@ mod tests {
             window.present();
             let attempts = Rc::new(RefCell::new(Vec::<(PollDraft, i64)>::new()));
             let sent = attempts.clone();
-            let dialog = create(&window, move |draft, id| {
+            let dialog = create(&window, true, move |draft, id| {
                 sent.borrow_mut().push((draft, id));
                 Box::pin(async { anyhow::bail!("Synthetic send interruption") })
             });
@@ -753,6 +779,22 @@ mod tests {
             send(7);
             assert!(attempts.borrow()[6].0.deadline.is_none());
             assert!(!attempts.borrow()[6].0.hide_results_until_close);
+            let open = switch("Участники могут добавлять варианты");
+            assert!(!open.is_visible());
+            switch("Викторина").set_active(false);
+            assert!(open.is_visible());
+            open.set_active(true);
+            send(8);
+            assert!(attempts.borrow()[7].0.open_answers);
+            switch("Викторина").set_active(true);
+            assert!(!open.is_visible());
+            send(9);
+            assert!(!attempts.borrow()[8].0.open_answers);
+            switch("Викторина").set_active(false);
+            switch("Публичное голосование").set_active(false);
+            assert!(!open.is_visible());
+            send(10);
+            assert!(!attempts.borrow()[9].0.open_answers);
             assert!(dialog.width() <= window.width());
             dialog.close();
             window.close();

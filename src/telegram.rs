@@ -17,6 +17,8 @@ pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
 mod poll_timing;
 
+mod poll_answers;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,6 +137,7 @@ pub struct Telegram {
     blocked_changes: watch::Sender<u64>,
     join_request_changes: broadcast::Sender<i64>,
     poll_updates: broadcast::Sender<PollUpdate>,
+    poll_answer_changes: broadcast::Sender<(i64, i32)>,
     read_state: crate::read_state::ReadState,
 }
 
@@ -228,6 +231,7 @@ impl Telegram {
                 blocked_changes: watch::channel(0).0,
                 join_request_changes: broadcast::channel(32).0,
                 poll_updates: broadcast::channel(64).0,
+                poll_answer_changes: broadcast::channel(64).0,
                 read_state: crate::read_state::ReadState::default(),
             }),
             step,
@@ -457,6 +461,10 @@ impl Telegram {
         self.poll_updates.subscribe()
     }
 
+    pub fn poll_answer_changes(&self) -> broadcast::Receiver<(i64, i32)> {
+        self.poll_answer_changes.subscribe()
+    }
+
     fn invalidate_blocked(&self) {
         self.blocked_changes
             .send_modify(|value| *value = value.wrapping_add(1));
@@ -486,6 +494,12 @@ impl Telegram {
                 Ok(update) => {
                     retry_delay = Duration::from_secs(1);
                     self.record_history_change(&update);
+                    if let Update::NewMessage(message) = &update {
+                        let message: &TelegramMessage = message;
+                        if let Some(target) = poll_answers::changed_poll(&message.raw) {
+                            let _ = self.poll_answer_changes.send(target);
+                        }
+                    }
                     if let enums::Update::MessagePoll(update) = update.raw() {
                         let _ = self.poll_updates.send(poll_update(update));
                     }
@@ -4039,7 +4053,7 @@ fn poll_media(
             public_voters: poll.public,
             multiple_choice: poll.multiple,
             quiz: correct_answers.is_some(),
-            open_answers: false,
+            open_answers: poll.open_answers,
             revoting_disabled: correct_answers.is_some(),
             shuffle_answers: false,
             hide_results_until_close: poll.hide_results_until_close,
@@ -4073,6 +4087,7 @@ fn poll_media(
 
 fn poll_definition(raw: &types::Poll) -> Poll {
     Poll {
+        open_answers: raw.open_answers,
         id: raw.id,
         question: poll_question(&raw.question),
         creator: raw.creator,
@@ -4090,6 +4105,7 @@ fn poll_definition(raw: &types::Poll) -> Poll {
                     votes: None,
                     chosen: false,
                     correct: false,
+                    addition: poll_answers::answer_addition(answer),
                 })
             })
             .collect(),
@@ -4414,8 +4430,19 @@ fn message_styles(message: &TelegramMessage) -> Vec<TextSpan> {
 fn message_text(message: &TelegramMessage) -> String {
     if !message.text().is_empty() {
         message.text().to_owned()
-    } else if message.action().is_some() {
-        "Событие в чате".to_owned()
+    } else if let Some(action) = message.action() {
+        match action {
+            enums::MessageAction::PollAppendAnswer(action) => match &action.answer {
+                enums::PollAnswer::Answer(answer) => {
+                    format!("Добавлен вариант опроса «{}»", poll_question(&answer.text))
+                }
+                enums::PollAnswer::InputPollAnswer(answer) => {
+                    format!("Добавлен вариант опроса «{}»", poll_question(&answer.text))
+                }
+            },
+            enums::MessageAction::PollDeleteAnswer(_) => "Удалён вариант опроса".to_owned(),
+            _ => "Событие в чате".to_owned(),
+        }
     } else if let Some(sticker) = stickers::message_sticker(message) {
         sticker.label()
     } else if let Some(Media::Poll(raw)) = message.media() {
@@ -4672,6 +4699,28 @@ mod tests {
             assert_eq!(request.correct_answers, Some(vec![1]));
             assert_eq!(request.solution.as_deref(), Some("После утра."));
         }
+    }
+
+    #[test]
+    fn open_answer_request_preserves_public_voting_and_timed_hidden_results() {
+        let draft = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Утром".into(), "Днём".into()],
+            public: true,
+            open_answers: true,
+            hide_results_until_close: true,
+            deadline: Some(crate::model::PollDeadline::After(60)),
+            ..PollDraft::default()
+        }
+        .validate()
+        .unwrap();
+        let (period, date) = draft.close_fields(1_800_000_000, 3600).unwrap();
+        let request = poll_media(draft, 42, period, date);
+        let enums::Poll::Poll(poll) = request.poll;
+        assert!(poll.public_voters && poll.open_answers && poll.hide_results_until_close);
+        assert!(!poll.quiz);
+        assert_eq!((poll.close_period, poll.close_date), (Some(60), None));
+        assert!(request.correct_answers.is_none());
     }
 
     #[test]

@@ -1217,6 +1217,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 deadline: None,
                 hide_results_until_close: false,
                 question: "Когда провести встречу?".into(),
+                open_answers: false,
                 choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
                 multiple: true,
                 ..PollDraft::default()
