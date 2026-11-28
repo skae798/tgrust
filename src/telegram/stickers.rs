@@ -335,6 +335,36 @@ pub(super) fn message_sticker(message: &TelegramMessage) -> Option<Sticker> {
     sticker_view(&sticker.document)
 }
 
+pub(super) fn video_playback(sticker: &TelegramSticker) -> Option<crate::model::PlayableMedia> {
+    let document = &sticker.document;
+    if sticker_view(document)?.kind != StickerKind::Video {
+        return None;
+    }
+    let size = document.size()? as u64;
+    if !(1..=256 * 1024).contains(&size) {
+        return None;
+    }
+    let Some(enums::Document::Document(raw)) = &document.raw.document else {
+        return None;
+    };
+    raw.attributes.iter().find_map(|attribute| {
+        let enums::DocumentAttribute::Video(video) = attribute else {
+            return None;
+        };
+        ((1..=512).contains(&video.w) && (1..=512).contains(&video.h)).then_some(
+            crate::model::PlayableMedia::Video {
+                width: video.w,
+                height: video.h,
+                size,
+                duration: (video.duration.is_finite()
+                    && video.duration > 0.0
+                    && video.duration <= 4.0)
+                    .then(|| video.duration.ceil() as u32),
+            },
+        )
+    })
+}
+
 fn sticker_view(document: &Document) -> Option<Sticker> {
     if document.raw.ttl_seconds.is_some() || document.is_spoiler() {
         return None;
@@ -479,6 +509,74 @@ mod tests {
             }
             .into(),
         )
+    }
+
+    #[test]
+    fn video_sticker_playback_requires_safe_size_dimensions_and_non_timed_media() {
+        let mut document = sample("video/webm");
+        if let Some(enums::Document::Document(raw)) = &mut document.raw.document {
+            raw.attributes.push(
+                types::DocumentAttributeVideo {
+                    round_message: false,
+                    supports_streaming: true,
+                    nosound: true,
+                    duration: 2.0,
+                    w: 512,
+                    h: 512,
+                    preload_prefix_size: None,
+                    video_start_ts: None,
+                    video_codec: Some("vp9".into()),
+                }
+                .into(),
+            );
+        }
+        let playable = |document: &Document| {
+            video_playback(&TelegramSticker::from_document(document).unwrap())
+        };
+        assert_eq!(
+            playable(&document),
+            Some(crate::model::PlayableMedia::Video {
+                width: 512,
+                height: 512,
+                duration: Some(2),
+                size: 100
+            })
+        );
+        assert!(
+            super::super::playable_media(&Media::Sticker(
+                TelegramSticker::from_document(&document).unwrap()
+            ))
+            .is_some()
+        );
+        let mut timed = document.clone();
+        timed.raw.ttl_seconds = Some(1);
+        assert!(playable(&timed).is_none());
+        timed.raw.ttl_seconds = None;
+        timed.raw.spoiler = true;
+        assert!(playable(&timed).is_none());
+        let mut oversized = document.clone();
+        if let Some(enums::Document::Document(raw)) = &mut oversized.raw.document {
+            raw.size = 256 * 1024 + 1;
+        }
+        assert!(playable(&oversized).is_none());
+        if let Some(enums::Document::Document(raw)) = &mut oversized.raw.document {
+            raw.size = 0;
+        }
+        assert!(playable(&oversized).is_none());
+        let mut dimensions = document.clone();
+        if let Some(enums::Document::Document(raw)) = &mut dimensions.raw.document
+            && let enums::DocumentAttribute::Video(video) = &mut raw.attributes[1]
+        {
+            video.w = 513;
+        }
+        assert!(playable(&dimensions).is_none());
+        for mime in ["image/webp", "application/x-tgsticker"] {
+            let mut other = document.clone();
+            if let Some(enums::Document::Document(raw)) = &mut other.raw.document {
+                raw.mime_type = mime.into();
+            }
+            assert!(playable(&other).is_none());
+        }
     }
 
     #[test]

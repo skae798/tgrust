@@ -14,7 +14,7 @@ jobs:
     container: fedora:45
     steps:
       - name: Install system dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc git gtk4-devel libadwaita-devel make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth
+        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc git gtk4-devel libadwaita-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -31,8 +31,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked
-      - name: Test GTK startup styles and QR rendering
-        run: GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored
+      - name: Test GTK and media playback
+        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored
       - name: Test patched search pagination
         run: cargo test --locked -p grammers-client --lib --no-default-features
       - name: Validate desktop entry

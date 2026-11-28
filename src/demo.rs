@@ -1404,6 +1404,17 @@ pub fn history(chat: i64) -> Vec<Message> {
         );
         sticker.timestamp = today - 10;
         messages.push(sticker);
+        let mut video = sticker_message(
+            86,
+            crate::model::Sticker {
+                favorite: false,
+                id: 3,
+                emoji: "✨".into(),
+                kind: crate::model::StickerKind::Video,
+            },
+        );
+        video.timestamp = today - 5;
+        messages.push(video);
     }
     messages
 }
@@ -1477,6 +1488,37 @@ pub async fn playback_preview(
         PlayableMedia::Voice => include_bytes!("../data/demo-voice.ogg"),
         PlayableMedia::Video { .. } => include_bytes!("../data/demo-video.webm"),
     };
+    playback_bytes(media, progress, whole, bytes).await
+}
+
+pub fn sticker_video_media() -> PlayableMedia {
+    PlayableMedia::Video {
+        width: 512,
+        height: 512,
+        duration: Some(2),
+        size: include_bytes!("../data/demo-sticker-video.webm").len() as u64,
+    }
+}
+
+pub async fn sticker_video_preview(
+    progress: tokio::sync::watch::Sender<PlaybackProgress>,
+    whole: bool,
+) -> anyhow::Result<PlaybackSource> {
+    playback_bytes(
+        sticker_video_media(),
+        progress,
+        whole,
+        include_bytes!("../data/demo-sticker-video.webm"),
+    )
+    .await
+}
+
+async fn playback_bytes(
+    media: PlayableMedia,
+    progress: tokio::sync::watch::Sender<PlaybackProgress>,
+    whole: bool,
+    bytes: &'static [u8],
+) -> anyhow::Result<PlaybackSource> {
     if !whole && media != PlayableMedia::Voice {
         let stream = crate::media_stream::StreamSource::new(bytes.len() as u64, move |index| {
             Box::pin(async move {
@@ -1571,8 +1613,12 @@ pub fn privacy_settings()
 pub fn sticker_message(id: i32, sticker: crate::model::Sticker) -> Message {
     let mut message = poll_message(id, PollDraft::default());
     message.poll = None;
-    message.attachment =
-        (sticker.kind == crate::model::StickerKind::Static).then(|| format!("sticker-{id}.webp"));
+    message.attachment = match sticker.kind {
+        crate::model::StickerKind::Static => Some(format!("sticker-{id}.webp")),
+        crate::model::StickerKind::Video => Some(format!("sticker-{id}.webm")),
+        _ => None,
+    };
+    message.playback = (sticker.kind == crate::model::StickerKind::Video).then(sticker_video_media);
     message.sticker = Some(sticker);
     message
 }

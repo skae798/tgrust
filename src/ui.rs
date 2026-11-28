@@ -4890,7 +4890,12 @@ impl Ui {
                             bubble.append(&self.poll_card(chat, item.id, poll));
                         }
                         if let Some(sticker) = &item.sticker {
-                            bubble.append(&self.sticker_card(sticker));
+                            bubble.append(&self.sticker_card(
+                                chat,
+                                item.id,
+                                sticker,
+                                item.playback,
+                            ));
                         }
                         if let Some(widget) = self.attachment_widget(chat, item, is_album) {
                             bubble.append(&widget);
@@ -5522,7 +5527,10 @@ impl Ui {
                 ),
             );
         }
-        if let Some(media) = message.playback.filter(|_| !message.ephemeral) {
+        if let Some(media) = message
+            .playback
+            .filter(|_| !message.ephemeral && message.sticker.is_none())
+        {
             add_menu_button(
                 &menu,
                 media.open_label(),
@@ -5803,10 +5811,17 @@ impl Ui {
         });
     }
 
-    fn sticker_card(self: &Rc<Self>, sticker: &crate::model::Sticker) -> gtk::Widget {
+    fn sticker_card(
+        self: &Rc<Self>,
+        chat: i64,
+        id: i32,
+        sticker: &crate::model::Sticker,
+        playback: Option<PlayableMedia>,
+    ) -> gtk::Widget {
         let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let image = gtk::Stack::new();
         image.set_size_request(160, 160);
+        image.set_tooltip_text(Some(&sticker.label()));
         let fallback = label(
             if sticker.emoji.is_empty() {
                 "✦"
@@ -5823,10 +5838,30 @@ impl Ui {
             .build();
         picture.update_property(&[gtk::accessible::Property::Label(&sticker.label())]);
         image.add_named(&picture, Some("image"));
-        body.append(&image);
-        let caption = label(&sticker.label(), "dim-label");
-        caption.set_wrap(true);
-        body.append(&caption);
+        if matches!(playback, Some(PlayableMedia::Video { .. })) {
+            let demo = self.is_demo.get();
+            let client = self.client.borrow().clone();
+            body.append(&crate::inline_sticker::build(
+                &image,
+                self.runtime.clone(),
+                Box::new(move || {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        let (progress, _) = tokio::sync::watch::channel(Default::default());
+                        if demo {
+                            demo::sticker_video_preview(progress, true).await
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .sticker_video_preview(chat, id, progress, true)
+                                .await
+                        }
+                    })
+                }),
+            ));
+        } else {
+            body.append(&image);
+        }
         self.load_chat_image(
             ChatImage::Sticker(sticker.id),
             glib::clone!(
@@ -6954,8 +6989,15 @@ impl Ui {
                         .get(&chat)
                         .and_then(|messages| messages.iter().find(|message| message.id == id))
                         .and_then(|message| message.sticker.as_ref())
-                        .filter(|sticker| sticker.kind == crate::model::StickerKind::Static)
-                        .map(|_| include_bytes!("../data/demo-sticker.webp").to_vec()),
+                        .and_then(|sticker| match sticker.kind {
+                            crate::model::StickerKind::Static => {
+                                Some(include_bytes!("../data/demo-sticker.webp").to_vec())
+                            }
+                            crate::model::StickerKind::Video => {
+                                Some(include_bytes!("../data/demo-sticker-video.webm").to_vec())
+                            }
+                            _ => None,
+                        }),
                 })
                 .flatten();
             let progress = adw::Toast::new("Загрузка вложения…");
@@ -7521,6 +7563,21 @@ mod tests {
             );
             window.set_default_size(360, 720);
             ui.show_chat(1, None);
+            let video = ui.messages.borrow()[&86].clone();
+            let menu = ui.message_menu_content(1, &video, None).unwrap();
+            let mut child = menu.first_child();
+            while let Some(button) = child {
+                let text = button
+                    .first_child()
+                    .and_downcast::<gtk::Label>()
+                    .map(|label| label.text());
+                assert_ne!(
+                    text.as_deref(),
+                    Some(video.playback.unwrap().open_label()),
+                    "Sticker menu must not open a separate video viewer"
+                );
+                child = button.next_sibling();
+            }
             ui.input
                 .buffer()
                 .set_text("Текст вместе с подготовленным файлом");

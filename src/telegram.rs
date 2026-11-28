@@ -2724,9 +2724,38 @@ impl Telegram {
         progress: watch::Sender<PlaybackProgress>,
         whole: bool,
     ) -> Result<PlaybackSource> {
+        self.playback_preview_mode(chat, id, progress, whole, false)
+            .await
+    }
+
+    pub async fn sticker_video_preview(
+        self: &Arc<Self>,
+        chat: i64,
+        id: i32,
+        progress: watch::Sender<PlaybackProgress>,
+        whole: bool,
+    ) -> Result<PlaybackSource> {
+        self.playback_preview_mode(chat, id, progress, whole, true)
+            .await
+    }
+
+    async fn playback_preview_mode(
+        self: &Arc<Self>,
+        chat: i64,
+        id: i32,
+        progress: watch::Sender<PlaybackProgress>,
+        whole: bool,
+        sticker: bool,
+    ) -> Result<PlaybackSource> {
         let peer = self.peer(chat).await?;
         let mut media = self.attachment_media(peer, id).await?;
         let kind = playable_media(&media).context("Это вложение нельзя воспроизвести")?;
+        if sticker {
+            ensure!(
+                matches!(&media, Media::Sticker(_)) && matches!(kind, PlayableMedia::Video { .. }),
+                "Видеостикер в сообщении изменился"
+            );
+        }
         let identity = attachment_id(&media);
         let expected = media.size().context("Неизвестен размер медиа")? as u64;
         if !whole && kind != PlayableMedia::Voice {
@@ -4424,6 +4453,9 @@ fn is_muted(until: i32, now: SystemTime) -> bool {
 }
 
 fn playable_media(media: &Media) -> Option<PlayableMedia> {
+    if let Media::Sticker(sticker) = media {
+        return stickers::video_playback(sticker);
+    }
     let Media::Document(document) = media else {
         return None;
     };

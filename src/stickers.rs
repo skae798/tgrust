@@ -335,13 +335,8 @@ impl Picker {
                 .content_fit(gtk::ContentFit::Contain)
                 .build();
             image.add_named(&picture, Some("image"));
-            let body = gtk::Box::new(gtk::Orientation::Vertical, 2);
-            body.append(&image);
-            let caption = gtk::Label::new(Some(&sticker.emoji));
-            caption.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            body.append(&caption);
             let button = gtk::Button::builder()
-                .child(&body)
+                .child(&image)
                 .tooltip_text(sticker.label())
                 .build();
             button.add_css_class("flat");
