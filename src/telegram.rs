@@ -4040,6 +4040,13 @@ fn validate_poll_target(draft: &PollDraft, kind: PeerKind) -> Result<()> {
 
 fn poll_vote_error(error: InvocationError) -> anyhow::Error {
     if let InvocationError::Rpc(ref rpc) = error
+        && rpc.name == "POLL_COUNTRY_RESTRICTED"
+    {
+        return anyhow::anyhow!(
+            "Страна номера вашего аккаунта не входит в список стран для этого опроса"
+        );
+    }
+    if let InvocationError::Rpc(ref rpc) = error
         && rpc.name == "POLL_MEMBER_RESTRICTED"
     {
         return anyhow::anyhow!(
@@ -4096,7 +4103,7 @@ fn poll_media(
                 .collect(),
             close_period,
             close_date,
-            countries_iso2: None,
+            countries_iso2: (!poll.countries.is_empty()).then_some(poll.countries),
             hash: 0,
         }
         .into(),
@@ -4135,6 +4142,7 @@ fn poll_definition(raw: &types::Poll) -> Poll {
         closed: raw.closed,
         public: raw.public_voters,
         subscribers_only: raw.subscribers_only,
+        countries: raw.countries_iso2.clone().unwrap_or_default(),
         multiple: raw.multiple_choice,
         quiz: raw.quiz,
         revoting_disabled: raw.revoting_disabled,
@@ -4794,6 +4802,49 @@ mod tests {
     }
 
     #[test]
+    fn country_restrictions_survive_request_and_readback_with_other_poll_options() {
+        let draft = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            countries: vec![" ua ".into(), "PL".into(), "UA".into()],
+            subscribers_only: true,
+            shuffle_answers: true,
+            quiz: Some(crate::model::PollQuizDraft {
+                correct: vec![1],
+                solution: String::new(),
+            }),
+            ..PollDraft::default()
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(draft.countries, ["PL", "UA"]);
+        assert_eq!(draft.clone().into_poll(50).countries, ["PL", "UA"]);
+        let request = poll_media(draft, 50, None, None);
+        let enums::Poll::Poll(mut raw) = request.poll;
+        assert_eq!(
+            raw.countries_iso2.as_deref(),
+            Some(["PL".into(), "UA".into()].as_slice())
+        );
+        assert!(raw.subscribers_only && raw.shuffle_answers && raw.quiz && raw.revoting_disabled);
+        assert_eq!(request.correct_answers, Some(vec![1]));
+        assert_eq!(poll_definition(&raw).countries, ["PL", "UA"]);
+        raw.countries_iso2 = Some(vec!["XX".into(), "UA".into()]);
+        assert_eq!(poll_definition(&raw).countries, ["XX", "UA"]);
+        let unrestricted = poll_media(PollDraft::default(), 51, None, None);
+        let enums::Poll::Poll(raw) = unrestricted.poll;
+        assert!(raw.countries_iso2.is_none());
+        assert!(poll_definition(&raw).countries.is_empty());
+        let refused = poll_vote_error(InvocationError::Rpc(RpcError {
+            code: 406,
+            name: "POLL_COUNTRY_RESTRICTED".into(),
+            value: None,
+            caused_by: None,
+        }))
+        .to_string();
+        assert!(refused.contains("номера вашего аккаунта") && refused.contains("не входит"));
+    }
+
+    #[test]
     fn subscriber_polls_require_channel_peers_and_preserve_the_flag_on_readback() {
         for restricted in [false, true] {
             let draft = PollDraft {
@@ -4831,11 +4882,7 @@ mod tests {
         };
         let refused = poll_vote_error(error("POLL_MEMBER_RESTRICTED", 406)).to_string();
         assert!(refused.contains("участники") && refused.contains("24 часа до публикации"));
-        for (name, code) in [
-            ("FLOOD_WAIT", 420),
-            ("MESSAGE_POLL_CLOSED", 400),
-            ("POLL_COUNTRY_RESTRICTED", 406),
-        ] {
+        for (name, code) in [("FLOOD_WAIT", 420), ("MESSAGE_POLL_CLOSED", 400)] {
             assert_eq!(
                 poll_vote_error(error(name, code)).to_string(),
                 error(name, code).to_string()

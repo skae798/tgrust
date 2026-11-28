@@ -6,6 +6,7 @@ mod chat_addresses;
 mod chat_management;
 mod contact_picker;
 mod contacts;
+mod countries;
 mod demo;
 mod devices;
 mod formatting;

@@ -2199,6 +2199,7 @@ pub struct Poll {
     pub closed: bool,
     pub public: bool,
     pub subscribers_only: bool,
+    pub countries: Vec<String>,
     pub multiple: bool,
     pub shuffle_answers: bool,
     pub quiz: bool,
@@ -2446,6 +2447,7 @@ pub struct PollDraft {
     pub revoting_disabled: bool,
     pub public: bool,
     pub subscribers_only: bool,
+    pub countries: Vec<String>,
     pub quiz: Option<PollQuizDraft>,
 }
 
@@ -2486,6 +2488,7 @@ impl PollDraft {
     }
 
     pub fn validate(self) -> anyhow::Result<Self> {
+        let countries = crate::countries::normalize(self.countries)?;
         anyhow::ensure!(
             !self.open_answers || (self.public && self.quiz.is_none()),
             "Добавление вариантов доступно в обычном публичном опросе"
@@ -2545,6 +2548,7 @@ impl PollDraft {
         }
         let revoting_disabled = self.revoting_disabled || quiz.is_some();
         Ok(Self {
+            countries,
             question,
             choices,
             quiz,
@@ -2576,6 +2580,7 @@ impl PollDraft {
             closed: false,
             public: self.public,
             subscribers_only: self.subscribers_only,
+            countries: self.countries,
             multiple: self.multiple,
             shuffle_answers: self.shuffle_answers,
             quiz: self.quiz.is_some(),
