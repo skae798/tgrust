@@ -1,4 +1,5 @@
 mod countries;
+mod photo;
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -248,8 +249,18 @@ pub fn vote(
 pub fn create(
     window: &adw::ApplicationWindow,
     options: PollCreateOptions,
+    runtime: tokio::runtime::Handle,
     send: impl Fn(PollDraft, i64) -> SendPoll + 'static,
 ) -> adw::Dialog {
+    build(window, options, runtime, send).0
+}
+
+fn build(
+    window: &adw::ApplicationWindow,
+    options: PollCreateOptions,
+    runtime: tokio::runtime::Handle,
+    send: impl Fn(PollDraft, i64) -> SendPoll + 'static,
+) -> (adw::Dialog, photo::Controls) {
     let dialog = adw::Dialog::builder()
         .title("Новый опрос")
         .content_width(430)
@@ -268,6 +279,8 @@ pub fn create(
     let quiz = adw::SwitchRow::builder().title("Викторина").build();
     question_group.add(&quiz);
     content.append(&question_group);
+    let photo = photo::Controls::append(window, &dialog, &content, runtime);
+    let exposed_photo = photo.clone();
     let answers = adw::PreferencesGroup::builder()
         .title("Варианты ответа")
         .build();
@@ -512,6 +525,14 @@ pub fn create(
                 shuffle_answers: shuffle.is_active(),
                 public: options.public_voters && public.is_active(),
                 subscribers_only: options.subscribers_only && subscribers.is_active(),
+                attached_photo: match photo.selection() {
+                    Ok(photo) => photo,
+                    Err(error) => {
+                        status.set_text(&error.to_string());
+                        status.set_visible(true);
+                        return;
+                    }
+                },
                 countries: match countries.selection() {
                     Ok(codes) => codes,
                     Err(error) => {
@@ -594,7 +615,7 @@ pub fn create(
     toolbar.add_bottom_bar(&actions);
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(window));
-    dialog
+    (dialog, exposed_photo)
 }
 
 const POLL_PERIODS: [(&str, i32); 6] = [
@@ -789,6 +810,11 @@ mod tests {
     #[ignore = "requires a graphical display"]
     fn subscriber_controls_respect_the_chat_and_explain_the_condition_before_voting() {
         gtk::test_synced(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
             let app = adw::Application::builder()
                 .application_id("io.github.skae798.tgrust.SubscriberPollTest")
                 .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
@@ -811,6 +837,7 @@ mod tests {
                         public_voters: !channel,
                         subscribers_only: channel,
                     },
+                    runtime.handle().clone(),
                     move |draft, _| {
                         result.replace(Some(draft));
                         Box::pin(async { Ok(()) })
@@ -888,8 +915,181 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn photo_editor_freezes_retries_and_cancels_replaced_or_closed_preparations() {
+        gtk::test_synced(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.PollPhotoEditorTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(720)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            settle(|| window.width() > 0);
+            let sent = Rc::new(RefCell::new(Vec::<(PollDraft, i64)>::new()));
+            let captured = sent.clone();
+            let (dialog, photo) = build(
+                &window,
+                PollCreateOptions {
+                    open_answers: true,
+                    public_voters: true,
+                    subscribers_only: true,
+                },
+                runtime.handle().clone(),
+                move |draft, id| {
+                    captured.borrow_mut().push((draft, id));
+                    Box::pin(async { anyhow::bail!("Synthetic lost response") })
+                },
+            );
+            settle(|| dialog.is_mapped());
+            for (title, text) in [
+                ("Вопрос", "Кто на фото?"),
+                ("Вариант 1", "Кот"),
+                ("Вариант 2", "Собака"),
+            ] {
+                find(&dialog, &|row: &adw::EntryRow| row.title() == title)
+                    .unwrap()
+                    .set_text(text);
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("photo.png");
+            let write = |color| {
+                image::RgbImage::from_pixel(96, 48, image::Rgb(color))
+                    .save(&path)
+                    .unwrap()
+            };
+            write([20, 100, 220]);
+            photo.load(path.clone());
+            assert!(photo.selection().is_err());
+            settle(|| photo.selection().is_ok_and(|photo| photo.is_some()));
+            let original = photo.selection().unwrap().unwrap();
+            assert!(find(&dialog, &|picture: &gtk::Picture| picture.is_visible()).is_some());
+            std::fs::write(&path, b"changed source").unwrap();
+            let submit = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Создать опрос")
+            })
+            .unwrap();
+            let send = |count| {
+                settle(|| submit.is_mapped() && submit.width() > 0);
+                assert!(submit.grab_focus());
+                assert!(gtk::prelude::WidgetExt::activate(&submit));
+                settle(|| sent.borrow().len() == count && submit.is_sensitive());
+            };
+            send(1);
+            send(2);
+            assert_eq!(sent.borrow()[0].1, sent.borrow()[1].1);
+            assert!(
+                sent.borrow()[0]
+                    .0
+                    .attached_photo
+                    .as_ref()
+                    .is_some_and(|photo| photo == &original)
+            );
+            let spoiler = find(&dialog, &|row: &adw::SwitchRow| {
+                row.title() == "Скрыть фото спойлером"
+            })
+            .unwrap();
+            spoiler.set_active(true);
+            send(3);
+            assert_ne!(sent.borrow()[1].1, sent.borrow()[2].1);
+            assert!(
+                sent.borrow()[2]
+                    .0
+                    .attached_photo
+                    .as_ref()
+                    .unwrap()
+                    .spoiler()
+            );
+            photo.load(path.clone());
+            settle(|| photo.selection().is_ok());
+            assert_eq!(
+                photo.selection().unwrap().unwrap().bytes(),
+                original.bytes()
+            );
+            assert!(
+                find(&dialog, &|row: &adw::ActionRow| row
+                    .subtitle()
+                    .is_some_and(|text| text.contains("Осталось прежнее фото")))
+                .is_some()
+            );
+            write([200, 60, 20]);
+            photo.load(path.clone());
+            settle(|| {
+                photo
+                    .selection()
+                    .is_ok_and(|photo| photo.is_some_and(|photo| photo.bytes() != original.bytes()))
+            });
+            find(&dialog, &|row: &adw::SwitchRow| row.title() == "Викторина")
+                .unwrap()
+                .set_active(true);
+            let second = find(&dialog, &|row: &adw::EntryRow| row.title() == "Вариант 2").unwrap();
+            find(&second, &|_: &gtk::CheckButton| true)
+                .unwrap()
+                .set_active(true);
+            send(4);
+            assert_ne!(sent.borrow()[2].1, sent.borrow()[3].1);
+            assert!(sent.borrow()[3].0.quiz.is_some());
+            assert!(
+                sent.borrow()[3]
+                    .0
+                    .attached_photo
+                    .as_ref()
+                    .unwrap()
+                    .spoiler()
+            );
+            let remove = find(&dialog, &|button: &gtk::Button| {
+                button.tooltip_text().as_deref() == Some("Убрать фото")
+            })
+            .unwrap();
+            assert!(remove.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&remove));
+            settle(|| photo.selection().is_ok_and(|photo| photo.is_none()));
+            send(5);
+            assert!(sent.borrow()[4].0.attached_photo.is_none());
+            photo.load(path.clone());
+            remove.emit_clicked();
+            for _ in 0..30 {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(photo.selection().unwrap().is_none());
+            photo.load(path);
+            dialog.close();
+            settle(|| window.visible_dialog().is_none() && photo.selection().is_err());
+            let (_, next) = build(
+                &window,
+                PollCreateOptions::default(),
+                runtime.handle().clone(),
+                |_, _| Box::pin(async { Ok(()) }),
+            );
+            for _ in 0..30 {
+                glib::MainContext::default().iteration(false);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(next.selection().unwrap().is_none());
+            assert!(window.width() <= 360);
+            window.close();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn quiz_editor_normalizes_choices_and_retries_without_duplicate_operations() {
         gtk::test_synced(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
             let app = adw::Application::builder()
                 .application_id("io.github.skae798.tgrust.QuizEditorTest")
                 .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
@@ -911,6 +1111,7 @@ mod tests {
                     public_voters: true,
                     subscribers_only: true,
                 },
+                runtime.handle().clone(),
                 move |draft, id| {
                     sent.borrow_mut().push((draft, id));
                     Box::pin(async { anyhow::bail!("Synthetic send interruption") })

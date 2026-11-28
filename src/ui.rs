@@ -203,6 +203,7 @@ struct Ui {
     poll_answer_limits: Cell<(usize, i32)>,
     poll_answer_refreshes: RefCell<HashMap<(i64, i32), poll_answers::AnswerRefresh>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
+    demo_poll_photos: RefCell<HashMap<(i64, i32), crate::poll_photo::Photo>>,
     media_viewer: glib::WeakRef<adw::Window>,
     inline_audio: RefCell<Option<InlineAudio>>,
     audio_cards: RefCell<HashMap<i32, crate::audio::AudioCard>>,
@@ -754,6 +755,7 @@ fn build_window(
         )),
         poll_answer_refreshes: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
+        demo_poll_photos: RefCell::new(HashMap::new()),
         media_viewer: glib::WeakRef::new(),
         inline_audio: RefCell::new(None),
         audio_cards: RefCell::new(HashMap::new()),
@@ -4005,11 +4007,7 @@ impl Ui {
                             message.preview_text().into_owned()
                         });
                         view.preview_sender = last.map(|message| message.sender.clone());
-                        view.preview_image = last.and_then(|message| {
-                            message
-                                .thumbnail
-                                .map(|media| ChatImage::attachment(chat, message.id, media))
-                        });
+                        view.preview_image = last.and_then(|message| message.preview_image(chat));
                         view.last_message_id = last.map_or(0, |message| message.id);
                     }
                     drop(histories);
@@ -5351,6 +5349,20 @@ impl Ui {
         show: impl FnOnce(&gtk::gdk::Texture) + 'static,
     ) {
         if self.is_demo.get() {
+            let selected = match image {
+                ChatImage::Attachment { chat, message, .. } => self.demo_poll_photo(chat, message),
+                _ => None,
+            };
+            if let Some(photo) = selected {
+                if let Ok(texture) =
+                    gtk::gdk::Texture::from_bytes(&glib::Bytes::from(photo.preview()))
+                    && let Some(texture) = scaled_thumbnail(&texture)
+                {
+                    show(&texture);
+                }
+                return;
+            }
+
             if matches!(image, ChatImage::Sticker(_)) {
                 show(&crate::stickers::demo_texture());
                 return;
@@ -5709,7 +5721,9 @@ impl Ui {
             );
         }
         if let Some(name) = &message.attachment
-            && (!self.is_demo.get() || demo::has_sample_attachment(chat, id))
+            && (!self.is_demo.get()
+                || demo::has_sample_attachment(chat, id)
+                || self.demo_poll_photos.borrow().contains_key(&(chat, id)))
         {
             add_menu_button(
                 &menu,
@@ -6172,6 +6186,35 @@ impl Ui {
         self.update_send_button();
     }
 
+    fn demo_poll_photo(&self, chat: i64, id: i32) -> Option<crate::poll_photo::Photo> {
+        self.demo_poll_photos.borrow().get(&(chat, id)).cloned()
+    }
+
+    fn add_demo_poll(self: &Rc<Self>, target: Conversation, draft: crate::model::PollDraft) -> i32 {
+        let id = self.next_demo_message();
+        if let Some(quiz) = draft.quiz.clone() {
+            self.demo_quizzes.borrow_mut().insert(i64::from(id), quiz);
+        }
+        let photo = draft.attached_photo.clone();
+        let mut message = Message {
+            topic: target.topic,
+            ..demo::poll_message(id, draft)
+        };
+        if let Some(photo) = photo {
+            let media = AttachmentThumbnail::Photo(i64::from(id));
+            message.attachment = Some("poll-photo.jpg".into());
+            message.photo_preview = true;
+            message.thumbnail = Some(media);
+            message.media_spoiler = photo.spoiler().then_some(media);
+            self.demo_poll_photos
+                .borrow_mut()
+                .insert((target.chat, id), photo);
+        }
+        self.add_demo_messages(target, vec![message]);
+        self.start_demo_slow_mode(target.chat);
+        id
+    }
+
     fn create_poll(self: &Rc<Self>) {
         if !self.attach.is_sensitive() || self.chat_dialog_open() {
             return;
@@ -6196,18 +6239,7 @@ impl Ui {
                     anyhow::bail!("{}", slow_mode_status(wait));
                 }
                 if ui.is_demo.get() {
-                    let id = ui.next_demo_message();
-                    if let Some(quiz) = draft.quiz.clone() {
-                        ui.demo_quizzes.borrow_mut().insert(i64::from(id), quiz);
-                    }
-                    ui.add_demo_messages(
-                        target,
-                        vec![Message {
-                            topic: target.topic,
-                            ..demo::poll_message(id, draft)
-                        }],
-                    );
-                    ui.start_demo_slow_mode(chat);
+                    ui.add_demo_poll(target, draft);
                     return Ok(());
                 }
                 let client = ui
@@ -6215,9 +6247,14 @@ impl Ui {
                     .borrow()
                     .clone()
                     .context("Нет подключения к Telegram")?;
+                let timeout = if draft.attached_photo.is_some() {
+                    120
+                } else {
+                    35
+                };
                 let task = ui.runtime.spawn(async move {
                     tokio::time::timeout(
-                        Duration::from_secs(35),
+                        Duration::from_secs(timeout),
                         client.send_poll(chat, draft, random_id, target.topic),
                     )
                     .await
@@ -6249,7 +6286,7 @@ impl Ui {
                 Ok(())
             }) as _
         };
-        let dialog = poll_dialog::create(&window, options, send);
+        let dialog = poll_dialog::create(&window, options, self.runtime.clone(), send);
         dialog.connect_closed(glib::clone!(
             #[weak(rename_to = ui)]
             self,
@@ -7007,9 +7044,7 @@ impl Ui {
                 last.displayed_sender(self.own_name.borrow().as_deref())
                     .to_owned()
             });
-            chat.preview_image = last
-                .thumbnail
-                .map(|media| ChatImage::attachment(chat.id, last.id, media));
+            chat.preview_image = last.preview_image(chat.id);
         }
         self.demo_messages
             .borrow_mut()
@@ -7266,6 +7301,7 @@ impl Ui {
     }
 
     fn apply_deletion(self: &Rc<Self>, chat: i64, id: i32) {
+        self.demo_poll_photos.borrow_mut().remove(&(chat, id));
         self.history_cache.borrow_mut().remove(chat);
         if self.is_demo.get()
             && let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
@@ -7286,11 +7322,7 @@ impl Ui {
                         .displayed_sender(self.own_name.borrow().as_deref())
                         .to_owned()
                 });
-                chat.preview_image = last.and_then(|message| {
-                    message
-                        .thumbnail
-                        .map(|media| ChatImage::attachment(chat.id, message.id, media))
-                });
+                chat.preview_image = last.and_then(|message| message.preview_image(chat.id));
             }
             self.render_chats();
         }
@@ -7440,32 +7472,37 @@ impl Ui {
             let fixture = ui
                 .is_demo
                 .get()
-                .then(|| match (chat, id) {
-                    (1, 83) => Some(demo::FILE_CONTENT.as_bytes().to_vec()),
-                    (5, 2) => Some(include_bytes!("../data/demo-video.webm").to_vec()),
-                    (1, 84) | (3, 1) | (6, 2) | (6, demo::SAMPLE_QUIZ_ID) => Some(
-                        ui.demo_image
-                            .get_or_init(demo_texture)
-                            .save_to_png_bytes()
-                            .to_vec(),
-                    ),
-                    _ => ui
-                        .demo_messages
-                        .borrow()
-                        .get(&chat)
-                        .and_then(|messages| messages.iter().find(|message| message.id == id))
-                        .and_then(|message| message.sticker.as_ref())
-                        .map(|sticker| match sticker.kind {
-                            crate::model::StickerKind::Static => {
-                                include_bytes!("../data/demo-sticker.webp").to_vec()
-                            }
-                            crate::model::StickerKind::Video => {
-                                include_bytes!("../data/demo-sticker-video.webm").to_vec()
-                            }
-                            crate::model::StickerKind::Animated => {
-                                include_bytes!("../data/demo-sticker.tgs").to_vec()
-                            }
-                        }),
+                .then(|| {
+                    if let Some(photo) = ui.demo_poll_photos.borrow().get(&(chat, id)) {
+                        return Some(photo.bytes().to_vec());
+                    }
+                    match (chat, id) {
+                        (1, 83) => Some(demo::FILE_CONTENT.as_bytes().to_vec()),
+                        (5, 2) => Some(include_bytes!("../data/demo-video.webm").to_vec()),
+                        (1, 84) | (3, 1) | (6, 2) | (6, demo::SAMPLE_QUIZ_ID) => Some(
+                            ui.demo_image
+                                .get_or_init(demo_texture)
+                                .save_to_png_bytes()
+                                .to_vec(),
+                        ),
+                        _ => ui
+                            .demo_messages
+                            .borrow()
+                            .get(&chat)
+                            .and_then(|messages| messages.iter().find(|message| message.id == id))
+                            .and_then(|message| message.sticker.as_ref())
+                            .map(|sticker| match sticker.kind {
+                                crate::model::StickerKind::Static => {
+                                    include_bytes!("../data/demo-sticker.webp").to_vec()
+                                }
+                                crate::model::StickerKind::Video => {
+                                    include_bytes!("../data/demo-sticker-video.webm").to_vec()
+                                }
+                                crate::model::StickerKind::Animated => {
+                                    include_bytes!("../data/demo-sticker.tgs").to_vec()
+                                }
+                            }),
+                    }
                 })
                 .flatten();
             let progress = adw::Toast::new("Загрузка вложения…");
@@ -7592,7 +7629,15 @@ impl Ui {
         let request = self.begin_media_preview();
         let save = self.viewer_save(chat, id, "Фотография.png");
         if self.is_demo.get() {
-            self.present_photo(self.demo_image.get_or_init(demo_texture).upcast_ref(), save);
+            let selected = self.demo_poll_photo(chat, id);
+            if let Some(photo) = selected {
+                match gtk::gdk::Texture::from_bytes(&glib::Bytes::from(photo.bytes())) {
+                    Ok(texture) => self.present_photo(&texture, save),
+                    Err(error) => self.toast(&format!("Не удалось показать фото. {error}")),
+                }
+            } else {
+                self.present_photo(self.demo_image.get_or_init(demo_texture).upcast_ref(), save);
+            }
         } else if let Some(client) = self.client.borrow().clone() {
             let progress = adw::Toast::new("Загрузка фотографии…");
             self.toasts.add_toast(progress.clone());
@@ -8059,6 +8104,55 @@ mod tests {
             settle(|| named(&spoiler_name).is_some());
             assert!(named("attachment-1").is_none());
             settle(|| (340..=360).contains(&window.width()));
+            let photo = crate::poll_photo::prepare(
+                "selected.webp".into(),
+                include_bytes!("../data/demo-sticker.webp").to_vec(),
+            )
+            .unwrap()
+            .with_spoiler(true);
+            let expected = photo.clone();
+            let target = ui.conversation().unwrap();
+            let id = ui.add_demo_poll(
+                target,
+                crate::model::PollDraft {
+                    question: "Фото из редактора".into(),
+                    choices: vec!["Да".into(), "Нет".into()],
+                    attached_photo: Some(photo),
+                    ..Default::default()
+                }
+                .validate()
+                .unwrap(),
+            );
+            assert_eq!(ui.demo_poll_photo(6, id).unwrap().bytes(), expected.bytes());
+            assert!(
+                ui.chats
+                    .borrow()
+                    .iter()
+                    .find(|chat| chat.id == 6)
+                    .unwrap()
+                    .preview_image
+                    .is_none()
+            );
+            let captured = Rc::new(RefCell::new(None));
+            let result = captured.clone();
+            ui.load_chat_image(
+                ChatImage::attachment(6, id, AttachmentThumbnail::Photo(i64::from(id))),
+                move |texture| {
+                    result.replace(Some(texture.clone()));
+                },
+            );
+            let preview =
+                gtk::gdk::Texture::from_bytes(&glib::Bytes::from(expected.preview())).unwrap();
+            let expected_preview = scaled_thumbnail(&preview).unwrap();
+            assert_eq!(
+                captured.borrow().as_ref().unwrap().save_to_png_bytes(),
+                expected_preview.save_to_png_bytes()
+            );
+            ui.show_chat(2, None);
+            ui.show_chat(6, Some(id));
+            assert_eq!(ui.demo_poll_photo(6, id).unwrap().bytes(), expected.bytes());
+            ui.apply_deletion(6, id);
+            assert!(ui.demo_poll_photo(6, id).is_none());
             window.close();
         });
     }

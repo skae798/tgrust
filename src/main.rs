@@ -27,6 +27,7 @@ mod new_chat;
 mod own_profile;
 mod playback_controls;
 mod poll_dialog;
+mod poll_photo;
 mod poll_voters;
 mod privacy;
 mod privacy_rules;

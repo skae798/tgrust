@@ -2554,11 +2554,16 @@ impl Telegram {
         let peer = self.peer(chat).await?;
         validate_poll_target(&poll, peer.id.kind())?;
         let max_seconds = self.poll_close_limit(poll.deadline.is_some()).await;
-        let (close_period, close_date) =
-            poll.close_fields(crate::model::unix_now(), max_seconds)?;
-        let media = poll_media(poll, random_id, close_period, close_date);
+        // Reject an invalid deadline before upload, then check it again afterwards.
+        poll.close_fields(crate::model::unix_now(), max_seconds)?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
+        let photo = self
+            .upload_poll_photo(peer, poll.attached_photo.as_ref())
+            .await?;
+        let (close_period, close_date) =
+            poll.close_fields(crate::model::unix_now(), max_seconds)?;
+        let media = poll_media(poll, random_id, close_period, close_date, photo);
         let message = self
             .client
             .send_message(
@@ -2645,6 +2650,43 @@ impl Telegram {
             },
             _ => None,
         })
+    }
+
+    async fn upload_poll_photo(
+        &self,
+        peer: PeerRef,
+        photo: Option<&crate::poll_photo::Photo>,
+    ) -> Result<Option<enums::InputMedia>> {
+        let Some(photo) = photo else {
+            return Ok(None);
+        };
+        let mut bytes = photo.bytes();
+        let uploaded = self
+            .client
+            .upload_stream(&mut bytes, photo.bytes().len(), "poll-photo.jpg".into())
+            .await
+            .context("Не удалось загрузить фото опроса")?;
+        let prepared = self
+            .client
+            .upload_media(
+                peer,
+                types::InputMediaUploadedPhoto {
+                    spoiler: photo.spoiler(),
+                    file: uploaded.raw,
+                    stickers: None,
+                    ttl_seconds: None,
+                    live_photo: false,
+                    video: None,
+                },
+            )
+            .await?
+            .context("Telegram не вернул фото опроса")?;
+        let Media::Photo(prepared) = prepared else {
+            anyhow::bail!("Telegram не подтвердил фото опроса");
+        };
+        let mut media = prepared.to_raw_input_media();
+        media.spoiler = photo.spoiler();
+        Ok(Some(media.into()))
     }
 
     async fn upload_file(&self, upload: Upload) -> Result<Uploaded> {
@@ -4083,6 +4125,7 @@ fn poll_media(
     random_id: i64,
     close_period: Option<i32>,
     close_date: Option<i32>,
+    attached_media: Option<enums::InputMedia>,
 ) -> types::InputMediaPoll {
     let (correct_answers, solution) = match poll.quiz {
         Some(quiz) => (
@@ -4130,7 +4173,7 @@ fn poll_media(
         }
         .into(),
         correct_answers,
-        attached_media: None,
+        attached_media,
         solution_entities: solution.as_ref().map(|_| Vec::new()),
         solution,
         solution_media: None,
@@ -4705,7 +4748,7 @@ mod tests {
             public: true,
             ..PollDraft::default()
         };
-        let media = poll_media(draft.clone().validate().unwrap(), 123, None, None);
+        let media = poll_media(draft.clone().validate().unwrap(), 123, None, None, None);
         let enums::Poll::Poll(poll) = media.poll;
         assert!(poll.public_voters && !poll.quiz && !poll.revoting_disabled);
         assert!(media.correct_answers.is_none());
@@ -4715,7 +4758,7 @@ mod tests {
             correct: vec![2],
             solution: "Среда идёт после вторника.".into(),
         });
-        let media = poll_media(draft.clone().validate().unwrap(), 123, None, None);
+        let media = poll_media(draft.clone().validate().unwrap(), 123, None, None, None);
         let enums::Poll::Poll(poll) = media.poll;
         assert_eq!(poll.id, 123);
         assert!(poll.public_voters && poll.quiz && poll.revoting_disabled);
@@ -4731,7 +4774,7 @@ mod tests {
         assert_eq!(media.solution_entities, Some(vec![]));
 
         draft.quiz.as_mut().unwrap().solution.clear();
-        let media = poll_media(draft.validate().unwrap(), 123, None, None);
+        let media = poll_media(draft.validate().unwrap(), 123, None, None, None);
         assert_eq!(media.correct_answers, Some(vec![1]));
         assert!(media.solution.is_none() && media.solution_entities.is_none());
     }
@@ -4755,7 +4798,7 @@ mod tests {
             .validate()
             .unwrap();
             let (period, date) = draft.close_fields(now, 3600).unwrap();
-            let request = poll_media(draft, 41, period, date);
+            let request = poll_media(draft, 41, period, date, None);
             let enums::Poll::Poll(poll) = request.poll;
             assert!(poll.quiz && poll.hide_results_until_close && poll.revoting_disabled);
             assert_eq!((poll.close_period, poll.close_date), (period, date));
@@ -4778,7 +4821,7 @@ mod tests {
         .validate()
         .unwrap();
         let (period, date) = draft.close_fields(1_800_000_000, 3600).unwrap();
-        let request = poll_media(draft, 42, period, date);
+        let request = poll_media(draft, 42, period, date, None);
         let enums::Poll::Poll(poll) = request.poll;
         assert!(poll.public_voters && poll.open_answers && poll.hide_results_until_close);
         assert!(!poll.quiz);
@@ -4797,7 +4840,7 @@ mod tests {
             }
             .validate()
             .unwrap();
-            let request = poll_media(draft, 43, None, None);
+            let request = poll_media(draft, 43, None, None, None);
             let enums::Poll::Poll(poll) = request.poll;
             assert!(!poll.quiz);
             assert_eq!(poll.revoting_disabled, locked);
@@ -4820,7 +4863,7 @@ mod tests {
             }
             .validate()
             .unwrap();
-            let request = poll_media(draft, 17, None, None);
+            let request = poll_media(draft, 17, None, None, None);
             let enums::Poll::Poll(poll) = request.poll;
             assert!(poll.shuffle_answers);
             let enums::PollAnswer::InputPollAnswer(first) = &poll.answers[0] else {
@@ -4849,7 +4892,7 @@ mod tests {
         .unwrap();
         assert_eq!(draft.countries, ["PL", "UA"]);
         assert_eq!(draft.clone().into_poll(50).countries, ["PL", "UA"]);
-        let request = poll_media(draft, 50, None, None);
+        let request = poll_media(draft, 50, None, None, None);
         let enums::Poll::Poll(mut raw) = request.poll;
         assert_eq!(
             raw.countries_iso2.as_deref(),
@@ -4860,7 +4903,7 @@ mod tests {
         assert_eq!(poll_definition(&raw).countries, ["PL", "UA"]);
         raw.countries_iso2 = Some(vec!["XX".into(), "UA".into()]);
         assert_eq!(poll_definition(&raw).countries, ["XX", "UA"]);
-        let unrestricted = poll_media(PollDraft::default(), 51, None, None);
+        let unrestricted = poll_media(PollDraft::default(), 51, None, None, None);
         let enums::Poll::Poll(raw) = unrestricted.poll;
         assert!(raw.countries_iso2.is_none());
         assert!(poll_definition(&raw).countries.is_empty());
@@ -4872,6 +4915,59 @@ mod tests {
         }))
         .to_string();
         assert!(refused.contains("номера вашего аккаунта") && refused.contains("не входит"));
+    }
+
+    #[test]
+    fn poll_photo_request_preserves_the_quiz_deadline_and_voter_restrictions() {
+        let photo = crate::poll_photo::prepare(
+            "photo.webp".into(),
+            include_bytes!("../data/demo-sticker.webp").to_vec(),
+        )
+        .unwrap()
+        .with_spoiler(true);
+        let draft = PollDraft {
+            question: "Что на фото?".into(),
+            choices: vec!["Кот".into(), "Собака".into()],
+            quiz: Some(crate::model::PollQuizDraft {
+                correct: vec![1],
+                solution: "Собака".into(),
+            }),
+            attached_photo: Some(photo),
+            countries: vec!["UA".into()],
+            subscribers_only: true,
+            shuffle_answers: true,
+            hide_results_until_close: true,
+            deadline: Some(crate::model::PollDeadline::After(60)),
+            ..PollDraft::default()
+        }
+        .validate()
+        .unwrap();
+        let media = types::InputMediaPhoto {
+            spoiler: true,
+            id: types::InputPhoto {
+                id: 9,
+                access_hash: 8,
+                file_reference: vec![7],
+            }
+            .into(),
+            ttl_seconds: None,
+            live_photo: false,
+            video: None,
+        };
+        let request = poll_media(draft, 53, Some(60), None, Some(media.clone().into()));
+        assert_eq!(request.attached_media, Some(media.into()));
+        assert_eq!(request.correct_answers, Some(vec![1]));
+        assert_eq!(request.solution.as_deref(), Some("Собака"));
+        let enums::Poll::Poll(raw) = request.poll;
+        assert!(
+            raw.quiz
+                && raw.revoting_disabled
+                && raw.hide_results_until_close
+                && raw.subscribers_only
+                && raw.shuffle_answers
+        );
+        assert_eq!(raw.close_period, Some(60));
+        assert_eq!(raw.countries_iso2, Some(vec!["UA".into()]));
     }
 
     #[test]
@@ -4892,7 +4988,7 @@ mod tests {
                 );
             }
             let local = draft.clone().into_poll(47);
-            let request = poll_media(draft, 47, None, None);
+            let request = poll_media(draft, 47, None, None, None);
             let enums::Poll::Poll(raw) = request.poll;
             assert_eq!(local.subscribers_only, restricted);
             assert_eq!(raw.subscribers_only, restricted);
@@ -5900,7 +5996,7 @@ mod tests {
             ..PollDraft::default()
         };
         let mut poll = types::MessageMediaPoll {
-            poll: poll_media(draft, 52, None, None).poll,
+            poll: poll_media(draft, 52, None, None, None).poll,
             results: types::PollResults {
                 min: true,
                 has_unread_votes: false,
