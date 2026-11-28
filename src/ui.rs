@@ -18,9 +18,9 @@ use crate::media_viewer::fit_viewport as photo_viewport;
 use crate::model::{
     Avatar, COMMON_REACTIONS, Chat, ChatFolder, ChatImage, Contact, FormattedText,
     HISTORY_PAGE_SIZE, HistoryCache, HistoryRevision, IncomingMessage, MAX_ALBUM_ITEMS, Message,
-    Poll, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit, TextStyle,
-    UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats, prepend_history_page,
-    redact_spoilers,
+    Poll, PollQuizDraft, PollUpdate, PollVoteCount, Reaction, ReadRequest, Reply, SearchHit,
+    TextStyle, UpdateStatus, Upload, UploadKind, merge_latest_history, order_chats,
+    prepend_history_page, redact_spoilers,
 };
 use crate::model::{
     ChatInfo, Conversation, ForumTopic, ForumWriteResult, GENERAL_TOPIC, GroupPermissionEdit,
@@ -107,6 +107,9 @@ struct Ui {
     demo_join_requests: Rc<RefCell<demo::JoinRequests>>,
     own_profile_dialog: glib::WeakRef<adw::Dialog>,
     poll_dialog: glib::WeakRef<adw::Dialog>,
+    stickers_dialog: glib::WeakRef<adw::Dialog>,
+    demo_favorite_stickers: Rc<RefCell<HashSet<i64>>>,
+    demo_sticker_packs: Rc<RefCell<demo::StickerPacks>>,
     own_name: RefCell<Option<String>>,
     own_avatar: Cell<Option<Option<Avatar>>>,
     account_label: gtk::Label,
@@ -178,8 +181,9 @@ struct Ui {
     history_revision: Cell<HistoryRevision>,
     history_refreshed: Cell<Option<Instant>>,
     demo_messages: RefCell<HashMap<i64, Vec<Message>>>,
+    demo_quizzes: RefCell<HashMap<i64, PollQuizDraft>>,
     demo_read_topics: Rc<RefCell<HashSet<Conversation>>>,
-    demo_forums: Rc<RefCell<demo::ForumTopics>>,
+    demo_forums: Rc<RefCell<HashMap<i64, demo::ForumTopics>>>,
     demo_next_message: Cell<i32>,
     drafts: RefCell<HashMap<Conversation, FormattedText>>,
     uploads: RefCell<HashMap<Conversation, Vec<Upload>>>,
@@ -205,6 +209,16 @@ pub fn open(
     api_hash: Option<String>,
     runtime: Runtime,
 ) -> adw::ApplicationWindow {
+    build_window(app, accounts, account, api_hash, runtime).0
+}
+
+fn build_window(
+    app: &adw::Application,
+    accounts: Rc<Accounts>,
+    account: Account,
+    api_hash: Option<String>,
+    runtime: Runtime,
+) -> (adw::ApplicationWindow, Rc<Ui>) {
     let demo = matches!(account, Account::Demo(_));
     let title = if matches!(account, Account::Welcome | Account::Demo(0)) {
         "tgrust".into()
@@ -435,6 +449,7 @@ pub fn open(
         .sensitive(false)
         .build();
     profile_button.add_css_class("flat");
+    profile_button.add_css_class("chat-title-button");
     profile_button.update_property(&[gtk::accessible::Property::Label("Информация о чате")]);
     pane_header.set_title_widget(Some(&profile_button));
     let archive_chat = icon_button("folder-symbolic", "Переместить в архив");
@@ -502,6 +517,7 @@ pub fn open(
     attach_menu.append(Some("Файлы"), Some("win.attach-file"));
     attach_menu.append(Some("Фотографии"), Some("win.attach-photo"));
     attach_menu.append(Some("Опрос"), Some("win.create-poll"));
+    attach_menu.append(Some("Стикеры"), Some("win.stickers"));
     attach.set_menu_model(Some(&attach_menu));
     let upload_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     upload_bar.add_css_class("composer");
@@ -631,6 +647,9 @@ pub fn open(
         demo_join_requests: Rc::new(RefCell::new(demo::JoinRequests::default())),
         own_profile_dialog: glib::WeakRef::new(),
         poll_dialog: glib::WeakRef::new(),
+        stickers_dialog: glib::WeakRef::new(),
+        demo_favorite_stickers: Rc::default(),
+        demo_sticker_packs: Rc::default(),
         own_name: RefCell::new(None),
         own_avatar: Cell::new(None),
         account_label: menu_label,
@@ -704,8 +723,9 @@ pub fn open(
         history_revision: Cell::new(HistoryRevision::default()),
         history_refreshed: Cell::new(None),
         demo_messages: RefCell::new(HashMap::new()),
+        demo_quizzes: RefCell::new(HashMap::new()),
         demo_read_topics: Rc::new(RefCell::new(HashSet::new())),
-        demo_forums: Rc::new(RefCell::new(demo::ForumTopics::default())),
+        demo_forums: Rc::new(RefCell::new(HashMap::new())),
         demo_next_message: Cell::new(200),
         drafts: RefCell::new(HashMap::new()),
         uploads: RefCell::new(HashMap::new()),
@@ -1084,6 +1104,13 @@ pub fn open(
         move |_, _| ui.create_poll()
     ));
     window.add_action(&create_poll);
+    let stickers = gtk::gio::SimpleAction::new("stickers", None);
+    stickers.connect_activate(glib::clone!(
+        #[weak]
+        ui,
+        move |_, _| ui.open_stickers()
+    ));
+    window.add_action(&stickers);
     remove_upload.connect_clicked(glib::clone!(
         #[weak]
         ui,
@@ -1219,7 +1246,7 @@ pub fn open(
     } else {
         ui.connect();
     }
-    window
+    (window, ui)
 }
 
 impl Ui {
@@ -1497,6 +1524,11 @@ impl Ui {
 
     fn start_demo(self: &Rc<Self>) {
         self.is_demo.set(true);
+        if let Some(quiz) = demo::sample_quiz().quiz {
+            self.demo_quizzes
+                .borrow_mut()
+                .insert(i64::from(demo::SAMPLE_QUIZ_ID), quiz);
+        }
         self.unread_overrides.borrow_mut().clear();
         self.reading_chats.borrow_mut().clear();
         self.client.replace(None);
@@ -1734,26 +1766,27 @@ impl Ui {
             } else {
                 match result {
                     Ok(chats) => {
-                        let previous_slow_mode = ui.selection.get().and_then(|id| {
-                            ui.chats
-                                .borrow()
-                                .iter()
-                                .find(|chat| chat.id == id)
-                                .map(|chat| chat.slow_mode_enabled)
-                        });
+                        let previous = ui.selection.get().and_then(|id| ui.chat_view(id));
                         for chat in chats.iter().filter(|chat| chat.unread == 0 || chat.muted) {
                             ui.withdraw_chat_notification(chat.id);
                         }
                         ui.chats.replace(chats);
                         if let Some(id) = ui.selection.get()
-                            && let Some(chat) = ui.chats.borrow().iter().find(|chat| chat.id == id)
+                            && let Some(chat) = ui.chat_view(id)
                         {
-                            ui.set_chat_writability(chat.can_write);
-                            if chat.slow_mode_enabled && previous_slow_mode != Some(true) {
-                                ui.refresh_slow_mode(chat.id);
-                            } else if !chat.slow_mode_enabled && previous_slow_mode == Some(true) {
+                            let previous_slow_mode =
+                                previous.as_ref().is_some_and(|old| old.slow_mode_enabled);
+                            if !chat.slow_mode_enabled && previous_slow_mode {
                                 ui.slow_mode_requests.borrow_mut().remove(&id);
                                 ui.set_slow_mode_wait(id, Duration::ZERO);
+                            }
+                            if previous.is_some_and(|old| old.forum != chat.forum) {
+                                ui.reload_forum_view(chat);
+                            } else {
+                                ui.set_chat_writability(chat.can_write);
+                                if chat.slow_mode_enabled && !previous_slow_mode {
+                                    ui.refresh_slow_mode(chat.id);
+                                }
                             }
                         }
                         ui.render_chats();
@@ -2334,6 +2367,7 @@ impl Ui {
             &self.profile_dialog,
             &self.own_profile_dialog,
             &self.poll_dialog,
+            &self.stickers_dialog,
             &self.contacts_dialog,
             &self.create_chat_dialog,
             &self.devices_dialog,
@@ -3050,6 +3084,7 @@ impl Ui {
         let edit_client = client.clone();
         let address_client = client.clone();
         let permissions_client = client.clone();
+        let forum_client = client.clone();
         let member_client = client.clone();
         let moderation_client = client.clone();
         let restriction_loader = client.clone();
@@ -3062,6 +3097,7 @@ impl Ui {
         let demo_members = self.demo_member_changes.clone();
         let demo_blocked = self.demo_blocked.clone();
         let demo_profile = self.demo_profile.clone();
+        let profile_ui = Rc::downgrade(self);
         let dialog = crate::profile::open(
             &window,
             crate::profile::ProfileContext {
@@ -3075,6 +3111,11 @@ impl Ui {
                     let group_permissions = demo_group_permissions.borrow().get(&id).copied();
                     let demo_count = demo.then(|| demo::member_count(id, &demo_members.borrow()));
                     let created = demo_created_chats.borrow().get(&id).cloned();
+                    let demo_forum = demo
+                        && profile_ui
+                            .upgrade()
+                            .and_then(|ui| ui.chat_view(id))
+                            .is_some_and(|chat| chat.forum);
                     let added = demo_members.borrow().invited_count(id);
                     Box::pin(async move {
                         if demo {
@@ -3089,6 +3130,9 @@ impl Ui {
                                 profile
                             };
                             profile.blocked = profile.blocked.map(|_| blocked);
+                            if let Some(mode) = &mut profile.forum_mode {
+                                mode.enabled = demo_forum;
+                            }
                             if let Some(addresses) = chat_addresses.or(profile.addresses.take()) {
                                 profile.usernames = addresses.active_usernames();
                                 profile.addresses = Some(addresses);
@@ -3103,6 +3147,7 @@ impl Ui {
                                 profile.group_permissions =
                                     Some(crate::model::GroupPermissionSettings {
                                         slow_mode: saved.slow_mode,
+                                        forum: demo_forum,
                                         ..demo::group_permissions(saved.allowed, public)
                                     });
                             }
@@ -3160,6 +3205,24 @@ impl Ui {
                     #[weak(rename_to = ui)]
                     self,
                     move |info| ui.apply_chat_info(id, info)
+                )),
+                set_forum_mode: Box::new(move |confirmed| {
+                    let client = forum_client.clone();
+                    Box::pin(async move {
+                        if demo {
+                            Ok(!confirmed.enabled)
+                        } else {
+                            client
+                                .context("Нет подключения к Telegram")?
+                                .set_forum_mode(id, confirmed)
+                                .await
+                        }
+                    })
+                }),
+                forum_mode_changed: Box::new(glib::clone!(
+                    #[weak(rename_to = ui)]
+                    self,
+                    move |enabled| ui.apply_forum_mode(id, enabled)
                 )),
                 edit_addresses: Box::new({
                     let demo_addresses = self.demo_chat_addresses.clone();
@@ -3583,6 +3646,48 @@ impl Ui {
         self.render_chats();
     }
 
+    fn apply_forum_mode(self: &Rc<Self>, id: i64, enabled: bool) {
+        let changed = self.chat_view(id).is_some_and(|chat| chat.forum != enabled);
+        if let Some(chat) = self
+            .chats
+            .borrow_mut()
+            .iter_mut()
+            .find(|chat| chat.id == id)
+        {
+            chat.forum = enabled;
+        }
+        if let Some(chat) = self
+            .external_chat
+            .borrow_mut()
+            .as_mut()
+            .filter(|chat| chat.id == id)
+        {
+            chat.forum = enabled;
+        }
+        self.chat_settings_revision
+            .set(self.chat_settings_revision.get().wrapping_add(1));
+        if changed {
+            if self.selection.get() == Some(id)
+                && let Some(chat) = self.chat_view(id)
+            {
+                self.reload_forum_view(chat);
+            } else {
+                self.history_cache.borrow_mut().remove(id);
+            }
+        }
+        self.render_chats();
+        self.refresh_chats();
+    }
+
+    fn reload_forum_view(self: &Rc<Self>, chat: Chat) {
+        self.history_cache.borrow_mut().remove(chat.id);
+        self.history_refreshed.set(None);
+        if let Some(picker) = self.topic_picker.upgrade() {
+            picker.close();
+        }
+        self.display_conversation(chat, None, None, self.split.shows_content());
+    }
+
     fn open_message_search(self: &Rc<Self>, scoped: bool) {
         if (!self.is_demo.get() && self.login_step.get() != LoginStep::Authorized)
             || self.chat_dialog_open()
@@ -3712,7 +3817,7 @@ impl Ui {
         };
         self.choose_forum_topic(chat, true, move |ui, topic| {
             if ui.selection.get() == Some(chat)
-                && let Some(chat) = ui.chat_view(chat)
+                && let Some(chat) = ui.chat_view(chat).filter(|view| view.forum)
             {
                 ui.show_conversation(chat, Some(topic), None);
             }
@@ -3742,7 +3847,11 @@ impl Ui {
                 write: Box::new(move |write| {
                     let client = client.clone();
                     let write = if demo {
-                        let result = demo_forums.borrow_mut().write(write);
+                        let result = demo_forums
+                            .borrow_mut()
+                            .entry(chat)
+                            .or_insert_with(|| demo::ForumTopics::for_chat(chat))
+                            .write(write);
                         return Box::pin(async move { result });
                     } else {
                         write
@@ -3767,7 +3876,11 @@ impl Ui {
             move |cursor| {
                 let client = client.clone();
                 let sample = demo.then(|| {
-                    let mut page = demo_forums.borrow().page(cursor);
+                    let mut page = demo_forums
+                        .borrow_mut()
+                        .entry(chat)
+                        .or_insert_with(|| demo::ForumTopics::for_chat(chat))
+                        .page(cursor);
                     let read = read_topics.borrow();
                     for topic in &mut page.topics {
                         if read.contains(&Conversation {
@@ -3874,7 +3987,13 @@ impl Ui {
                     .find(|message| message.id == anchor)
                     .map(|message| message.topic.unwrap_or(GENERAL_TOPIC))
             });
-            let topic = topic.and_then(|id| self.demo_forums.borrow().topic(id));
+            let topic = topic.and_then(|id| {
+                self.demo_forums
+                    .borrow_mut()
+                    .entry(chat)
+                    .or_insert_with(|| demo::ForumTopics::for_chat(chat))
+                    .topic(id)
+            });
             if let Some(topic) = topic {
                 self.show_conversation(view, Some(topic), Some(anchor));
             }
@@ -3916,14 +4035,26 @@ impl Ui {
         topic: Option<ForumTopic>,
         anchor: Option<i32>,
     ) {
+        self.display_conversation(chat, topic, anchor, true);
+    }
+
+    fn display_conversation(
+        self: &Rc<Self>,
+        chat: Chat,
+        topic: Option<ForumTopic>,
+        anchor: Option<i32>,
+        reveal: bool,
+    ) {
         let id = chat.id;
         let target = Conversation {
             chat: id,
             topic: topic.as_ref().map(|topic| topic.id),
         };
         let overview = chat.forum && topic.is_none();
+        let visible = reveal || !self.split.is_collapsed();
         let previous = self.conversation();
-        if self.is_demo.get()
+        if visible
+            && self.is_demo.get()
             && anchor.is_none()
             && let Some(topic) = &topic
             && self.demo_read_topics.borrow_mut().insert(target)
@@ -3935,7 +4066,9 @@ impl Ui {
         {
             chat.unread = (chat.unread - topic.unread).max(0);
         }
-        self.withdraw_chat_notification(id);
+        if visible {
+            self.withdraw_chat_notification(id);
+        }
         if chat.slow_mode_enabled {
             self.refresh_slow_mode(id);
         }
@@ -3961,9 +4094,12 @@ impl Ui {
                 }),
         );
         self.topics_button.set_visible(chat.forum);
-        self.split.set_show_content(true);
+        if reveal {
+            self.split.set_show_content(true);
+        }
         let client = self.client.borrow().clone();
-        if !chat.forum
+        if visible
+            && !chat.forum
             && self.unread_overrides.borrow_mut().remove(&id)
             && let Some(client) = &client
         {
@@ -3984,7 +4120,9 @@ impl Ui {
         {
             self.selected_topic.replace(topic);
             self.set_chat_writability(chat.can_write);
-            self.focus_composer();
+            if visible {
+                self.focus_composer();
+            }
             if self.is_demo.get()
                 || self.history_refreshed.get().is_some_and(|refreshed| {
                     self.history_revision
@@ -3992,9 +4130,11 @@ impl Ui {
                         .is_fresh(refreshed, revision, now)
                 })
             {
-                self.mark_cached_conversation_read(&chat, target);
+                if visible {
+                    self.mark_cached_conversation_read(&chat, target);
+                }
             } else {
-                self.load_history(None, true);
+                self.load_history(None, visible);
             }
             return;
         }
@@ -4042,7 +4182,9 @@ impl Ui {
         if overview {
             buffer.set_text("");
             self.set_chat_writability(false);
-            self.open_topics_button.grab_focus();
+            if visible {
+                self.open_topics_button.grab_focus();
+            }
             return;
         }
         if let Some(draft) = self.drafts.borrow().get(&target) {
@@ -4069,16 +4211,19 @@ impl Ui {
                 self.render_chats();
             }
             if fresh {
-                self.mark_cached_conversation_read(&chat, target);
+                if visible {
+                    self.mark_cached_conversation_read(&chat, target);
+                }
             } else {
-                self.load_history(None, true);
+                self.load_history(None, visible);
             }
         } else if self.is_demo.get() {
             let (messages, has_older, _) = self.demo_history(target, None, anchor);
             self.messages
                 .borrow_mut()
                 .extend(messages.into_iter().map(|message| (message.id, message)));
-            if !chat.forum
+            if visible
+                && !chat.forum
                 && let Some(chat) = self
                     .chats
                     .borrow_mut()
@@ -4096,9 +4241,9 @@ impl Ui {
             self.render_history(anchor.is_none());
         } else {
             self.render_history(true);
-            self.load_history(None, true);
+            self.load_history(None, visible);
         }
-        if anchor.is_none() {
+        if visible && anchor.is_none() {
             self.focus_composer();
         }
     }
@@ -4752,6 +4897,14 @@ impl Ui {
                         if let Some(poll) = &item.poll {
                             bubble.append(&self.poll_card(chat, item.id, poll));
                         }
+                        if let Some(sticker) = &item.sticker {
+                            bubble.append(&self.sticker_card(
+                                chat,
+                                item.id,
+                                sticker,
+                                item.playback,
+                            ));
+                        }
                         if let Some(widget) = self.attachment_widget(chat, item, is_album) {
                             bubble.append(&widget);
                         }
@@ -4903,6 +5056,9 @@ impl Ui {
         message: &Message,
         in_album: bool,
     ) -> Option<gtk::Widget> {
+        if message.sticker.is_some() {
+            return None;
+        }
         let id = message.id;
         let playback = message.playback.filter(|_| !message.ephemeral);
         if let Some(media @ (PlayableMedia::Audio | PlayableMedia::Voice)) = playback {
@@ -5083,6 +5239,10 @@ impl Ui {
         show: impl FnOnce(&gtk::gdk::Texture) + 'static,
     ) {
         if self.is_demo.get() {
+            if matches!(image, ChatImage::Sticker(_)) {
+                show(&crate::stickers::demo_texture());
+                return;
+            }
             if let Some((avatar, texture)) = self.demo_photo.borrow().as_ref()
                 && image == ChatImage::Avatar(*avatar)
             {
@@ -5129,7 +5289,7 @@ impl Ui {
                                 gtk::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes))
                                     .ok()?;
                             match image {
-                                ChatImage::Avatar(_) => Some(texture),
+                                ChatImage::Avatar(_) | ChatImage::Sticker(_) => Some(texture),
                                 ChatImage::Attachment { .. } => scaled_thumbnail(&texture),
                             }
                         });
@@ -5393,7 +5553,10 @@ impl Ui {
                 ),
             );
         }
-        if let Some(media) = message.playback.filter(|_| !message.ephemeral) {
+        if let Some(media) = message
+            .playback
+            .filter(|_| !message.ephemeral && message.sticker.is_none())
+        {
             add_menu_button(
                 &menu,
                 media.open_label(),
@@ -5674,6 +5837,211 @@ impl Ui {
         });
     }
 
+    fn sticker_card(
+        self: &Rc<Self>,
+        chat: i64,
+        id: i32,
+        sticker: &crate::model::Sticker,
+        playback: Option<PlayableMedia>,
+    ) -> gtk::Widget {
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let image = gtk::Stack::new();
+        image.set_size_request(160, 160);
+        image.set_tooltip_text(Some(&sticker.label()));
+        let fallback = label(
+            if sticker.emoji.is_empty() {
+                "✦"
+            } else {
+                &sticker.emoji
+            },
+            "title-1",
+        );
+        fallback.set_halign(gtk::Align::Center);
+        image.add_named(&fallback, Some("fallback"));
+        let picture = gtk::Picture::builder()
+            .can_shrink(true)
+            .content_fit(gtk::ContentFit::Contain)
+            .build();
+        picture.update_property(&[gtk::accessible::Property::Label(&sticker.label())]);
+        image.add_named(&picture, Some("image"));
+        if sticker.kind == crate::model::StickerKind::Animated
+            || matches!(playback, Some(PlayableMedia::Video { .. }))
+        {
+            let tgs = sticker.kind == crate::model::StickerKind::Animated;
+            let demo = self.is_demo.get();
+            let client = self.client.borrow().clone();
+            body.append(&crate::inline_sticker::build(
+                &image,
+                self.runtime.clone(),
+                Box::new(move || {
+                    let client = client.clone();
+                    Box::pin(async move {
+                        let (progress, _) = tokio::sync::watch::channel(Default::default());
+                        if tgs {
+                            let bytes = if demo {
+                                include_bytes!("../data/demo-sticker.tgs").to_vec()
+                            } else {
+                                client
+                                    .context("Нет подключения к Telegram")?
+                                    .sticker_tgs_preview(chat, id)
+                                    .await?
+                            };
+                            Ok(crate::model::StickerAnimationSource::Tgs(bytes))
+                        } else {
+                            let source = if demo {
+                                demo::sticker_video_preview(progress, true).await?
+                            } else {
+                                client
+                                    .context("Нет подключения к Telegram")?
+                                    .sticker_video_preview(chat, id, progress, true)
+                                    .await?
+                            };
+                            Ok(crate::model::StickerAnimationSource::Video(source))
+                        }
+                    })
+                }),
+            ));
+        } else {
+            body.append(&image);
+        }
+        self.load_chat_image(
+            ChatImage::Sticker(sticker.id),
+            glib::clone!(
+                #[weak]
+                picture,
+                #[weak]
+                image,
+                move |texture| {
+                    picture.set_paintable(Some(texture));
+                    image.set_visible_child_name("image");
+                }
+            ),
+        );
+        body.upcast()
+    }
+
+    fn open_stickers(self: &Rc<Self>) {
+        if !self.attach.is_sensitive() || self.chat_dialog_open() {
+            return;
+        }
+        let (Some(window), Some(target)) = (self.window.upgrade(), self.conversation()) else {
+            return;
+        };
+        let reply = self.replies.borrow().get(&target).cloned();
+        let weak = Rc::downgrade(self);
+        let dialog = crate::stickers::open(
+            &window,
+            crate::stickers::ContextData {
+                runtime: self.runtime.clone(),
+                client: self.client.borrow().clone(),
+                demo_favorites: self.demo_favorite_stickers.clone(),
+                demo_packs: self.demo_sticker_packs.clone(),
+                send: Box::new(move |sticker, random_id| {
+                    let weak = weak.clone();
+                    let reply = reply.clone();
+                    Box::pin(async move {
+                        let ui = weak.upgrade().context("Аккаунт закрыт")?;
+                        anyhow::ensure!(
+                            ui.conversation() == Some(target),
+                            "Чат изменился. Откройте стикеры в нужном чате заново"
+                        );
+                        anyhow::ensure!(
+                            ui.input.is_sensitive(),
+                            "Сейчас нельзя отправить сообщение в этот чат"
+                        );
+                        anyhow::ensure!(!ui.sending.get(), "Дождитесь текущей отправки");
+                        if let Some(wait) = ui.slow_mode_remaining(target.chat) {
+                            anyhow::bail!("{}", slow_mode_status(wait));
+                        }
+                        let message = if ui.is_demo.get() {
+                            demo::sticker_message(ui.next_demo_message(), sticker)
+                        } else {
+                            let client = ui
+                                .client
+                                .borrow()
+                                .clone()
+                                .context("Нет подключения к Telegram")?;
+                            ui.sending.set(true);
+                            ui.update_send_button();
+                            let reply_to = reply.as_ref().map(|reply| reply.id);
+                            let task = ui.runtime.spawn(async move {
+                                tokio::time::timeout(
+                                    Duration::from_secs(35),
+                                    client.send_sticker(target, sticker.id, reply_to, random_id),
+                                )
+                                .await
+                                .context("Telegram не подтвердил отправку вовремя")?
+                            });
+                            drop(ui);
+                            let result = task
+                                .await
+                                .map_err(anyhow::Error::from)
+                                .and_then(|result| result);
+                            let ui = weak.upgrade().context("Аккаунт закрыт")?;
+                            ui.sending.set(false);
+                            ui.update_send_button();
+                            result.map_err(|error| {
+                                ui.note_slow_mode_error(target.chat, &error)
+                                    .map(anyhow::Error::msg)
+                                    .unwrap_or(error)
+                            })?
+                        };
+                        if let Some(ui) = weak.upgrade() {
+                            ui.complete_sticker_send(target, message, reply);
+                        }
+                        Ok(())
+                    })
+                }),
+            },
+        );
+        dialog.connect_closed(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |_| {
+                ui.stickers_dialog.set(None);
+                ui.focus_composer();
+            }
+        ));
+        self.stickers_dialog.set(Some(&dialog));
+    }
+
+    fn complete_sticker_send(
+        self: &Rc<Self>,
+        target: Conversation,
+        mut message: Message,
+        reply: Option<Reply>,
+    ) {
+        if self.is_demo.get() {
+            message.topic = target.topic;
+            message.reply_to = reply.as_ref().map(|reply| reply.id);
+        }
+        if message.reply_preview.is_none()
+            && message.reply_to == reply.as_ref().map(|reply| reply.id)
+        {
+            message.reply_preview = reply.as_ref().map(|reply| reply.preview.clone());
+        }
+        if self.replies.borrow().get(&target) == reply.as_ref() {
+            self.replies.borrow_mut().remove(&target);
+        }
+        self.history_cache.borrow_mut().remove_conversation(target);
+        if self.is_demo.get() {
+            self.add_demo_messages(target, vec![message]);
+            self.start_demo_slow_mode(target.chat);
+        } else {
+            self.refresh_slow_mode_if_enabled(target.chat);
+            if self.conversation() == Some(target) {
+                if self.search_anchor.get().is_some() || !self.loaded.get() {
+                    self.reopen_conversation(None);
+                } else {
+                    self.messages.borrow_mut().insert(message.id, message);
+                    self.render_history(true);
+                }
+            }
+            self.refresh_chats();
+        }
+        self.update_send_button();
+    }
+
     fn create_poll(self: &Rc<Self>) {
         if !self.attach.is_sensitive() || self.chat_dialog_open() {
             return;
@@ -5691,11 +6059,15 @@ impl Ui {
                     anyhow::bail!("{}", slow_mode_status(wait));
                 }
                 if ui.is_demo.get() {
+                    let id = ui.next_demo_message();
+                    if let Some(quiz) = draft.quiz.clone() {
+                        ui.demo_quizzes.borrow_mut().insert(i64::from(id), quiz);
+                    }
                     ui.add_demo_messages(
                         target,
                         vec![Message {
                             topic: target.topic,
-                            ..demo::poll_message(ui.next_demo_message(), draft)
+                            ..demo::poll_message(id, draft)
                         }],
                     );
                     ui.start_demo_slow_mode(chat);
@@ -5902,6 +6274,8 @@ impl Ui {
             };
             let total = poll.total.unwrap_or(0) - i32::from(poll.has_vote())
                 + i32::from(!options.is_empty());
+            let quizzes = self.demo_quizzes.borrow();
+            let quiz = quizzes.get(&expected);
             let results = poll
                 .choices
                 .iter()
@@ -5914,7 +6288,7 @@ impl Ui {
                         option: choice.option.clone(),
                         votes: Some(votes.max(0)),
                         chosen,
-                        correct: poll.quiz && index == 0,
+                        correct: quiz.is_some_and(|quiz| quiz.correct.contains(&index)),
                     }
                 })
                 .collect();
@@ -5924,7 +6298,10 @@ impl Ui {
                 definition: None,
                 results: Some(results),
                 total: Some(total.max(0)),
-                solution: poll.quiz.then_some("Первый вариант правильный.".into()),
+                solution: quiz
+                    .map(|quiz| &quiz.solution)
+                    .filter(|solution| !solution.is_empty())
+                    .cloned(),
                 partial: false,
             });
             return;
@@ -6044,6 +6421,7 @@ impl Ui {
                 audio: None,
                 thumbnail: None,
                 poll: None,
+                sticker: None,
                 reply_to,
                 reply_preview: reply.map(|reply| reply.preview),
                 can_reply: true,
@@ -6569,6 +6947,7 @@ impl Ui {
     }
 
     fn apply_deletion(self: &Rc<Self>, chat: i64, id: i32) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.is_demo.get()
             && let Some(messages) = self.demo_messages.borrow_mut().get_mut(&chat)
         {
@@ -6635,6 +7014,7 @@ impl Ui {
     }
 
     fn apply_message_pin(self: &Rc<Self>, chat: i64, id: i32, pinned: bool) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.selection.get() != Some(chat) {
             return;
         }
@@ -6695,6 +7075,7 @@ impl Ui {
     }
 
     fn apply_reactions(self: &Rc<Self>, chat: i64, id: i32, reactions: Vec<Reaction>) {
+        self.history_cache.borrow_mut().remove(chat);
         if self.selection.get() == Some(chat) {
             if let Some(message) = self.messages.borrow_mut().get_mut(&id) {
                 message.reactions = reactions;
@@ -6749,7 +7130,23 @@ impl Ui {
                             .save_to_png_bytes()
                             .to_vec(),
                     ),
-                    _ => None,
+                    _ => ui
+                        .demo_messages
+                        .borrow()
+                        .get(&chat)
+                        .and_then(|messages| messages.iter().find(|message| message.id == id))
+                        .and_then(|message| message.sticker.as_ref())
+                        .map(|sticker| match sticker.kind {
+                            crate::model::StickerKind::Static => {
+                                include_bytes!("../data/demo-sticker.webp").to_vec()
+                            }
+                            crate::model::StickerKind::Video => {
+                                include_bytes!("../data/demo-sticker-video.webm").to_vec()
+                            }
+                            crate::model::StickerKind::Animated => {
+                                include_bytes!("../data/demo-sticker.tgs").to_vec()
+                            }
+                        }),
                 })
                 .flatten();
             let progress = adw::Toast::new("Загрузка вложения…");
@@ -7211,6 +7608,294 @@ mod tests {
             caption.select_region(2, 7);
             assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
             assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn poll_closing_confirms_safely_and_updates_its_chat_after_switching() {
+        gtk::test_synced(|| {
+            fn settle(mut ready: impl FnMut() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready() && Instant::now() < deadline {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(ready(), "Poll closing did not settle");
+            }
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.PollClosingTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            settle(|| (340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            let target = ui.conversation().unwrap();
+            ui.input.buffer().set_text("Черновик первого чата");
+            ui.add_demo_messages(target, vec![demo::poll_message(900, demo::sample_quiz())]);
+            let open = ui.messages.borrow()[&900].poll.clone().unwrap();
+            ui.close_poll(target, 900, open.id + 1);
+            assert!(!ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            ui.confirm_close_poll(target, 900, open.id);
+            let prompt = window
+                .visible_dialog()
+                .unwrap()
+                .downcast::<adw::AlertDialog>()
+                .unwrap();
+            assert_eq!(prompt.default_response().as_deref(), Some("cancel"));
+            let cancel = prompt
+                .default_widget()
+                .and_downcast::<gtk::Button>()
+                .unwrap();
+            settle(|| cancel.is_mapped());
+            assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= window.width());
+            assert!(cancel.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&cancel));
+            settle(|| window.visible_dialog().is_none());
+            assert!(!ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            ui.confirm_close_poll(target, 900, open.id);
+            let prompt = window.visible_dialog().unwrap();
+            ui.show_chat(2, None);
+            ui.input.buffer().set_text("Черновик второго чата");
+            prompt.emit_by_name::<()>("response", &[&"close"]);
+            prompt.close();
+            assert!(
+                !ui.demo_messages.borrow()[&1]
+                    .iter()
+                    .find(|message| message.id == 900)
+                    .unwrap()
+                    .poll
+                    .as_ref()
+                    .unwrap()
+                    .closed
+            );
+            let mut closed = open.clone();
+            closed.closed = true;
+            let mut update = PollUpdate {
+                id: open.id,
+                target: Some((1, 900)),
+                definition: Some(closed),
+                results: None,
+                total: None,
+                solution: None,
+                partial: false,
+            };
+            // A network completion arrives after the originating chat was cached.
+            ui.apply_poll_update(update.clone());
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик второго чата"
+            );
+            ui.show_chat(1, None);
+            assert!(ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            update.definition = Some(open);
+            ui.apply_poll_update(update);
+            assert!(ui.messages.borrow()[&900].poll.as_ref().unwrap().closed);
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик первого чата"
+            );
+            ui.add_demo_messages(target, vec![demo::poll_message(901, demo::sample_quiz())]);
+            let expected = ui.messages.borrow()[&901].poll.as_ref().unwrap().id;
+            ui.close_poll(target, 901, expected);
+            ui.close_poll(target, 901, expected);
+            assert!(ui.messages.borrow()[&901].poll.as_ref().unwrap().closed);
+            ui.show_chat(2, None);
+            ui.show_chat(1, None);
+            assert!(ui.messages.borrow()[&901].poll.as_ref().unwrap().closed);
+            window.close();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn completed_message_actions_survive_switching_away_and_back() {
+        gtk::test_synced(|| {
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.CacheTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            let context = glib::MainContext::default();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !(340..=360).contains(&window.width()) && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // X11 client-side shadows can subtract 10 px from the requested width.
+            assert!((340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            while !ui.input.is_mapped() && Instant::now() < deadline {
+                context.iteration(false);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(ui.input.grab_focus());
+            assert_eq!(
+                gtk::prelude::RootExt::focus(&window),
+                Some(ui.input.clone().upcast())
+            );
+            let id = *ui.messages.borrow().last_key_value().unwrap().0;
+            ui.input.buffer().set_text("Черновик первого чата");
+            ui.show_chat(2, None);
+            ui.input.buffer().set_text("Черновик второго чата");
+            ui.set_message_pinned(1, id, true);
+            ui.show_chat(1, None);
+            assert!(
+                ui.messages.borrow()[&id].pinned,
+                "Completed pin was lost to a cached page"
+            );
+            ui.show_chat(2, None);
+            ui.toggle_reaction(1, id, "👍".into());
+            ui.show_chat(1, None);
+            assert!(
+                ui.messages.borrow()[&id]
+                    .reactions
+                    .iter()
+                    .any(|reaction| reaction.emoji == "👍" && reaction.chosen),
+                "Completed reaction was lost to a cached page"
+            );
+            ui.show_chat(2, None);
+            ui.apply_deletion(1, id);
+            ui.show_chat(1, None);
+            assert!(
+                !ui.messages.borrow().contains_key(&id),
+                "Deleted message reappeared from a cached page"
+            );
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик первого чата"
+            );
+            ui.show_chat(2, None);
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Черновик второго чата"
+            );
+            window.close();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn sticker_completion_routes_to_its_chat_and_topic_without_consuming_the_text_draft() {
+        gtk::test_synced(|| {
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.StickerRoutingTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            ui.show_chat(1, None);
+            let video = ui.messages.borrow()[&86].clone();
+            let menu = ui.message_menu_content(1, &video, None).unwrap();
+            let mut child = menu.first_child();
+            while let Some(button) = child {
+                let text = button
+                    .first_child()
+                    .and_downcast::<gtk::Label>()
+                    .map(|label| label.text());
+                assert_ne!(
+                    text.as_deref(),
+                    Some(video.playback.unwrap().open_label()),
+                    "Sticker menu must not open a separate video viewer"
+                );
+                child = button.next_sibling();
+            }
+            ui.input
+                .buffer()
+                .set_text("Текст вместе с подготовленным файлом");
+            let upload = Upload {
+                path: "/synthetic/notes.txt".into(),
+                name: "notes.txt".into(),
+                kind: UploadKind::File,
+            };
+            ui.uploads
+                .borrow_mut()
+                .insert(1.into(), vec![upload.clone()]);
+            let reply = Reply {
+                id: 84,
+                preview: ui.messages.borrow()[&84].reply_preview(),
+            };
+            ui.replies.borrow_mut().insert(1.into(), reply.clone());
+            ui.show_chat(2, None);
+            ui.input.buffer().set_text("Другой черновик");
+            let sticker =
+                crate::stickers::demo_stickers(crate::model::StickerSource::Recent).remove(0);
+            let message = demo::sticker_message(1000, sticker.clone());
+            ui.complete_sticker_send(1.into(), message, Some(reply));
+            assert!(!ui.messages.borrow().contains_key(&1000));
+            assert_eq!(editor_text(&ui.input.buffer()).text, "Другой черновик");
+            assert_eq!(ui.uploads.borrow()[&1.into()][0].path, upload.path);
+            assert!(!ui.replies.borrow().contains_key(&1.into()));
+            ui.show_chat(1, None);
+            assert_eq!(ui.messages.borrow()[&1000].reply_to, Some(84));
+            assert_eq!(ui.messages.borrow()[&1000].sticker, Some(sticker.clone()));
+            assert_eq!(
+                editor_text(&ui.input.buffer()).text,
+                "Текст вместе с подготовленным файлом"
+            );
+            let chat = ui.chat_view(demo::FORUM_CHAT).unwrap();
+            let first = Conversation {
+                chat: chat.id,
+                topic: Some(100),
+            };
+            ui.show_conversation(
+                chat.clone(),
+                demo::ForumTopics::for_chat(demo::FORUM_CHAT).topic(100),
+                None,
+            );
+            ui.input.buffer().set_text("Черновик темы 100");
+            ui.show_conversation(
+                chat.clone(),
+                demo::ForumTopics::for_chat(demo::FORUM_CHAT).topic(200),
+                None,
+            );
+            ui.input.buffer().set_text("Черновик темы 200");
+            ui.complete_sticker_send(first, demo::sticker_message(1001, sticker), None);
+            assert!(!ui.messages.borrow().contains_key(&1001));
+            assert_eq!(editor_text(&ui.input.buffer()).text, "Черновик темы 200");
+            ui.show_conversation(
+                chat,
+                demo::ForumTopics::for_chat(demo::FORUM_CHAT).topic(100),
+                None,
+            );
+            assert_eq!(ui.messages.borrow()[&1001].topic, Some(100));
+            assert_eq!(editor_text(&ui.input.buffer()).text, "Черновик темы 100");
+            window.close();
         });
     }
 

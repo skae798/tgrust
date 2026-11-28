@@ -61,7 +61,7 @@ impl Telegram {
                     broadcast: draft.kind == NewChatKind::Channel,
                     megagroup: draft.kind == NewChatKind::Supergroup,
                     for_import: false,
-                    forum: false,
+                    forum: draft.forum,
                     title: draft.info.title.clone(),
                     about: draft.info.about.clone(),
                     geo_point: None,
@@ -321,6 +321,7 @@ fn choose_created_chat(
                 chat.creator
                     && !chat.left
                     && !chat.min
+                    && chat.forum == draft.forum
                     && ((draft.kind == NewChatKind::Channel && chat.broadcast)
                         || (draft.kind == NewChatKind::Supergroup && chat.megagroup)),
             ),
@@ -367,6 +368,7 @@ mod tests {
     fn sample_group() -> NewChatDraft {
         NewChatDraft {
             kind: NewChatKind::Group,
+            forum: false,
             info: ChatInfo {
                 title: "Группа разработки".into(),
                 about: String::new(),

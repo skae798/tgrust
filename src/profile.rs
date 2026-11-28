@@ -13,8 +13,8 @@ use crate::chat_management::{
     self, EditFuture, MemberChangeFuture, MemberFuture, MemberRestrictionsContext, MembersContext,
 };
 use crate::model::{
-    Avatar, ChatAddresses, ChatInfo, ChatKind, MemberChange, MemberFilter, MemberModeration,
-    PeerProfile,
+    Avatar, ChatAddresses, ChatInfo, ChatKind, ForumMode, MemberChange, MemberFilter,
+    MemberModeration, PeerProfile,
 };
 
 type ProfileFuture = Pin<Box<dyn Future<Output = Result<PeerProfile>> + Send>>;
@@ -30,6 +30,8 @@ pub struct ProfileContext {
     pub edit_addresses:
         Box<dyn Fn(ChatAddresses, ChatAddresses) -> crate::chat_addresses::EditAddressesFuture>,
     pub edit_group_permissions: crate::group_permissions::Save,
+    pub set_forum_mode: crate::forum_mode::Save,
+    pub forum_mode_changed: Box<dyn Fn(bool)>,
     pub chat_saved: Box<dyn Fn(ChatInfo)>,
     pub members: Box<dyn Fn(MemberFilter, i32) -> MemberFuture>,
     pub moderate: Box<dyn Fn(i64, MemberChange) -> MemberChangeFuture>,
@@ -322,6 +324,9 @@ impl ProfileDialog {
             ));
             self.body.append(&button);
         }
+        if let Some(mode) = profile.forum_mode {
+            self.forum_mode_row(mode);
+        }
         if profile.can_read_admin_log {
             let button = gtk::Button::with_label("Недавние действия");
             button.set_halign(gtk::Align::Center);
@@ -599,6 +604,61 @@ impl ProfileDialog {
         ));
         self.body.append(&button);
         self.body.append(&status);
+    }
+
+    fn forum_mode_row(self: &Rc<Self>, mode: ForumMode) {
+        let group = adw::PreferencesGroup::new();
+        let row = adw::ActionRow::builder()
+            .title("Режим тем")
+            .subtitle(if mode.enabled {
+                "Включён"
+            } else {
+                "Выключен"
+            })
+            .build();
+        if !mode.enabled && mode.linked_discussion {
+            row.set_subtitle("Группа обсуждения привязана к каналу");
+        } else {
+            let button = gtk::Button::with_label(crate::forum_mode::action(mode));
+            button.set_valign(gtk::Align::Center);
+            button.connect_clicked(glib::clone!(
+                #[weak(rename_to = state)]
+                self,
+                move |button| {
+                    let save = Rc::downgrade(&state);
+                    let complete = save.clone();
+                    crate::forum_mode::open(
+                        button,
+                        state.context.runtime.clone(),
+                        mode,
+                        move |confirmed| {
+                            if let Some(state) = save.upgrade() {
+                                (state.context.set_forum_mode)(confirmed)
+                            } else {
+                                Box::pin(async {
+                                    anyhow::bail!("Профиль чата закрыт")
+                                })
+                            }
+                        },
+                        move |saved| {
+                            if let Some(state) = complete.upgrade() {
+                                if let Some(enabled) = saved {
+                                    (state.context.forum_mode_changed)(enabled);
+                                    if let Some(dialog) = state.dialog.upgrade() {
+                                        dialog.close();
+                                    }
+                                } else {
+                                    state.load();
+                                }
+                            }
+                        },
+                    );
+                }
+            ));
+            row.add_suffix(&button);
+        }
+        group.add(&row);
+        self.body.append(&group);
     }
 }
 

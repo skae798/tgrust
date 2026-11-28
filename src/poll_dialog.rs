@@ -6,9 +6,10 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::model::{MAX_POLL_CHOICES, Poll, PollDraft};
+use crate::model::{MAX_POLL_CHOICES, Poll, PollDraft, PollQuizDraft};
 
 type SendPoll = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
+type ChoiceRows = Rc<RefCell<Vec<(adw::EntryRow, gtk::CheckButton)>>>;
 
 fn label(text: &str) -> gtk::Label {
     gtk::Label::builder()
@@ -35,6 +36,7 @@ pub fn card(poll: &Poll) -> gtk::Box {
     let kind = label(kind);
     kind.add_css_class("dim-label");
     card.append(&kind);
+    let correct_known = poll.quiz && poll.choices.iter().any(|choice| choice.correct);
     for choice in &poll.choices {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let answer = label(&choice.label);
@@ -45,12 +47,16 @@ pub fn card(poll: &Poll) -> gtk::Box {
         }
         row.append(&answer);
         if choice.chosen || choice.correct {
-            let icon = gtk::Image::from_icon_name("object-select-symbolic");
-            icon.update_property(&[gtk::accessible::Property::Label(if choice.correct {
-                "Правильный ответ"
+            let (name, description, color) = if choice.correct {
+                ("object-select-symbolic", "Правильный ответ", "success")
+            } else if correct_known {
+                ("window-close-symbolic", "Неправильный ответ", "error")
             } else {
-                "Ваш голос"
-            })]);
+                ("object-select-symbolic", "Ваш голос", "accent")
+            };
+            let icon = gtk::Image::from_icon_name(name);
+            icon.add_css_class(color);
+            icon.update_property(&[gtk::accessible::Property::Label(description)]);
             row.append(&icon);
         }
         if let Some(votes) = choice.votes {
@@ -185,38 +191,107 @@ pub fn create(
     let question = adw::EntryRow::builder().title("Вопрос").build();
     let question_group = adw::PreferencesGroup::new();
     question_group.add(&question);
+    let quiz = adw::SwitchRow::builder().title("Викторина").build();
+    question_group.add(&quiz);
     content.append(&question_group);
     let answers = adw::PreferencesGroup::builder()
         .title("Варианты ответа")
         .build();
-    let choices = Rc::new(RefCell::new(Vec::<adw::EntryRow>::new()));
-    let append = |rows: &mut Vec<adw::EntryRow>, group: &adw::PreferencesGroup| {
+    let correct_hint = label("Отметьте правильные варианты ответа");
+    correct_hint.add_css_class("dim-label");
+    quiz.bind_property("active", &correct_hint, "visible")
+        .sync_create()
+        .build();
+    content.append(&correct_hint);
+    let multiple = adw::SwitchRow::builder().title("Несколько ответов").build();
+    let choices = ChoiceRows::default();
+    let append = |rows: &ChoiceRows,
+                  quiz: &adw::SwitchRow,
+                  group: &adw::PreferencesGroup,
+                  multiple: &adw::SwitchRow| {
+        let number = rows.borrow().len() + 1;
         let row = adw::EntryRow::builder()
-            .title(format!("Вариант {}", rows.len() + 1))
+            .title(format!("Вариант {number}"))
             .build();
+        let correct = gtk::CheckButton::builder()
+            .valign(gtk::Align::Center)
+            .tooltip_text("Правильный ответ")
+            .sensitive(false)
+            .build();
+        correct.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Правильный ответ, вариант {number}"
+        ))]);
+        quiz.bind_property("active", &correct, "visible")
+            .sync_create()
+            .build();
+        row.connect_changed(glib::clone!(
+            #[weak]
+            correct,
+            move |row| {
+                let filled = !row.text().trim().is_empty();
+                if !filled {
+                    correct.set_active(false);
+                }
+                correct.set_sensitive(filled);
+            }
+        ));
+        let other_rows = Rc::downgrade(rows);
+        correct.connect_toggled(glib::clone!(
+            #[weak]
+            multiple,
+            move |checked| {
+                if checked.is_active()
+                    && !multiple.is_active()
+                    && let Some(rows) = other_rows.upgrade()
+                {
+                    for (_, other) in rows.borrow().iter().filter(|(_, other)| other != checked) {
+                        other.set_active(false);
+                    }
+                }
+            }
+        ));
+        row.add_suffix(&correct);
         group.add(&row);
-        rows.push(row.clone());
+        rows.borrow_mut().push((row.clone(), correct));
         row
     };
-    append(&mut choices.borrow_mut(), &answers);
-    append(&mut choices.borrow_mut(), &answers);
+    append(&choices, &quiz, &answers, &multiple);
+    append(&choices, &quiz, &answers, &multiple);
     content.append(&answers);
     let add = gtk::Button::with_label("Добавить вариант");
     add.set_halign(gtk::Align::Start);
     content.append(&add);
+    let settings = adw::PreferencesGroup::new();
     add.connect_clicked(glib::clone!(
         #[weak]
         answers,
+        #[weak]
+        quiz,
+        #[weak]
+        multiple,
         #[strong]
         choices,
         move |add| {
-            let mut rows = choices.borrow_mut();
-            append(&mut rows, &answers).grab_focus();
-            add.set_sensitive(rows.len() < MAX_POLL_CHOICES);
+            append(&choices, &quiz, &answers, &multiple).grab_focus();
+            add.set_sensitive(choices.borrow().len() < MAX_POLL_CHOICES);
         }
     ));
-    let settings = adw::PreferencesGroup::new();
-    let multiple = adw::SwitchRow::builder().title("Несколько ответов").build();
+    multiple.connect_active_notify(glib::clone!(
+        #[strong]
+        choices,
+        move |multiple| {
+            if !multiple.is_active() {
+                for (_, extra) in choices
+                    .borrow()
+                    .iter()
+                    .filter(|(_, correct)| correct.is_active())
+                    .skip(1)
+                {
+                    extra.set_active(false);
+                }
+            }
+        }
+    ));
     let public = adw::SwitchRow::builder()
         .title("Публичное голосование")
         .subtitle("Другие участники смогут видеть, кто за что проголосовал")
@@ -224,13 +299,51 @@ pub fn create(
     settings.add(&multiple);
     settings.add(&public);
     content.append(&settings);
+    let explanation = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    explanation.append(&label("Пояснение к ответу (необязательно)"));
+    let solution = gtk::TextView::builder()
+        .height_request(64)
+        .accepts_tab(false)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .css_classes(["card"])
+        .build();
+    solution.update_property(&[gtk::accessible::Property::Label("Пояснение к ответу")]);
+    explanation.append(&solution);
+    quiz.bind_property("active", &explanation, "visible")
+        .sync_create()
+        .build();
+    content.append(&explanation);
+    let actions = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    actions.set_margin_top(8);
+    actions.set_margin_bottom(12);
+    actions.set_margin_start(12);
+    actions.set_margin_end(12);
     let status = label("");
     status.add_css_class("dim-label");
-    content.append(&status);
+    status.set_visible(false);
+    actions.append(&status);
     let submit = gtk::Button::with_label("Создать опрос");
     submit.add_css_class("suggested-action");
     submit.set_halign(gtk::Align::End);
-    content.append(&submit);
+    actions.append(&submit);
+    quiz.connect_active_notify(glib::clone!(
+        #[weak]
+        submit,
+        #[weak]
+        dialog,
+        #[weak]
+        status,
+        move |quiz| {
+            let (title, action) = if quiz.is_active() {
+                ("Новая викторина", "Создать викторину")
+            } else {
+                ("Новый опрос", "Создать опрос")
+            };
+            dialog.set_title(title);
+            submit.set_label(action);
+            status.set_visible(false);
+        }
+    ));
     let attempt = RefCell::new(None::<(PollDraft, i64)>);
     submit.connect_clicked(glib::clone!(
         #[weak]
@@ -239,17 +352,31 @@ pub fn create(
         content,
         #[weak]
         status,
-        move |_| {
+        move |submit| {
+            let rows = choices.borrow();
             let draft = PollDraft {
                 question: question.text().into(),
-                choices: choices
-                    .borrow()
-                    .iter()
-                    .map(|choice| choice.text().into())
-                    .collect(),
+                choices: rows.iter().map(|(row, _)| row.text().into()).collect(),
                 multiple: multiple.is_active(),
                 public: public.is_active(),
+                quiz: quiz.is_active().then(|| {
+                    let buffer = solution.buffer();
+                    PollQuizDraft {
+                        correct: rows
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, (_, correct))| {
+                                correct.is_active().then_some(index)
+                            })
+                            .collect(),
+                        solution: buffer
+                            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+                            .into(),
+                    }
+                }),
             };
+            drop(rows);
+            status.set_visible(true);
             let draft = match draft.validate() {
                 Ok(draft) => draft,
                 Err(error) => {
@@ -258,6 +385,7 @@ pub fn create(
                 }
             };
             content.set_sensitive(false);
+            submit.set_sensitive(false);
             status.set_text("Отправка…");
             let random_id = {
                 let mut attempt = attempt.borrow_mut();
@@ -280,14 +408,17 @@ pub fn create(
                 content,
                 #[weak]
                 status,
+                #[weak]
+                submit,
                 async move {
                     match result.await {
                         Ok(()) => {
                             dialog.close();
                         }
                         Err(error) => {
-                            status.set_text(&format!("Не удалось отправить опрос. {error}"));
+                            status.set_text(&format!("Не удалось отправить. {error}"));
                             content.set_sensitive(true);
+                            submit.set_sensitive(true);
                         }
                     }
                 }
@@ -299,7 +430,147 @@ pub fn create(
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
     toolbar.set_content(Some(&scroll));
+    toolbar.add_bottom_bar(&actions);
     dialog.set_child(Some(&toolbar));
     dialog.present(Some(window));
     dialog
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[track_caller]
+    fn settle(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !ready() && Instant::now() < deadline {
+            glib::MainContext::default().iteration(false);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready(), "Quiz editor did not settle");
+    }
+
+    fn find<W: IsA<gtk::Widget> + Clone>(
+        root: &impl IsA<gtk::Widget>,
+        predicate: &impl Fn(&W) -> bool,
+    ) -> Option<W> {
+        if let Ok(widget) = root.as_ref().clone().downcast::<W>()
+            && predicate(&widget)
+        {
+            return Some(widget);
+        }
+        let mut child = root.as_ref().first_child();
+        while let Some(widget) = child {
+            if let Some(found) = find(&widget, predicate) {
+                return Some(found);
+            }
+            child = widget.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn quiz_editor_normalizes_choices_and_retries_without_duplicate_operations() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.QuizEditorTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(720)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            let attempts = Rc::new(RefCell::new(Vec::<(PollDraft, i64)>::new()));
+            let sent = attempts.clone();
+            let dialog = create(&window, move |draft, id| {
+                sent.borrow_mut().push((draft, id));
+                Box::pin(async { anyhow::bail!("Synthetic send interruption") })
+            });
+            settle(|| dialog.is_mapped());
+            let entry =
+                |title: &str| find(&dialog, &|row: &adw::EntryRow| row.title() == title).unwrap();
+            let switch =
+                |title: &str| find(&dialog, &|row: &adw::SwitchRow| row.title() == title).unwrap();
+            let question = entry("Вопрос");
+            question.set_text("Что видно ночью?");
+            let first = entry("Вариант 1");
+            first.set_text("Звёзды");
+            switch("Викторина").set_active(true);
+            let add = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Добавить вариант")
+            })
+            .unwrap();
+            add.emit_clicked();
+            let third = entry("Вариант 3");
+            third.set_text("Луна");
+            let correct = |row: &adw::EntryRow| find(row, &|_: &gtk::CheckButton| true).unwrap();
+            let submit = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Создать викторину")
+            })
+            .unwrap();
+            settle(|| submit.is_mapped());
+            assert!(submit.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&submit));
+            settle(|| {
+                find(&dialog, &|label: &gtk::Label| {
+                    label.is_visible() && label.text().contains("Отметьте правильный ответ")
+                })
+                .is_some()
+            });
+            assert!(attempts.borrow().is_empty());
+            correct(&third).set_active(true);
+            correct(&first).set_active(true);
+            assert!(!correct(&third).is_active());
+            correct(&third).set_active(true);
+            let solution = find(&dialog, &|_: &gtk::TextView| true).unwrap();
+            solution
+                .buffer()
+                .set_text("Луна отражает свет.\nЗвёзды светят сами.");
+            let send = |count| {
+                assert!(submit.grab_focus());
+                assert!(gtk::prelude::WidgetExt::activate(&submit));
+                settle(|| attempts.borrow().len() == count && submit.is_sensitive());
+            };
+            send(1);
+            send(2);
+            {
+                let attempts = attempts.borrow();
+                assert_eq!(attempts[0].1, attempts[1].1);
+                let draft = &attempts[0].0;
+                assert_eq!(draft.choices, ["Звёзды", "Луна"]);
+                assert_eq!(draft.quiz.as_ref().unwrap().correct, [1]);
+                assert!(draft.quiz.as_ref().unwrap().solution.contains('\n'));
+            }
+            switch("Несколько ответов").set_active(true);
+            correct(&first).set_active(true);
+            switch("Публичное голосование").set_active(true);
+            send(3);
+            {
+                let attempts = attempts.borrow();
+                assert_ne!(attempts[1].1, attempts[2].1);
+                assert_eq!(attempts[2].0.quiz.as_ref().unwrap().correct, [0, 1]);
+                assert!(attempts[2].0.multiple && attempts[2].0.public);
+            }
+            switch("Несколько ответов").set_active(false);
+            assert!(correct(&first).is_active());
+            assert!(!correct(&third).is_active());
+            first.set_text("");
+            assert!(!correct(&first).is_active());
+            assert!(!correct(&first).is_sensitive());
+            first.set_text("Звёзды");
+            switch("Викторина").set_active(false);
+            assert!(!correct(&first).is_visible());
+            send(4);
+            assert!(attempts.borrow()[3].0.quiz.is_none());
+            assert!(dialog.width() <= window.width());
+            dialog.close();
+            window.close();
+        });
+    }
 }
