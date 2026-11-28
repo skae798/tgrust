@@ -4054,7 +4054,7 @@ fn poll_media(
             multiple_choice: poll.multiple,
             quiz: correct_answers.is_some(),
             open_answers: poll.open_answers,
-            revoting_disabled: correct_answers.is_some(),
+            revoting_disabled: poll.revoting_disabled || correct_answers.is_some(),
             shuffle_answers: false,
             hide_results_until_close: poll.hide_results_until_close,
             creator: false,
@@ -4721,6 +4721,25 @@ mod tests {
         assert!(!poll.quiz);
         assert_eq!((poll.close_period, poll.close_date), (Some(60), None));
         assert!(request.correct_answers.is_none());
+    }
+
+    #[test]
+    fn ordinary_poll_request_sets_the_selected_vote_lock() {
+        for locked in [false, true] {
+            let draft = PollDraft {
+                question: "Когда?".into(),
+                choices: vec!["Сейчас".into(), "Завтра".into()],
+                revoting_disabled: locked,
+                ..PollDraft::default()
+            }
+            .validate()
+            .unwrap();
+            let request = poll_media(draft, 43, None, None);
+            let enums::Poll::Poll(poll) = request.poll;
+            assert!(!poll.quiz);
+            assert_eq!(poll.revoting_disabled, locked);
+            assert!(request.correct_answers.is_none());
+        }
     }
 
     #[test]

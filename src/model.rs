@@ -2402,6 +2402,7 @@ pub struct PollDraft {
     pub open_answers: bool,
     pub choices: Vec<String>,
     pub multiple: bool,
+    pub revoting_disabled: bool,
     pub public: bool,
     pub quiz: Option<PollQuizDraft>,
 }
@@ -2500,10 +2501,12 @@ impl PollDraft {
                 "Пояснение должно быть до 200 символов и трёх строк"
             );
         }
+        let revoting_disabled = self.revoting_disabled || quiz.is_some();
         Ok(Self {
             question,
             choices,
             quiz,
+            revoting_disabled,
             ..self
         })
     }
@@ -2532,7 +2535,7 @@ impl PollDraft {
             public: self.public,
             multiple: self.multiple,
             quiz: self.quiz.is_some(),
-            revoting_disabled: self.quiz.is_some(),
+            revoting_disabled: self.revoting_disabled || self.quiz.is_some(),
             total: None,
             solution: None,
             closes_at: None,
@@ -3888,6 +3891,25 @@ mod tests {
             Some(7),
         ));
         assert_eq!(current.into_keys().collect::<Vec<_>>(), [50, 51]);
+    }
+
+    #[test]
+    fn ordinary_poll_can_lock_the_first_vote_without_becoming_a_quiz() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: vec!["Сейчас".into(), "Завтра".into()],
+            revoting_disabled: true,
+            ..PollDraft::default()
+        }
+        .validate()
+        .unwrap()
+        .into_poll(47);
+        assert!(!poll.quiz && poll.revoting_disabled);
+        assert!(poll.accepts(&[vec![0]]));
+        poll.choices[0].chosen = true;
+        assert!(!poll.can_vote());
+        assert!(!poll.accepts(&[vec![1]]));
+        assert!(!poll.accepts(&[]));
     }
 
     #[test]

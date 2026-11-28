@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -12,6 +12,8 @@ use crate::model::{PollDeadline, unix_now};
 
 type SendPoll = Pin<Box<dyn Future<Output = anyhow::Result<()>>>>;
 type ChoiceRows = Rc<RefCell<Vec<(adw::EntryRow, gtk::CheckButton)>>>;
+
+const LOCKED_VOTE_HINT: &str = "После отправки голос нельзя изменить или отозвать";
 
 fn label(text: &str) -> gtk::Label {
     gtk::Label::builder()
@@ -50,6 +52,11 @@ pub fn card(poll: &Poll) -> gtk::Box {
     let kind = label(kind);
     kind.add_css_class("dim-label");
     card.append(&kind);
+    if poll.revoting_disabled && !poll.closed {
+        let hint = label(LOCKED_VOTE_HINT);
+        hint.add_css_class("dim-label");
+        card.append(&hint);
+    }
     let correct_known = poll.quiz && poll.choices.iter().any(|choice| choice.correct);
     for choice in &poll.choices {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -136,8 +143,14 @@ pub fn vote(
     poll: &Poll,
     submit: impl FnOnce(Vec<Vec<u8>>) + 'static,
 ) {
+    if !poll.can_vote() {
+        return;
+    }
     let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
     body.append(&label(&poll.question));
+    if poll.revoting_disabled {
+        body.append(&label(LOCKED_VOTE_HINT));
+    }
     let mut controls: Vec<(gtk::CheckButton, Vec<u8>)> = Vec::new();
     for choice in &poll.choices {
         let option = gtk::CheckButton::new();
@@ -332,8 +345,35 @@ pub fn create(
         .title("Публичное голосование")
         .subtitle("Другие участники смогут видеть, кто за что проголосовал")
         .build();
+    let vote_lock = adw::SwitchRow::builder()
+        .title("Запретить переголосование")
+        .subtitle("После отправки голос нельзя изменить или отозвать")
+        .build();
+    let ordinary_lock = Rc::new(Cell::new(false));
+    vote_lock.connect_active_notify(glib::clone!(
+        #[weak]
+        quiz,
+        #[strong]
+        ordinary_lock,
+        move |row| {
+            if !quiz.is_active() {
+                ordinary_lock.set(row.is_active());
+            }
+        }
+    ));
+    quiz.connect_active_notify(glib::clone!(
+        #[weak]
+        vote_lock,
+        #[strong]
+        ordinary_lock,
+        move |quiz| {
+            vote_lock.set_sensitive(!quiz.is_active());
+            vote_lock.set_active(quiz.is_active() || ordinary_lock.get());
+        }
+    ));
     settings.add(&multiple);
     settings.add(&public);
+    settings.add(&vote_lock);
     let timing = TimingControls::append(&settings);
     content.append(&settings);
     let open_answers = adw::SwitchRow::builder()
@@ -429,6 +469,7 @@ pub fn create(
                     && open_answers.is_active(),
                 choices: rows.iter().map(|(row, _)| row.text().into()).collect(),
                 multiple: multiple.is_active(),
+                revoting_disabled: vote_lock.is_active(),
                 public: public.is_active(),
                 quiz: quiz.is_active().then(|| {
                     let buffer = solution.buffer();
@@ -638,6 +679,65 @@ mod tests {
 
     #[test]
     #[ignore = "requires a graphical display"]
+    fn locked_vote_explains_the_choice_and_cannot_be_opened_again() {
+        gtk::test_synced(|| {
+            let app = adw::Application::builder()
+                .application_id("io.github.skae798.tgrust.VoteLockTest")
+                .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+                .build();
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let window = adw::ApplicationWindow::builder()
+                .application(&app)
+                .default_width(360)
+                .default_height(600)
+                .build();
+            window.set_content(Some(&gtk::Box::new(gtk::Orientation::Vertical, 0)));
+            window.present();
+            let mut poll = PollDraft {
+                question: "Когда?".into(),
+                choices: vec!["Сейчас".into(), "Завтра".into()],
+                revoting_disabled: true,
+                ..PollDraft::default()
+            }
+            .into_poll(48);
+            let captured = Rc::new(RefCell::new(None));
+            let result = captured.clone();
+            vote(&window, &poll, move |options| {
+                result.replace(Some(options));
+            });
+            settle(|| window.visible_dialog().is_some());
+            let dialog = window.visible_dialog().unwrap();
+            assert!(
+                find(&dialog, &|label: &gtk::Label| label.text()
+                    == LOCKED_VOTE_HINT)
+                .is_some()
+            );
+            let choice = find(&dialog, &|button: &gtk::CheckButton| {
+                button
+                    .child()
+                    .and_downcast::<gtk::Label>()
+                    .is_some_and(|label| label.text() == "Сейчас")
+            })
+            .unwrap();
+            choice.set_active(true);
+            let submit = find(&dialog, &|button: &gtk::Button| {
+                button.label().as_deref() == Some("Голосовать")
+            })
+            .unwrap();
+            settle(|| submit.is_mapped());
+            assert!(submit.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&submit));
+            settle(|| captured.borrow().is_some() && window.visible_dialog().is_none());
+            assert_eq!(captured.borrow().as_ref().unwrap(), &[vec![0]]);
+            poll.choices[0].chosen = true;
+            vote(&window, &poll, |_| panic!("Locked vote was changed"));
+            assert!(window.visible_dialog().is_none());
+            window.close();
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
     fn quiz_editor_normalizes_choices_and_retries_without_duplicate_operations() {
         gtk::test_synced(|| {
             let app = adw::Application::builder()
@@ -795,6 +895,21 @@ mod tests {
             assert!(!open.is_visible());
             send(10);
             assert!(!attempts.borrow()[9].0.open_answers);
+            let lock = switch("Запретить переголосование");
+            assert!(!lock.is_active() && lock.is_sensitive());
+            lock.set_active(true);
+            send(11);
+            assert!(attempts.borrow()[10].0.revoting_disabled);
+            switch("Викторина").set_active(true);
+            assert!(lock.is_active() && !lock.is_sensitive());
+            switch("Викторина").set_active(false);
+            assert!(lock.is_active() && lock.is_sensitive());
+            lock.set_active(false);
+            switch("Викторина").set_active(true);
+            send(12);
+            assert!(attempts.borrow()[11].0.revoting_disabled);
+            switch("Викторина").set_active(false);
+            assert!(!lock.is_active() && lock.is_sensitive());
             assert!(dialog.width() <= window.width());
             dialog.close();
             window.close();
