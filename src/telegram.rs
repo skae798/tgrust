@@ -738,6 +738,7 @@ impl Telegram {
                     thumbnail(&media).map(|media| ChatImage::attachment(id, message.id(), media))
                 }),
                 group,
+                supergroup: matches!(peer, Peer::Community(_)),
                 forum: forum_topics::is_forum(peer),
                 unread: raw.unread_count.max(0),
                 unread_mark: raw.unread_mark,
@@ -2098,6 +2099,7 @@ impl Telegram {
                     preview_sender: None,
                     preview_image: None,
                     group: matches!(peer, Peer::Group(_) | Peer::Community(_)),
+                    supergroup: matches!(peer, Peer::Community(_)),
                     forum: forum_topics::is_forum(peer),
                     unread: 0,
                     unread_mark: false,
@@ -2548,11 +2550,12 @@ impl Telegram {
         topic: Option<i32>,
     ) -> Result<Option<Message>> {
         let poll = draft.validate()?;
+        let peer = self.peer(chat).await?;
+        validate_poll_target(&poll, peer.id.kind())?;
         let max_seconds = self.poll_close_limit(poll.deadline.is_some()).await;
         let (close_period, close_date) =
             poll.close_fields(crate::model::unix_now(), max_seconds)?;
         let media = poll_media(poll, random_id, close_period, close_date);
-        let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
         let message = self
@@ -2604,7 +2607,8 @@ impl Telegram {
                 msg_id: id,
                 options,
             })
-            .await?;
+            .await
+            .map_err(poll_vote_error)?;
         let updates = match response {
             enums::Updates::Updates(updates) => updates.updates,
             enums::Updates::Combined(updates) => updates.updates,
@@ -4026,6 +4030,25 @@ fn poll_question(text: &enums::TextWithEntities) -> String {
     quote_preview(&text.text, &text.entities)
 }
 
+fn validate_poll_target(draft: &PollDraft, kind: PeerKind) -> Result<()> {
+    ensure!(
+        !draft.subscribers_only || kind == PeerKind::Channel,
+        "Опрос только для подписчиков доступен в каналах и супергруппах"
+    );
+    Ok(())
+}
+
+fn poll_vote_error(error: InvocationError) -> anyhow::Error {
+    if let InvocationError::Rpc(ref rpc) = error
+        && rpc.name == "POLL_MEMBER_RESTRICTED"
+    {
+        return anyhow::anyhow!(
+            "Голосовать могут только участники, вступившие в чат минимум за 24 часа до публикации опроса"
+        );
+    }
+    error.into()
+}
+
 fn poll_media(
     poll: PollDraft,
     random_id: i64,
@@ -4058,7 +4081,7 @@ fn poll_media(
             shuffle_answers: poll.shuffle_answers,
             hide_results_until_close: poll.hide_results_until_close,
             creator: false,
-            subscribers_only: false,
+            subscribers_only: poll.subscribers_only,
             question: text(poll.question),
             answers: poll
                 .choices
@@ -4111,6 +4134,7 @@ fn poll_definition(raw: &types::Poll) -> Poll {
             .collect(),
         closed: raw.closed,
         public: raw.public_voters,
+        subscribers_only: raw.subscribers_only,
         multiple: raw.multiple_choice,
         quiz: raw.quiz,
         revoting_disabled: raw.revoting_disabled,
@@ -4766,6 +4790,56 @@ mod tests {
             };
             assert_eq!(poll_question(&first.text), "Первый");
             assert_eq!(request.correct_answers, quiz.then(|| vec![1]));
+        }
+    }
+
+    #[test]
+    fn subscriber_polls_require_channel_peers_and_preserve_the_flag_on_readback() {
+        for restricted in [false, true] {
+            let draft = PollDraft {
+                question: "Когда?".into(),
+                choices: vec!["Сейчас".into(), "Завтра".into()],
+                subscribers_only: restricted,
+                ..PollDraft::default()
+            }
+            .validate()
+            .unwrap();
+            for kind in [PeerKind::User, PeerKind::Chat, PeerKind::Channel] {
+                assert_eq!(
+                    validate_poll_target(&draft, kind).is_ok(),
+                    !restricted || kind == PeerKind::Channel
+                );
+            }
+            let local = draft.clone().into_poll(47);
+            let request = poll_media(draft, 47, None, None);
+            let enums::Poll::Poll(raw) = request.poll;
+            assert_eq!(local.subscribers_only, restricted);
+            assert_eq!(raw.subscribers_only, restricted);
+            assert_eq!(poll_definition(&raw).subscribers_only, restricted);
+        }
+    }
+
+    #[test]
+    fn subscriber_vote_refusal_explains_membership_and_unrelated_errors_are_preserved() {
+        let error = |name: &str, code| {
+            InvocationError::Rpc(RpcError {
+                code,
+                name: name.into(),
+                value: None,
+                caused_by: None,
+            })
+        };
+        let refused = poll_vote_error(error("POLL_MEMBER_RESTRICTED", 406)).to_string();
+        assert!(refused.contains("участники") && refused.contains("24 часа до публикации"));
+        for (name, code) in [
+            ("FLOOD_WAIT", 420),
+            ("MESSAGE_POLL_CLOSED", 400),
+            ("POLL_COUNTRY_RESTRICTED", 406),
+        ] {
+            assert_eq!(
+                poll_vote_error(error(name, code)).to_string(),
+                error(name, code).to_string()
+            );
         }
     }
 

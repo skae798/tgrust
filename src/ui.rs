@@ -6125,7 +6125,10 @@ impl Ui {
         };
         let chat = target.chat;
         let weak = Rc::downgrade(self);
-        let allow_open = self.chat_view(chat).is_some_and(|chat| !chat.broadcast);
+        let options = self
+            .chat_view(chat)
+            .map(|chat| chat.poll_options())
+            .unwrap_or_default();
         let send = move |draft: crate::model::PollDraft, random_id| {
             let weak = weak.clone();
             Box::pin(async move {
@@ -6190,7 +6193,7 @@ impl Ui {
                 Ok(())
             }) as _
         };
-        let dialog = poll_dialog::create(&window, allow_open, send);
+        let dialog = poll_dialog::create(&window, options, send);
         dialog.connect_closed(glib::clone!(
             #[weak(rename_to = ui)]
             self,
