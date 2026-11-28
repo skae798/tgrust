@@ -2188,6 +2188,7 @@ pub struct Poll {
     pub closed: bool,
     pub public: bool,
     pub multiple: bool,
+    pub shuffle_answers: bool,
     pub quiz: bool,
     pub revoting_disabled: bool,
     pub total: Option<i32>,
@@ -2212,6 +2213,26 @@ pub struct PollAnswerAddition {
 }
 
 impl Poll {
+    pub fn for_viewer(&self, viewer: Option<i64>) -> Self {
+        let mut view = self.clone();
+        let Some(viewer) = viewer.filter(|id| *id > 0) else {
+            return view;
+        };
+        if !self.shuffle_answers || self.creator {
+            return view;
+        }
+        let account = (viewer as u64).to_string();
+        let poll = (self.id as u64).to_string();
+        view.choices.sort_by_cached_key(|choice| {
+            let mut hash = flate2::Crc::new();
+            hash.update(account.as_bytes());
+            hash.update(&choice.option);
+            hash.update(poll.as_bytes());
+            (hash.sum(), choice.option.clone())
+        });
+        view
+    }
+
     pub fn can_list_voters(&self) -> bool {
         self.public
             && (self.creator || self.closed || (!self.hide_results_until_close && self.has_vote()))
@@ -2402,6 +2423,7 @@ pub struct PollDraft {
     pub open_answers: bool,
     pub choices: Vec<String>,
     pub multiple: bool,
+    pub shuffle_answers: bool,
     pub revoting_disabled: bool,
     pub public: bool,
     pub quiz: Option<PollQuizDraft>,
@@ -2534,6 +2556,7 @@ impl PollDraft {
             closed: false,
             public: self.public,
             multiple: self.multiple,
+            shuffle_answers: self.shuffle_answers,
             quiz: self.quiz.is_some(),
             revoting_disabled: self.revoting_disabled || self.quiz.is_some(),
             total: None,
@@ -3891,6 +3914,74 @@ mod tests {
             Some(7),
         ));
         assert_eq!(current.into_keys().collect::<Vec<_>>(), [50, 51]);
+    }
+
+    #[test]
+    fn shuffled_answers_keep_ids_votes_and_order_across_updates() {
+        let mut poll = PollDraft {
+            question: "Когда?".into(),
+            choices: (0..5).map(|index| format!("Ответ {index}")).collect(),
+            shuffle_answers: true,
+            ..PollDraft::default()
+        }
+        .into_poll(17);
+        let ids = |poll: &Poll| {
+            poll.choices
+                .iter()
+                .map(|choice| choice.option[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&poll.for_viewer(Some(42))), [0, 1, 2, 3, 4]);
+        poll.creator = false;
+        assert_eq!(ids(&poll.for_viewer(None)), [0, 1, 2, 3, 4]);
+        assert_eq!(ids(&poll.for_viewer(Some(0))), [0, 1, 2, 3, 4]);
+        assert_eq!(ids(&poll.for_viewer(Some(42))), [4, 3, 2, 0, 1]);
+        assert_eq!(ids(&poll.for_viewer(Some(4))), [0, 1, 3, 2, 4]);
+        poll.choices.reverse();
+        assert_eq!(ids(&poll.for_viewer(Some(42))), [4, 3, 2, 0, 1]);
+        let update = PollUpdate {
+            id: 17,
+            target: None,
+            definition: None,
+            total: Some(5),
+            solution: None,
+            partial: false,
+            results: Some(vec![PollVoteCount {
+                option: vec![2],
+                votes: Some(5),
+                chosen: true,
+                correct: true,
+            }]),
+        };
+        assert!(update.apply(1, 1, &mut poll));
+        let view = poll.for_viewer(Some(42));
+        assert_eq!(ids(&view), [4, 3, 2, 0, 1]);
+        let choice = view
+            .choices
+            .iter()
+            .find(|choice| choice.option == [2])
+            .unwrap();
+        assert!(choice.chosen && choice.correct);
+        assert_eq!(choice.votes, Some(5));
+        assert_eq!(choice.label, "Ответ 2");
+        poll.choices.push(PollChoice {
+            option: vec![9],
+            label: "Новый".into(),
+            ..choice.clone()
+        });
+        let view = poll.for_viewer(Some(42));
+        assert_eq!(
+            ids(&view)
+                .into_iter()
+                .filter(|id| *id != 9)
+                .collect::<Vec<_>>(),
+            [4, 3, 2, 0, 1]
+        );
+        poll.choices.retain(|choice| choice.option != [9]);
+        poll.id = -1;
+        assert_eq!(ids(&poll.for_viewer(Some(42))), [2, 1, 3, 0, 4]);
+        poll.shuffle_answers = false;
+        assert_eq!(ids(&poll.for_viewer(Some(42))), [4, 3, 2, 1, 0]);
     }
 
     #[test]

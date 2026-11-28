@@ -49,7 +49,12 @@ pub fn card(poll: &Poll) -> gtk::Box {
         (false, false) => "Анонимный опрос",
         (false, true) => "Публичный опрос",
     };
-    let kind = label(kind);
+    let kind = if poll.shuffle_answers {
+        format!("{kind} · случайный порядок для участников")
+    } else {
+        kind.into()
+    };
+    let kind = label(&kind);
     kind.add_css_class("dim-label");
     card.append(&kind);
     if poll.revoting_disabled && !poll.closed {
@@ -374,6 +379,11 @@ pub fn create(
     settings.add(&multiple);
     settings.add(&public);
     settings.add(&vote_lock);
+    let shuffle = adw::SwitchRow::builder()
+        .title("Перемешать варианты")
+        .subtitle("Участники увидят варианты в случайном порядке")
+        .build();
+    settings.add(&shuffle);
     let timing = TimingControls::append(&settings);
     content.append(&settings);
     let open_answers = adw::SwitchRow::builder()
@@ -470,6 +480,7 @@ pub fn create(
                 choices: rows.iter().map(|(row, _)| row.text().into()).collect(),
                 multiple: multiple.is_active(),
                 revoting_disabled: vote_lock.is_active(),
+                shuffle_answers: shuffle.is_active(),
                 public: public.is_active(),
                 quiz: quiz.is_active().then(|| {
                     let buffer = solution.buffer();
@@ -910,6 +921,17 @@ mod tests {
             assert!(attempts.borrow()[11].0.revoting_disabled);
             switch("Викторина").set_active(false);
             assert!(!lock.is_active() && lock.is_sensitive());
+            let shuffle = switch("Перемешать варианты");
+            shuffle.set_active(true);
+            send(13);
+            assert!(attempts.borrow()[12].0.shuffle_answers);
+            assert!(attempts.borrow()[12].0.quiz.is_none());
+            switch("Викторина").set_active(true);
+            send(14);
+            assert!(attempts.borrow()[13].0.shuffle_answers);
+            assert!(attempts.borrow()[13].0.quiz.is_some());
+            switch("Викторина").set_active(false);
+            assert!(shuffle.is_active());
             assert!(dialog.width() <= window.width());
             dialog.close();
             window.close();
