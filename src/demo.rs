@@ -1214,6 +1214,8 @@ pub fn history(chat: i64) -> Vec<Message> {
         let mut meeting = poll_message(
             2,
             PollDraft {
+                deadline: None,
+                hide_results_until_close: false,
                 question: "Когда провести встречу?".into(),
                 choices: vec!["В понедельник".into(), "В среду".into(), "В пятницу".into()],
                 multiple: true,
@@ -1388,6 +1390,32 @@ pub fn history(chat: i64) -> Vec<Message> {
             album: None,
         })
         .collect();
+    if chat == MODERATION_GROUP
+        && let Some(sample) = messages.first()
+    {
+        let mut poll = PollDraft {
+            question: "Как назвать раздел для правил?".into(),
+            choices: vec!["Правила группы".into(), "Памятка участника".into()],
+            ..PollDraft::default()
+        }
+        .into_poll(46);
+        poll.creator = false;
+        poll.hide_results_until_close = true;
+        poll.closes_at = Some(now() + 90);
+        poll.total = Some(2);
+        for choice in &mut poll.choices {
+            choice.votes = Some(1);
+        }
+        messages.insert(
+            0,
+            Message {
+                id: 46,
+                poll: Some(poll),
+                text: String::new(),
+                ..sample.clone()
+            },
+        );
+    }
     if chat == 1 {
         let sample = messages[0].clone();
         let day = 24 * 60 * 60;
@@ -1485,13 +1513,18 @@ pub fn sample_quiz() -> PollDraft {
 }
 
 pub fn poll_message(id: i32, draft: PollDraft) -> Message {
+    let timestamp = now();
+    let (deadline, hidden) = (draft.deadline, draft.hide_results_until_close);
+    let mut poll = draft.into_poll(i64::from(id));
+    poll.closes_at = deadline.map(|deadline| deadline.closes_at(timestamp));
+    poll.hide_results_until_close = hidden;
     Message {
         id,
         topic: None,
         sender: OWN_NAME.into(),
         sender_avatar: Some(OWN_AVATAR),
         self_authored: true,
-        timestamp: now(),
+        timestamp,
         text: String::new(),
         styles: Vec::new(),
         links: Vec::new(),
@@ -1501,7 +1534,7 @@ pub fn poll_message(id: i32, draft: PollDraft) -> Message {
         playback: None,
         audio: None,
         thumbnail: None,
-        poll: Some(draft.into_poll(i64::from(id))),
+        poll: Some(poll),
         sticker: None,
         reply_to: None,
         reply_preview: None,
@@ -1539,9 +1572,7 @@ pub fn preview_pixels() -> Vec<u8> {
 }
 
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    crate::model::unix_now()
 }
 
 pub async fn playback_preview(

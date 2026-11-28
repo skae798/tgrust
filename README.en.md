@@ -22,7 +22,7 @@ In GNOME/Wayland, normal launches use Wayland, including after updates. The X11 
 
 ## Features
 
-- **Messages** — paginated history, search, replies, edits, and reactions. Polls and quizzes: creation, voting, and closing; public polls include a voter list. Completed actions survive switching chats.
+- **Messages** — paginated history, search, replies, edits, and reactions. Polls and quizzes: creation, voting, and closing; public polls include a voter list. Polls can have a deadline and hide results until closing. Completed actions survive switching chats.
 - **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers.
 - **Chats** — create groups and channels, enable and manage supergroup topics, folders, archive, GNOME notifications, member and admin management, group and individual restrictions, slow mode, invitations, public addresses, and recent actions.
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.

@@ -15,6 +15,7 @@ mod poll_management;
 mod stickers;
 pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
+mod poll_timing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2533,7 +2534,10 @@ impl Telegram {
         topic: Option<i32>,
     ) -> Result<Option<Message>> {
         let poll = draft.validate()?;
-        let media = poll_media(poll, random_id);
+        let max_seconds = self.poll_close_limit(poll.deadline.is_some()).await;
+        let (close_period, close_date) =
+            poll.close_fields(crate::model::unix_now(), max_seconds)?;
+        let media = poll_media(poll, random_id, close_period, close_date);
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
@@ -2574,7 +2578,7 @@ impl Telegram {
         let Some(Media::Poll(raw)) = message.media() else {
             bail!("Опрос больше недоступен")
         };
-        let poll = poll_view(&raw);
+        let poll = poll_timing::poll_view_at(&raw, &message);
         ensure!(
             poll.id == expected && poll.accepts(&options),
             "Этот голос больше недоступен"
@@ -2615,7 +2619,7 @@ impl Telegram {
                 Some(Media::Poll(raw)) if raw.raw.id == expected => Some(poll_results(
                     expected,
                     Some((chat, id)),
-                    Some(poll_definition(&raw.raw)),
+                    Some(poll_timing::poll_view_at(&raw, &message)),
                     &raw.raw_results,
                 )),
                 _ => None,
@@ -3900,7 +3904,7 @@ fn message_view(
     let audio = attachment.as_ref().and_then(|(media, _)| audio_info(media));
     let thumbnail = attachment.as_ref().and_then(|(media, _)| thumbnail(media));
     let poll = match message.media() {
-        Some(Media::Poll(raw)) => Some(poll_view(&raw)),
+        Some(Media::Poll(raw)) => Some(poll_timing::poll_view_at(&raw, message)),
         _ => None,
     };
     let (reply_to, reply_preview) = match &message.raw {
@@ -4008,7 +4012,12 @@ fn poll_question(text: &enums::TextWithEntities) -> String {
     quote_preview(&text.text, &text.entities)
 }
 
-fn poll_media(poll: PollDraft, random_id: i64) -> types::InputMediaPoll {
+fn poll_media(
+    poll: PollDraft,
+    random_id: i64,
+    close_period: Option<i32>,
+    close_date: Option<i32>,
+) -> types::InputMediaPoll {
     let (correct_answers, solution) = match poll.quiz {
         Some(quiz) => (
             Some(quiz.correct.into_iter().map(|index| index as i32).collect()),
@@ -4033,7 +4042,7 @@ fn poll_media(poll: PollDraft, random_id: i64) -> types::InputMediaPoll {
             open_answers: false,
             revoting_disabled: correct_answers.is_some(),
             shuffle_answers: false,
-            hide_results_until_close: false,
+            hide_results_until_close: poll.hide_results_until_close,
             creator: false,
             subscribers_only: false,
             question: text(poll.question),
@@ -4048,8 +4057,8 @@ fn poll_media(poll: PollDraft, random_id: i64) -> types::InputMediaPoll {
                     .into()
                 })
                 .collect(),
-            close_period: None,
-            close_date: None,
+            close_period,
+            close_date,
             countries_iso2: None,
             hash: 0,
         }
@@ -4084,22 +4093,14 @@ fn poll_definition(raw: &types::Poll) -> Poll {
                 })
             })
             .collect(),
-        closed: raw.closed
-            || raw.close_date.is_some_and(|date| {
-                u64::try_from(date).is_ok_and(|date| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                        >= date
-                })
-            }),
+        closed: raw.closed,
         public: raw.public_voters,
         multiple: raw.multiple_choice,
         quiz: raw.quiz,
         revoting_disabled: raw.revoting_disabled,
         total: None,
         solution: None,
+        closes_at: raw.close_date.filter(|date| *date > 0).map(i64::from),
     }
 }
 
@@ -4614,7 +4615,7 @@ mod tests {
             public: true,
             ..PollDraft::default()
         };
-        let media = poll_media(draft.clone().validate().unwrap(), 123);
+        let media = poll_media(draft.clone().validate().unwrap(), 123, None, None);
         let enums::Poll::Poll(poll) = media.poll;
         assert!(poll.public_voters && !poll.quiz && !poll.revoting_disabled);
         assert!(media.correct_answers.is_none());
@@ -4624,7 +4625,7 @@ mod tests {
             correct: vec![2],
             solution: "Среда идёт после вторника.".into(),
         });
-        let media = poll_media(draft.clone().validate().unwrap(), 123);
+        let media = poll_media(draft.clone().validate().unwrap(), 123, None, None);
         let enums::Poll::Poll(poll) = media.poll;
         assert_eq!(poll.id, 123);
         assert!(poll.public_voters && poll.quiz && poll.revoting_disabled);
@@ -4640,9 +4641,37 @@ mod tests {
         assert_eq!(media.solution_entities, Some(vec![]));
 
         draft.quiz.as_mut().unwrap().solution.clear();
-        let media = poll_media(draft.validate().unwrap(), 123);
+        let media = poll_media(draft.validate().unwrap(), 123, None, None);
         assert_eq!(media.correct_answers, Some(vec![1]));
         assert!(media.solution.is_none() && media.solution_entities.is_none());
+    }
+
+    #[test]
+    fn timed_quiz_request_preserves_deadline_hidden_results_and_correct_indices() {
+        use crate::model::{PollDeadline, PollQuizDraft};
+        let now = 1_800_000_000;
+        for deadline in [PollDeadline::After(60), PollDeadline::At(now + 120)] {
+            let draft = PollDraft {
+                question: "Когда?".into(),
+                choices: vec!["Утром".into(), "".into(), "Днём".into()],
+                quiz: Some(PollQuizDraft {
+                    correct: vec![2],
+                    solution: "После утра.".into(),
+                }),
+                deadline: Some(deadline),
+                hide_results_until_close: true,
+                ..PollDraft::default()
+            }
+            .validate()
+            .unwrap();
+            let (period, date) = draft.close_fields(now, 3600).unwrap();
+            let request = poll_media(draft, 41, period, date);
+            let enums::Poll::Poll(poll) = request.poll;
+            assert!(poll.quiz && poll.hide_results_until_close && poll.revoting_disabled);
+            assert_eq!((poll.close_period, poll.close_date), (period, date));
+            assert_eq!(request.correct_answers, Some(vec![1]));
+            assert_eq!(request.solution.as_deref(), Some("После утра."));
+        }
     }
 
     #[test]

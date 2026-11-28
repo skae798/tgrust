@@ -193,6 +193,8 @@ struct Ui {
     poll_actions: RefCell<HashSet<(i64, i32)>>,
     poll_revision: Cell<u64>,
     recent_polls: RefCell<VecDeque<(u64, PollUpdate)>>,
+    poll_deadline_source: RefCell<Option<glib::SourceId>>,
+    elapsed_polls: RefCell<HashSet<(i32, i64)>>,
     images: RefCell<HashMap<ChatImage, ImageCacheEntry>>,
     demo_image: OnceCell<gtk::gdk::MemoryTexture>,
     media_viewer: glib::WeakRef<adw::Window>,
@@ -736,6 +738,8 @@ fn build_window(
         poll_actions: RefCell::new(HashSet::new()),
         poll_revision: Cell::new(0),
         recent_polls: RefCell::new(VecDeque::new()),
+        poll_deadline_source: RefCell::new(None),
+        elapsed_polls: RefCell::new(HashSet::new()),
         images: RefCell::new(HashMap::new()),
         demo_image: OnceCell::new(),
         media_viewer: glib::WeakRef::new(),
@@ -1225,6 +1229,7 @@ fn build_window(
                 viewer.close();
             }
             ui.inline_audio.take();
+            ui.cancel_poll_deadline();
             ui.window.set(None);
             if let Some(cancel) = ui.qr_cancel.take() {
                 cancel.send_replace(true);
@@ -4078,6 +4083,10 @@ impl Ui {
         if previous != Some(target) || anchor.is_some() {
             self.inline_audio.take();
         }
+        if previous != Some(target) {
+            self.cancel_poll_deadline();
+            self.elapsed_polls.borrow_mut().clear();
+        }
         if self.chats.borrow().iter().any(|item| item.id == id) {
             let in_folder = !self.archive.is_active()
                 && self
@@ -4747,6 +4756,7 @@ impl Ui {
     }
 
     fn render_history(self: &Rc<Self>, bottom: bool) {
+        self.arm_poll_deadline();
         let position = if bottom {
             HistoryScroll::Bottom
         } else {
@@ -6078,6 +6088,9 @@ impl Ui {
             let weak = weak.clone();
             Box::pin(async move {
                 let ui = weak.upgrade().context("Аккаунт закрыт")?;
+                if ui.is_demo.get() {
+                    draft.close_fields(demo::now(), crate::model::POLL_DEFAULT_MAX_SECONDS)?;
+                }
                 if let Some(wait) = ui.slow_mode_remaining(chat) {
                     anyhow::bail!("{}", slow_mode_status(wait));
                 }
@@ -6459,6 +6472,118 @@ impl Ui {
 
     fn render_poll_change(self: &Rc<Self>) {
         self.render_history(false);
+    }
+
+    fn cancel_poll_deadline(&self) {
+        if let Some(source) = self.poll_deadline_source.take() {
+            source.remove();
+        }
+    }
+
+    fn arm_poll_deadline(self: &Rc<Self>) {
+        self.cancel_poll_deadline();
+        let Some(target) = self.conversation() else {
+            return;
+        };
+        let now = crate::model::unix_now();
+        {
+            let messages = self.messages.borrow();
+            self.elapsed_polls.borrow_mut().retain(|(id, expected)| {
+                messages
+                    .get(id)
+                    .and_then(|message| message.poll.as_ref())
+                    .is_some_and(|poll| {
+                        poll.id == *expected
+                            && !poll.closed
+                            && poll.closes_at.is_some_and(|deadline| deadline <= now)
+                    })
+            });
+        }
+        let handled = self.elapsed_polls.borrow();
+        let next = self
+            .messages
+            .borrow()
+            .iter()
+            .filter_map(|(&id, message)| {
+                let poll = message.poll.as_ref()?;
+                (!poll.closed && !handled.contains(&(id, poll.id)))
+                    .then_some(poll.closes_at)
+                    .flatten()
+            })
+            .min();
+        if let Some(next) = next {
+            let delay = next.saturating_sub(now).clamp(0, 86_400) as u64;
+            let weak = Rc::downgrade(self);
+            let source = glib::timeout_add_local_once(Duration::from_secs(delay), move || {
+                let Some(ui) = weak.upgrade() else { return };
+                ui.poll_deadline_source.take();
+                if ui.conversation() == Some(target) {
+                    ui.finish_elapsed_polls(target);
+                }
+            });
+            self.poll_deadline_source.replace(Some(source));
+        }
+    }
+
+    fn finish_elapsed_polls(self: &Rc<Self>, target: Conversation) {
+        let now = crate::model::unix_now();
+        let elapsed: Vec<_> = {
+            let mut handled = self.elapsed_polls.borrow_mut();
+            self.messages
+                .borrow()
+                .iter()
+                .filter_map(|(&id, message)| {
+                    let poll = message.poll.as_ref()?;
+                    (!poll.closed
+                        && poll.closes_at.is_some_and(|deadline| deadline <= now)
+                        && handled.insert((id, poll.id)))
+                    .then(|| (id, poll.clone()))
+                })
+                .collect()
+        };
+        if elapsed.is_empty() {
+            self.arm_poll_deadline();
+            return;
+        }
+        if self.is_demo.get() {
+            for (_, mut poll) in elapsed {
+                poll.closed = true;
+                self.apply_poll_update(PollUpdate {
+                    id: poll.id,
+                    target: None,
+                    definition: Some(poll),
+                    results: None,
+                    total: None,
+                    solution: None,
+                    partial: false,
+                });
+            }
+            return;
+        }
+        self.render_poll_change();
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
+        let expected: Vec<_> = elapsed
+            .into_iter()
+            .map(|(id, poll)| (id, poll.id))
+            .collect();
+        self.job(
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(12),
+                    client.refresh_timed_polls(target.chat, &expected),
+                )
+                .await?
+            },
+            |ui, result| {
+                if let Ok(updates) = result {
+                    for update in updates {
+                        ui.apply_poll_update(update);
+                    }
+                }
+            },
+        );
     }
 
     fn send_message(self: &Rc<Self>) {
@@ -7685,6 +7810,131 @@ mod tests {
             caption.select_region(2, 7);
             assert_eq!(message_copy_text(&bubble, 12), Some(("текст".into(), true)));
             assert_eq!(message_copy_text(&bubble, 2), None);
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn timed_poll_reveals_results_in_its_chat_and_releases_the_deadline_source() {
+        gtk::test_synced(|| {
+            fn settle(mut ready: impl FnMut() -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready() && Instant::now() < deadline {
+                    glib::MainContext::default().iteration(false);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(ready(), "Poll deadline did not settle");
+            }
+            fn texts(widget: &gtk::Widget) -> Vec<String> {
+                let mut result = Vec::new();
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    result.push(label.text().into());
+                }
+                let mut child = widget.first_child();
+                while let Some(widget) = child {
+                    result.extend(texts(&widget));
+                    child = widget.next_sibling();
+                }
+                result
+            }
+            let app = crate::application(true);
+            app.set_application_id(Some("io.github.skae798.tgrust.PollDeadlineTest"));
+            app.set_flags(gtk::gio::ApplicationFlags::NON_UNIQUE);
+            app.register(None::<&gtk::gio::Cancellable>).unwrap();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (window, ui) = build_window(
+                &app,
+                Accounts::new(&app, true),
+                Account::Demo(0),
+                None,
+                runtime,
+            );
+            window.set_default_size(360, 720);
+            settle(|| (340..=360).contains(&window.width()));
+            ui.show_chat(1, None);
+            let target = ui.conversation().unwrap();
+            ui.input.buffer().set_text("Черновик с таймером");
+            let mut draft = demo::sample_quiz();
+            draft.deadline = Some(crate::model::PollDeadline::After(3600));
+            draft.hide_results_until_close = true;
+            draft.public = true;
+            let mut message = demo::poll_message(902, draft);
+            message.can_close_poll = false;
+            message.self_authored = false;
+            message.outgoing = false;
+            message.sender = "Анна".into();
+            let poll = message.poll.as_mut().unwrap();
+            poll.creator = false;
+            poll.total = Some(2);
+            poll.choices[0].votes = Some(2);
+            poll.choices[0].correct = true;
+            poll.solution = Some("Пояснение после завершения".into());
+            let mut expired = poll.clone();
+            expired.closes_at = Some(crate::model::unix_now() - 1);
+            let hidden = texts(crate::poll_dialog::card(poll).upcast_ref());
+            assert!(
+                !hidden
+                    .iter()
+                    .any(|text| text == "2" || text.contains("Пояснение"))
+            );
+            assert!(!poll.can_list_voters());
+            ui.add_demo_messages(target, vec![message]);
+            assert!(ui.poll_deadline_source.borrow().is_some());
+            // A fresh future deadline must replace a timer already awaiting server results.
+            let mut renewed = ui.messages.borrow()[&902].poll.clone().unwrap();
+            ui.cancel_poll_deadline();
+            ui.elapsed_polls.borrow_mut().insert((902, renewed.id));
+            renewed.closes_at = Some(crate::model::unix_now() + 7200);
+            ui.apply_poll_update(PollUpdate {
+                id: renewed.id,
+                target: Some((1, 902)),
+                definition: Some(renewed),
+                results: None,
+                total: None,
+                solution: None,
+                partial: false,
+            });
+            assert!(ui.poll_deadline_source.borrow().is_some());
+            assert!(ui.elapsed_polls.borrow().is_empty());
+            ui.show_chat(2, None);
+            assert!(ui.poll_deadline_source.borrow().is_none());
+            ui.input.buffer().set_text("Другой черновик");
+            let old = PollUpdate {
+                id: expired.id,
+                target: Some((1, 902)),
+                definition: Some(expired),
+                results: None,
+                total: None,
+                solution: None,
+                partial: false,
+            };
+            ui.apply_poll_update(old.clone());
+            assert!(ui.poll_deadline_source.borrow().is_none());
+            ui.show_chat(1, None);
+            settle(|| ui.messages.borrow()[&902].poll.as_ref().unwrap().closed);
+            let closed = ui.messages.borrow()[&902].poll.clone().unwrap();
+            assert!(closed.results_visible() && closed.can_list_voters());
+            assert!(!closed.can_vote());
+            let shown = texts(crate::poll_dialog::card(&closed).upcast_ref());
+            assert!(shown.iter().any(|text| text == "2"));
+            assert!(
+                shown
+                    .iter()
+                    .any(|text| text == "Пояснение после завершения")
+            );
+            assert!(ui.poll_deadline_source.borrow().is_none());
+            ui.apply_poll_update(old);
+            assert!(ui.messages.borrow()[&902].poll.as_ref().unwrap().closed);
+            assert_eq!(editor_text(&ui.input.buffer()).text, "Черновик с таймером");
+            ui.show_chat(2, None);
+            assert_eq!(editor_text(&ui.input.buffer()).text, "Другой черновик");
+            ui.show_chat(1, None);
+            assert!(ui.messages.borrow()[&902].poll.as_ref().unwrap().closed);
+            window.close();
         });
     }
 
