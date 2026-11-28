@@ -54,7 +54,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Install build dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config mutter dbus-daemon dbus-tools mesa-dri-drivers
+        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config mutter dbus-daemon dbus-tools mesa-dri-drivers xorg-x11-server-Xvfb xorg-x11-xauth
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
