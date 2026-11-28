@@ -6,10 +6,13 @@ mod poll_voters;
 pub(crate) use desktop_notifications::NotificationFilter;
 use desktop_notifications::{PendingNotification, notification_for};
 mod forum_management;
+mod forum_mode;
 mod forum_topics;
 mod group_permissions;
 mod invite_members;
 mod member_restrictions;
+mod poll_management;
+mod stickers;
 pub use group_permissions::slow_mode_wait;
 use invite_members::invite_restricted;
 
@@ -120,6 +123,8 @@ pub struct Telegram {
     changes: watch::Sender<UpdateStatus>,
     history_changes: StdMutex<(u64, HashMap<i64, HistoryRevision>)>,
     image_downloads: Semaphore,
+    stickers: StdMutex<stickers::StickerCache>,
+    sticker_settings: Mutex<()>,
     profile: RwLock<Option<Arc<Peer>>>,
     profile_edit: Mutex<()>,
     contacts_cache: Mutex<Option<ContactSnapshot>>,
@@ -211,6 +216,8 @@ impl Telegram {
                 changes,
                 history_changes: StdMutex::default(),
                 image_downloads: Semaphore::new(4),
+                stickers: StdMutex::new(stickers::StickerCache::default()),
+                sticker_settings: Mutex::new(()),
                 profile: RwLock::new(None),
                 profile_edit: Mutex::new(()),
                 contacts_cache: Mutex::new(None),
@@ -847,6 +854,10 @@ impl Telegram {
                 }
             }
             enums::ChatFull::ChannelFull(full) => {
+                if let Some(mode) = &mut profile.forum_mode {
+                    mode.linked_discussion = full.linked_chat_id.is_some();
+                    mode.hidden_history = full.hidden_prehistory;
+                }
                 if let Some(permissions) = &mut profile.group_permissions {
                     permissions.slow_mode = Some(full.slowmode_seconds.unwrap_or_default());
                 }
@@ -2172,6 +2183,7 @@ impl Telegram {
         self_id: Option<PeerId>,
         profile: Option<&Peer>,
     ) -> Message {
+        self.remember_sticker_message(message);
         let chat_author = message_chat_author(message);
         let author = self.message_author(message, profile);
         message_view(message, self_id, profile, chat_author, author)
@@ -2521,50 +2533,7 @@ impl Telegram {
         topic: Option<i32>,
     ) -> Result<Option<Message>> {
         let poll = draft.validate()?;
-        let text = |text| {
-            types::TextWithEntities {
-                text,
-                entities: Vec::new(),
-            }
-            .into()
-        };
-        let media = types::InputMediaPoll {
-            poll: types::Poll {
-                id: random_id,
-                closed: false,
-                public_voters: poll.public,
-                multiple_choice: poll.multiple,
-                quiz: false,
-                open_answers: false,
-                revoting_disabled: false,
-                shuffle_answers: false,
-                hide_results_until_close: false,
-                creator: false,
-                subscribers_only: false,
-                question: text(poll.question),
-                answers: poll
-                    .choices
-                    .into_iter()
-                    .map(|choice| {
-                        types::InputPollAnswer {
-                            text: text(choice),
-                            media: None,
-                        }
-                        .into()
-                    })
-                    .collect(),
-                close_period: None,
-                close_date: None,
-                countries_iso2: None,
-                hash: 0,
-            }
-            .into(),
-            correct_answers: None,
-            attached_media: None,
-            solution: None,
-            solution_entities: None,
-            solution_media: None,
-        };
+        let media = poll_media(poll, random_id);
         let peer = self.peer(chat).await?;
         let self_id = self.self_id().await?;
         let profile = self.profile().await;
@@ -2714,9 +2683,38 @@ impl Telegram {
         progress: watch::Sender<PlaybackProgress>,
         whole: bool,
     ) -> Result<PlaybackSource> {
+        self.playback_preview_mode(chat, id, progress, whole, false)
+            .await
+    }
+
+    pub async fn sticker_video_preview(
+        self: &Arc<Self>,
+        chat: i64,
+        id: i32,
+        progress: watch::Sender<PlaybackProgress>,
+        whole: bool,
+    ) -> Result<PlaybackSource> {
+        self.playback_preview_mode(chat, id, progress, whole, true)
+            .await
+    }
+
+    async fn playback_preview_mode(
+        self: &Arc<Self>,
+        chat: i64,
+        id: i32,
+        progress: watch::Sender<PlaybackProgress>,
+        whole: bool,
+        sticker: bool,
+    ) -> Result<PlaybackSource> {
         let peer = self.peer(chat).await?;
         let mut media = self.attachment_media(peer, id).await?;
         let kind = playable_media(&media).context("Это вложение нельзя воспроизвести")?;
+        if sticker {
+            ensure!(
+                matches!(&media, Media::Sticker(_)) && matches!(kind, PlayableMedia::Video { .. }),
+                "Видеостикер в сообщении изменился"
+            );
+        }
         let identity = attachment_id(&media);
         let expected = media.size().context("Неизвестен размер медиа")? as u64;
         if !whole && kind != PlayableMedia::Voice {
@@ -2875,6 +2873,7 @@ impl Telegram {
 
     async fn fetch_chat_image(&self, image: ChatImage) -> Result<Vec<u8>> {
         match image {
+            ChatImage::Sticker(id) => self.sticker_image(id).await,
             ChatImage::Avatar(avatar) => {
                 let id = PeerId::from_bot_api_dialog_id(avatar.peer).context("Чат не найден")?;
                 let cached = self.peers.read().await.get(&avatar.peer).copied();
@@ -3136,6 +3135,7 @@ fn attachment_id(media: &Media) -> Option<AttachmentThumbnail> {
     match media {
         Media::Photo(photo) => Some(AttachmentThumbnail::Photo(photo.id())),
         Media::Document(document) => Some(AttachmentThumbnail::Document(document.id())),
+        Media::Sticker(sticker) => Some(AttachmentThumbnail::Document(sticker.document.id())),
         _ => None,
     }
 }
@@ -3541,6 +3541,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         can_read_admin_log: false,
         addresses: None,
         group_permissions: group_permissions::group_permissions(peer).map(|(settings, _)| settings),
+        forum_mode: None,
         bot_commands: Vec::new(),
     };
     let channel = match peer {
@@ -3590,6 +3591,7 @@ fn peer_profile_view(peer: &Peer) -> Result<PeerProfile> {
         Peer::Community(_) => None,
     };
     if let Some(channel) = channel {
+        profile.forum_mode = forum_mode::owner_forum_mode(channel);
         profile.admin_policy = channel_admin_policy(channel);
         profile.can_read_admin_log = !channel.left
             && !channel.min
@@ -3890,6 +3892,7 @@ fn message_view(
     let topic = forum_topics::message_topic(&message.raw);
     let outgoing = message.outgoing();
     let attachment = attachment(message);
+    let sticker = stickers::message_sticker(message);
     let photo_preview = matches!(attachment, Some((Media::Photo(_), _)));
     let playback = attachment
         .as_ref()
@@ -3960,7 +3963,7 @@ fn message_view(
                 })
                 || (outgoing && !message.post() && message.sender_id().is_none())),
         timestamp: message.date().as_second(),
-        text: if attachment.is_some() || poll.is_some() {
+        text: if attachment.is_some() || poll.is_some() || sticker.is_some() {
             message.text().to_owned()
         } else {
             message_text(message)
@@ -3976,7 +3979,9 @@ fn message_view(
         playback,
         audio,
         thumbnail,
+        can_close_poll: poll.is_some() && poll_management::can_close_poll(message),
         poll,
+        sticker,
         reply_to,
         reply_preview,
         can_reply: matches!(message.raw, enums::Message::Message(_)),
@@ -3992,6 +3997,7 @@ fn message_view(
             || match message.media() {
                 Some(Media::Photo(photo)) => photo.raw.ttl_seconds.is_some(),
                 Some(Media::Document(document)) => document.raw.ttl_seconds.is_some(),
+                Some(Media::Sticker(sticker)) => sticker.document.raw.ttl_seconds.is_some(),
                 _ => false,
             },
     }
@@ -4000,6 +4006,60 @@ fn message_view(
 fn poll_question(text: &enums::TextWithEntities) -> String {
     let enums::TextWithEntities::Entities(text) = text;
     quote_preview(&text.text, &text.entities)
+}
+
+fn poll_media(poll: PollDraft, random_id: i64) -> types::InputMediaPoll {
+    let (correct_answers, solution) = match poll.quiz {
+        Some(quiz) => (
+            Some(quiz.correct.into_iter().map(|index| index as i32).collect()),
+            (!quiz.solution.is_empty()).then_some(quiz.solution),
+        ),
+        None => (None, None),
+    };
+    let text = |text| {
+        types::TextWithEntities {
+            text,
+            entities: Vec::new(),
+        }
+        .into()
+    };
+    types::InputMediaPoll {
+        poll: types::Poll {
+            id: random_id,
+            closed: false,
+            public_voters: poll.public,
+            multiple_choice: poll.multiple,
+            quiz: correct_answers.is_some(),
+            open_answers: false,
+            revoting_disabled: correct_answers.is_some(),
+            shuffle_answers: false,
+            hide_results_until_close: false,
+            creator: false,
+            subscribers_only: false,
+            question: text(poll.question),
+            answers: poll
+                .choices
+                .into_iter()
+                .map(|choice| {
+                    types::InputPollAnswer {
+                        text: text(choice),
+                        media: None,
+                    }
+                    .into()
+                })
+                .collect(),
+            close_period: None,
+            close_date: None,
+            countries_iso2: None,
+            hash: 0,
+        }
+        .into(),
+        correct_answers,
+        attached_media: None,
+        solution_entities: solution.as_ref().map(|_| Vec::new()),
+        solution,
+        solution_media: None,
+    }
 }
 
 fn poll_definition(raw: &types::Poll) -> Poll {
@@ -4184,6 +4244,7 @@ fn can_forward(message: &TelegramMessage) -> bool {
         && match message.media() {
             Some(Media::Photo(photo)) => photo.raw.ttl_seconds.is_none(),
             Some(Media::Document(document)) => document.raw.ttl_seconds.is_none(),
+            Some(Media::Sticker(sticker)) => sticker.document.raw.ttl_seconds.is_none(),
             _ => true,
         }
 }
@@ -4354,6 +4415,8 @@ fn message_text(message: &TelegramMessage) -> String {
         message.text().to_owned()
     } else if message.action().is_some() {
         "Событие в чате".to_owned()
+    } else if let Some(sticker) = stickers::message_sticker(message) {
+        sticker.label()
     } else if let Some(Media::Poll(raw)) = message.media() {
         let kind = if raw.raw.quiz {
             "Викторина"
@@ -4406,6 +4469,9 @@ fn is_muted(until: i32, now: SystemTime) -> bool {
 }
 
 fn playable_media(media: &Media) -> Option<PlayableMedia> {
+    if let Media::Sticker(sticker) = media {
+        return stickers::video_playback(sticker);
+    }
     let Media::Document(document) = media else {
         return None;
     };
@@ -4515,6 +4581,16 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
         Media::Photo(photo) if photo.raw.ttl_seconds.is_none() => {
             format!("photo-{}.jpg", message.id())
         }
+        Media::Sticker(sticker) if sticker.document.raw.ttl_seconds.is_none() => {
+            let extension = match sticker.document.mime_type() {
+                Some("image/webp") => "webp",
+                Some("application/x-tgsticker") => "tgs",
+                Some("video/webm") => "webm",
+                _ => "bin",
+            };
+            let fallback = format!("sticker-{}.{extension}", message.id());
+            attachment_name(sticker.document.name().unwrap_or(&fallback), &fallback)
+        }
         Media::Document(document) if document.raw.ttl_seconds.is_none() => {
             let fallback = format!("file-{}", message.id());
             attachment_name(document.name().unwrap_or(&fallback), &fallback)
@@ -4527,6 +4603,47 @@ fn attachment(message: &TelegramMessage) -> Option<(Media, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_media_sends_quiz_indices_and_pairs_optional_solution_fields() {
+        use crate::model::PollQuizDraft;
+
+        let mut draft = PollDraft {
+            question: "Какой день идёт после вторника?".into(),
+            choices: vec!["Понедельник".into(), " ".into(), "Среда".into()],
+            public: true,
+            ..PollDraft::default()
+        };
+        let media = poll_media(draft.clone().validate().unwrap(), 123);
+        let enums::Poll::Poll(poll) = media.poll;
+        assert!(poll.public_voters && !poll.quiz && !poll.revoting_disabled);
+        assert!(media.correct_answers.is_none());
+        assert!(media.solution.is_none() && media.solution_entities.is_none());
+
+        draft.quiz = Some(PollQuizDraft {
+            correct: vec![2],
+            solution: "Среда идёт после вторника.".into(),
+        });
+        let media = poll_media(draft.clone().validate().unwrap(), 123);
+        let enums::Poll::Poll(poll) = media.poll;
+        assert_eq!(poll.id, 123);
+        assert!(poll.public_voters && poll.quiz && poll.revoting_disabled);
+        let enums::PollAnswer::InputPollAnswer(answer) = &poll.answers[1] else {
+            panic!("expected an outgoing answer");
+        };
+        assert_eq!(poll_question(&answer.text), "Среда");
+        assert_eq!(media.correct_answers, Some(vec![1]));
+        assert_eq!(
+            media.solution.as_deref(),
+            Some("Среда идёт после вторника.")
+        );
+        assert_eq!(media.solution_entities, Some(vec![]));
+
+        draft.quiz.as_mut().unwrap().solution.clear();
+        let media = poll_media(draft.validate().unwrap(), 123);
+        assert_eq!(media.correct_answers, Some(vec![1]));
+        assert!(media.solution.is_none() && media.solution_entities.is_none());
+    }
 
     #[test]
     fn channel_admin_mapping_preserves_protocol_flags_and_server_editability() {
