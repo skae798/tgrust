@@ -34,7 +34,7 @@ if [[ -n $binary && $mode != demo ]] || (( ${#filters[@]} > 1 )) ||
     usage >&2
     exit 2
 fi
-for tool in dbus-run-session timeout; do
+for tool in dbus-run-session dbus-update-activation-environment timeout; do
     command -v "$tool" >/dev/null || { printf 'Required: %s\n' "$tool" >&2; exit 1; }
 done
 if [[ $backend == wayland ]]; then
@@ -56,7 +56,7 @@ cleanup() {
 trap cleanup EXIT
 mkdir -- "$runtime/data" "$runtime/config" "$runtime/cache"
 # These changes apply only to the child session, never to GNOME or the launcher.
-env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u GDK_BACKEND \
+env -u DISPLAY -u XAUTHORITY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u GDK_BACKEND \
     -u DBUS_SESSION_BUS_ADDRESS -u DBUS_SESSION_BUS_PID -u DBUS_STARTER_ADDRESS \
     -u DBUS_STARTER_BUS_TYPE -u AT_SPI_BUS_ADDRESS \
     XDG_RUNTIME_DIR="$runtime" XDG_DATA_HOME="$runtime/data" \
@@ -83,11 +83,20 @@ if [[ $backend == wayland ]]; then
         fi
         sleep 0.1
     done
-    test -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    if [[ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]]; then
+        cat "$XDG_RUNTIME_DIR/compositor.log" >&2
+        exit 1
+    fi
+    # This is the private bus. Never pass --systemd: GNOME must stay untouched.
+    dbus-update-activation-environment WAYLAND_DISPLAY
     display_command=()
 else
     export GDK_BACKEND=x11
-    display_command=(xvfb-run -a -s '-screen 0 1920x1440x24')
+    display_command=(xvfb-run -a -s '-screen 0 1920x1440x24' bash -c '
+        set -e
+        dbus-update-activation-environment DISPLAY XAUTHORITY GDK_BACKEND
+        exec "$@"
+    ' --)
 fi
 if [[ $mode == tests ]]; then
     "${display_command[@]}" cargo test --locked "$@" -- --ignored --nocapture --test-threads=1

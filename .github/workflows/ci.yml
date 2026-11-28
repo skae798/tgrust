@@ -14,7 +14,7 @@ jobs:
     container: fedora:45
     steps:
       - name: Install system dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc gcc-c++ git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth mutter dbus-daemon mesa-dri-drivers
+        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc gcc-c++ git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth mutter dbus-daemon dbus-tools mesa-dri-drivers
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -54,7 +54,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Install build dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config mutter dbus-daemon mesa-dri-drivers
+        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config mutter dbus-daemon dbus-tools mesa-dri-drivers
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
