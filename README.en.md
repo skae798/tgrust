@@ -23,8 +23,8 @@ In GNOME/Wayland, normal launches use Wayland, including after updates. Backgrou
 ## Features
 
 - **Messages** — paginated history, search, replies, edits, and reactions. Completed actions survive switching chats.
-- **Polls** — polls and quizzes, deadlines, hidden results, vote locks, shuffled answers, and subscriber-only participation in channels and supergroups, and country restrictions based on account phone numbers. Public polls include a voter list; regular public polls allow participants to add choices.
-- **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers.
+- **Polls** — polls and quizzes, deadlines, hidden results, vote locks, shuffled answers, and subscriber-only participation in channels and supergroups, and country restrictions based on account phone numbers. Photos and videos attached to the question are displayed. Public polls include a voter list; regular public polls allow participants to add choices.
+- **Media** — albums, streaming video and music, inline voice messages, and separate photo and video viewers. Spoiler media stays hidden until explicitly revealed.
 - **Chats** — create groups and channels, enable and manage supergroup topics, folders, archive, GNOME notifications, member and admin management, group and individual restrictions, slow mode, invitations, public addresses, and recent actions.
 - **Accounts** — separate windows, profile and privacy settings, session management, and SOCKS5.
 - **Stickers** — search by emoji; preview, install, and remove packs by Telegram links; recent and favorite stickers; send to chats or topics, including replies. WebP images render in full; video stickers loop directly in messages, with transparency and no sound. TGS animations play concurrently within messages at the monitor’s scale. Stickers have no captions in history or the picker.

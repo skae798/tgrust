@@ -32,7 +32,7 @@ const PUBLIC_POLL_ID: i32 = 73;
 pub const SLOW_MODE_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn has_sample_attachment(chat: i64, message: i32) -> bool {
-    chat == 1 && message == 83
+    (chat == 1 && message == 83) || (chat == 6 && matches!(message, 2 | SAMPLE_QUIZ_ID))
 }
 
 pub fn chats() -> Vec<Chat> {
@@ -1228,7 +1228,16 @@ pub fn history(chat: i64) -> Vec<Message> {
             },
         );
         let mut quiz = poll_message(SAMPLE_QUIZ_ID, sample_quiz());
+        quiz.media_spoiler = Some(crate::model::AttachmentThumbnail::Photo(i64::from(
+            SAMPLE_QUIZ_ID,
+        )));
         for message in [&mut meeting, &mut quiz] {
+            message.attachment = Some("poll-photo.png".into());
+            message.photo_preview = true;
+            message.thumbnail = Some(crate::model::AttachmentThumbnail::Photo(i64::from(
+                message.id,
+            )));
+
             message.sender = "Анна".into();
             message.sender_avatar = Some(Avatar {
                 peer: 6,
@@ -1373,6 +1382,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 _ => None,
             },
             photo_preview: (chat == 1 && index == 3) || chat == 3,
+            media_spoiler: None,
             thumbnail: if chat == 5 && index < 2 {
                 Some(AttachmentThumbnail::Document(50 + index as i64))
             } else {
@@ -1536,6 +1546,7 @@ pub fn poll_message(id: i32, draft: PollDraft) -> Message {
         outgoing: true,
         attachment: None,
         photo_preview: false,
+        media_spoiler: None,
         playback: None,
         audio: None,
         thumbnail: None,
