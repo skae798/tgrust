@@ -1223,6 +1223,7 @@ pub fn history(chat: i64) -> Vec<Message> {
                 multiple: true,
                 shuffle_answers: true,
                 subscribers_only: true,
+                countries: vec!["PL".into(), "UA".into()],
                 ..PollDraft::default()
             },
         );

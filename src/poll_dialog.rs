@@ -1,3 +1,5 @@
+mod countries;
+
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
@@ -66,6 +68,11 @@ pub fn card(poll: &Poll) -> gtk::Box {
     }
     if poll.subscribers_only {
         let hint = label(SUBSCRIBER_VOTE_HINT);
+        hint.add_css_class("dim-label");
+        card.append(&hint);
+    }
+    if let Some(text) = countries::description(&poll.countries, 6) {
+        let hint = label(&text);
         hint.add_css_class("dim-label");
         card.append(&hint);
     }
@@ -165,6 +172,9 @@ pub fn vote(
     }
     if poll.subscribers_only {
         body.append(&label(SUBSCRIBER_VOTE_HINT));
+    }
+    if let Some(text) = countries::description(&poll.countries, usize::MAX) {
+        body.append(&label(&text));
     }
     let mut controls: Vec<(gtk::CheckButton, Vec<u8>)> = Vec::new();
     for choice in &poll.choices {
@@ -402,6 +412,7 @@ pub fn create(
         .build();
     settings.add(&shuffle);
     let timing = TimingControls::append(&settings);
+    let countries = countries::Controls::append(&settings);
     content.append(&settings);
     let open_answers = adw::SwitchRow::builder()
         .title("Участники могут добавлять варианты")
@@ -501,6 +512,14 @@ pub fn create(
                 shuffle_answers: shuffle.is_active(),
                 public: options.public_voters && public.is_active(),
                 subscribers_only: options.subscribers_only && subscribers.is_active(),
+                countries: match countries.selection() {
+                    Ok(codes) => codes,
+                    Err(error) => {
+                        status.set_text(&error.to_string());
+                        status.set_visible(true);
+                        return;
+                    }
+                },
                 quiz: quiz.is_active().then(|| {
                     let buffer = solution.buffer();
                     PollQuizDraft {
@@ -833,7 +852,14 @@ mod tests {
                 assert_eq!(draft.public, !channel);
                 assert!(!draft.open_answers);
                 if channel {
-                    let poll = draft.into_poll(49);
+                    let mut poll = draft.into_poll(49);
+                    poll.countries = vec!["PL".into(), "UA".into()];
+                    let country_hint = countries::description(&poll.countries, 6).unwrap();
+                    assert!(
+                        find(&card(&poll), &|label: &gtk::Label| label.text()
+                            == country_hint)
+                        .is_some()
+                    );
                     assert!(
                         find(&card(&poll), &|label: &gtk::Label| label.text()
                             == SUBSCRIBER_VOTE_HINT)
@@ -845,6 +871,11 @@ mod tests {
                     assert!(
                         find(&vote_dialog, &|label: &gtk::Label| label.text()
                             == SUBSCRIBER_VOTE_HINT)
+                        .is_some()
+                    );
+                    assert!(
+                        find(&vote_dialog, &|label: &gtk::Label| label.text()
+                            == country_hint)
                         .is_some()
                     );
                     vote_dialog.close();
@@ -1053,6 +1084,49 @@ mod tests {
             assert!(attempts.borrow()[13].0.subscribers_only);
             switch("Викторина").set_active(false);
             assert!(shuffle.is_active());
+            let region = find(&dialog, &|row: &adw::ExpanderRow| {
+                row.title() == "Ограничить участие по странам"
+            })
+            .unwrap();
+            assert!(!region.enables_expansion());
+            region.set_enable_expansion(true);
+            assert!(submit.grab_focus());
+            assert!(gtk::prelude::WidgetExt::activate(&submit));
+            settle(|| {
+                find(&dialog, &|label: &gtk::Label| {
+                    label.is_visible() && label.text() == "Выберите хотя бы одну страну"
+                })
+                .is_some()
+            });
+            assert_eq!(attempts.borrow().len(), 14);
+            let country_search = find(&region, &|_: &gtk::SearchEntry| true).unwrap();
+            for code in ["UA", "PL"] {
+                country_search.set_text(code);
+                let check = find(&region, &|button: &gtk::CheckButton| {
+                    button
+                        .child()
+                        .and_downcast::<gtk::Label>()
+                        .is_some_and(|label| label.text() == countries::name(code))
+                })
+                .unwrap();
+                settle(|| check.is_mapped());
+                assert!(check.grab_focus());
+                assert!(gtk::prelude::WidgetExt::activate(&check));
+                assert!(check.is_active());
+            }
+            country_search.set_text("No country matches this text");
+            send(15);
+            assert_eq!(attempts.borrow()[14].0.countries, ["PL", "UA"]);
+            switch("Викторина").set_active(true);
+            send(16);
+            assert_eq!(attempts.borrow()[15].0.countries, ["PL", "UA"]);
+            assert!(attempts.borrow()[15].0.quiz.is_some());
+            region.set_enable_expansion(false);
+            send(17);
+            assert!(attempts.borrow()[16].0.countries.is_empty());
+            region.set_enable_expansion(true);
+            send(18);
+            assert_eq!(attempts.borrow()[17].0.countries, ["PL", "UA"]);
             assert!(dialog.width() <= window.width());
             dialog.close();
             window.close();
