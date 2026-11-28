@@ -18,7 +18,7 @@ Demo mode works without an account. To sign in, launch tgrust without `--demo` a
 
 The prebuilt client checks for updates automatically and opens the new build on the next launch.
 
-In GNOME/Wayland, normal launches use Wayland, including after updates. The X11 setting used for background tests applies only to the test command.
+In GNOME/Wayland, normal launches use Wayland, including after updates. Background UI checks use a private display and D-Bus through `scripts/test-ui.sh`. Before publishing an update, CI checks Wayland startup using the finished executable.
 
 ## Features
 

@@ -14,7 +14,7 @@ jobs:
     container: fedora:45
     steps:
       - name: Install system dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc gcc-c++ git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth
+        run: dnf install -y ca-certificates clang-devel cmake curl desktop-file-utils gcc gcc-c++ git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free make pkgconf-pkg-config xorg-x11-server-Xvfb xorg-x11-xauth mutter dbus-daemon mesa-dri-drivers
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -23,8 +23,8 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/tgrust-rustup.sh
           sh /tmp/tgrust-rustup.sh -y --profile minimal --default-toolchain 1.100.0 --component rustfmt --component clippy
           printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Check updater syntax
-        run: bash -n scripts/update.sh
+      - name: Check shell syntax
+        run: for script in scripts/*.sh; do bash -n "$script"; done
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
@@ -32,9 +32,11 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Test GTK and media playback
-        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GSETTINGS_BACKEND=memory GTK_A11Y=none xvfb-run -a cargo test --locked -- --ignored --nocapture --test-threads=1
+        run: ./scripts/test-ui.sh
       - name: Test inline stickers at HiDPI
-        run: env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET GDK_BACKEND=x11 GDK_SCALE=2 GSETTINGS_BACKEND=memory GTK_A11Y=none xvfb-run -a -s '-screen 0 1920x1440x24' cargo test --locked inline_sticker::tests -- --ignored --nocapture --test-threads=1
+        run: env GDK_SCALE=2 ./scripts/test-ui.sh inline_sticker::tests
+      - name: Test GNOME Wayland startup
+        run: ./scripts/test-ui.sh --wayland --demo
       - name: Test patched search pagination
         run: cargo test --locked -p grammers-client --lib --no-default-features
       - name: Validate desktop entry
@@ -52,7 +54,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Install build dependencies
-        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config
+        run: dnf install -y ca-certificates clang-devel cmake curl gcc gcc-c++ gh git gtk4-devel libadwaita-devel gstreamer1-devel gstreamer1-plugins-base-devel make pkgconf-pkg-config mutter dbus-daemon mesa-dri-drivers
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -70,6 +72,8 @@ jobs:
           cargo build --locked --release
           install -Dm755 target/release/tgrust dist/tgrust-fedora45-x86_64
           dist/tgrust-fedora45-x86_64 --version | grep -F "сборка $TGRUST_UPDATE_BUILD ($TGRUST_UPDATE_REVISION)"
+      - name: Verify release Wayland startup
+        run: ./scripts/test-ui.sh --wayland --demo --binary "$PWD/dist/tgrust-fedora45-x86_64"
       - name: Publish the verified build
         shell: bash
         env:
